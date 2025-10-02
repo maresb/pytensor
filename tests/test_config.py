@@ -281,3 +281,51 @@ class TestConfigHelperFunctions:
     def test_short_platform(self, release, platform, answer):
         o = short_platform(release, platform)
         assert o == answer, (o, answer)
+
+
+def test_cxx_env_variable(monkeypatch, tmp_path):
+    """Test that the CXX environment variable is respected."""
+    import subprocess
+    import sys
+
+    # Test script that imports pytensor and prints config.cxx
+    test_script = tmp_path / "test_cxx.py"
+    test_script.write_text(
+        "import sys; sys.path.insert(0, '.'); "
+        "from pytensor import config; "
+        "print(config.cxx)"
+    )
+
+    # Test without CXX set (should use default)
+    result = subprocess.run(
+        [sys.executable, str(test_script)],
+        cwd="/home/runner/work/pytensor/pytensor",
+        capture_output=True,
+        text=True,
+    )
+    default_cxx = result.stdout.strip()
+    # Just verify we got something (could be empty if no compiler available)
+    assert result.returncode == 0
+
+    # Test with CXX set to a custom compiler
+    custom_compiler = "/usr/bin/custom-g++"
+    result = subprocess.run(
+        [sys.executable, str(test_script)],
+        cwd="/home/runner/work/pytensor/pytensor",
+        capture_output=True,
+        text=True,
+        env={**subprocess.os.environ, "CXX": custom_compiler},
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == custom_compiler
+
+    # Test with CXX set to empty string (should fall back to default)
+    result = subprocess.run(
+        [sys.executable, str(test_script)],
+        cwd="/home/runner/work/pytensor/pytensor",
+        capture_output=True,
+        text=True,
+        env={**subprocess.os.environ, "CXX": ""},
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == default_cxx
