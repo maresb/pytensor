@@ -281,3 +281,88 @@ class TestConfigHelperFunctions:
     def test_short_platform(self, release, platform, answer):
         o = short_platform(release, platform)
         assert o == answer, (o, answer)
+
+
+def test_cxx_env_variable(monkeypatch, tmp_path):
+    """Test that the CXX environment variable is respected with correct priority.
+    
+    Priority order (highest to lowest):
+    1. Explicitly set PyTensor configuration (via PYTENSOR_FLAGS or config file)
+    2. CXX environment variable
+    3. Which-style search (g++, clang++, etc.)
+    """
+    import subprocess
+    import sys
+
+    # Test script that imports pytensor and prints config.cxx
+    test_script = tmp_path / "test_cxx.py"
+    test_script.write_text(
+        "import sys; sys.path.insert(0, '.'); "
+        "from pytensor import config; "
+        "print(config.cxx)"
+    )
+
+    # Test 1: No CXX, no explicit config - should use which-style search
+    result = subprocess.run(
+        [sys.executable, str(test_script)],
+        cwd="/home/runner/work/pytensor/pytensor",
+        capture_output=True,
+        text=True,
+    )
+    default_cxx = result.stdout.strip()
+    # Just verify we got something (could be empty if no compiler available)
+    assert result.returncode == 0
+
+    # Test 2: CXX set, no explicit config - should use CXX
+    custom_compiler = "/usr/bin/custom-g++"
+    result = subprocess.run(
+        [sys.executable, str(test_script)],
+        cwd="/home/runner/work/pytensor/pytensor",
+        capture_output=True,
+        text=True,
+        env={**subprocess.os.environ, "CXX": custom_compiler},
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == custom_compiler
+
+    # Test 3: CXX set to empty string - should fall back to default
+    result = subprocess.run(
+        [sys.executable, str(test_script)],
+        cwd="/home/runner/work/pytensor/pytensor",
+        capture_output=True,
+        text=True,
+        env={**subprocess.os.environ, "CXX": ""},
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == default_cxx
+
+    # Test 4: Both CXX and explicit config - explicit config should win
+    explicit_compiler = "/usr/bin/explicit-g++"
+    result = subprocess.run(
+        [sys.executable, str(test_script)],
+        cwd="/home/runner/work/pytensor/pytensor",
+        capture_output=True,
+        text=True,
+        env={
+            **subprocess.os.environ,
+            "CXX": custom_compiler,
+            "PYTENSOR_FLAGS": f"cxx={explicit_compiler}",
+        },
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == explicit_compiler
+
+    # Test 5: CXX set and explicit empty config - explicit empty should win
+    result = subprocess.run(
+        [sys.executable, str(test_script)],
+        cwd="/home/runner/work/pytensor/pytensor",
+        capture_output=True,
+        text=True,
+        env={
+            **subprocess.os.environ,
+            "CXX": custom_compiler,
+            "PYTENSOR_FLAGS": "cxx=",
+        },
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""

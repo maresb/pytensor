@@ -311,47 +311,52 @@ def add_compile_configvars():
         in_c_key=False,
     )
 
-    param = "g++"
+    # Check if CXX environment variable is set (for conda-forge compatibility)
+    param = os.environ.get("CXX", "").strip()
+    rc = 0 if param else 1  # Assume success if CXX is set
 
-    # Test whether or not g++ is present: disable C code if it is not.
-    try:
-        rc = call_subprocess_Popen(["g++", "-v"])
-    except OSError:
-        rc = 1
+    if not param:
+        param = "g++"
 
-    # Anaconda on Windows has mingw-w64 packages including GCC, but it may not be on PATH.
-    if rc != 0:
-        if sys.platform == "win32":
-            mingw_w64_gcc = Path(sys.executable).parent / "Library/mingw-w64/bin/g++"
-            try:
-                rc = call_subprocess_Popen([str(mingw_w64_gcc), "-v"])
-                if rc == 0:
-                    maybe_add_to_os_environ_pathlist("PATH", mingw_w64_gcc.parent)
-            except OSError:
-                rc = 1
-            if rc != 0:
-                _logger.warning(
-                    "g++ not available, if using conda: `conda install gxx`"
-                )
-
-    if rc != 0:
-        param = ""
-
-    # On Mac/FreeBSD we test for 'clang++' and use it by default
-    if sys.platform == "darwin" or sys.platform.startswith("freebsd"):
+        # Test whether or not g++ is present: disable C code if it is not.
         try:
-            rc = call_subprocess_Popen(["clang++", "-v"])
-            if rc == 0:
-                param = "clang++"
+            rc = call_subprocess_Popen(["g++", "-v"])
         except OSError:
-            pass
+            rc = 1
 
-    # Try to find the full compiler path from the name
-    if param != "":
-        newp = which(param)
-        if newp is not None:
-            param = newp
-        del newp
+        # Anaconda on Windows has mingw-w64 packages including GCC, but it may not be on PATH.
+        if rc != 0:
+            if sys.platform == "win32":
+                mingw_w64_gcc = Path(sys.executable).parent / "Library/mingw-w64/bin/g++"
+                try:
+                    rc = call_subprocess_Popen([str(mingw_w64_gcc), "-v"])
+                    if rc == 0:
+                        maybe_add_to_os_environ_pathlist("PATH", mingw_w64_gcc.parent)
+                except OSError:
+                    rc = 1
+                if rc != 0:
+                    _logger.warning(
+                        "g++ not available, if using conda: `conda install gxx`"
+                    )
+
+        if rc != 0:
+            param = ""
+
+        # On Mac/FreeBSD we test for 'clang++' and use it by default
+        if sys.platform == "darwin" or sys.platform.startswith("freebsd"):
+            try:
+                rc = call_subprocess_Popen(["clang++", "-v"])
+                if rc == 0:
+                    param = "clang++"
+            except OSError:
+                pass
+
+        # Try to find the full compiler path from the name
+        if param != "":
+            newp = which(param)
+            if newp is not None:
+                param = newp
+            del newp
 
     # to support path that includes spaces, we need to wrap it with double quotes on Windows
     if param and os.name == "nt":
