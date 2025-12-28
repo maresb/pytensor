@@ -1,7 +1,5 @@
 """Core graph classes."""
 
-from __future__ import annotations
-
 import abc
 import warnings
 from collections.abc import (
@@ -15,7 +13,9 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Generic,
+    Optional,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -33,14 +33,13 @@ from pytensor.graph.utils import (
 
 
 if TYPE_CHECKING:
+    from pytensor.graph.op import Op
     from pytensor.graph.type import Type
 
 
-# NOTE: TypeVar bounds use string forward references for mypy compatibility.
-# The bounds cannot be checked at runtime by beartype due to circular imports.
-OpType = TypeVar("OpType")  # bound: Op
+OpType = TypeVar("OpType", bound="Op")
 OptionalApplyType = TypeVar("OptionalApplyType", None, "Apply", covariant=True)
-_TypeType = TypeVar("_TypeType")  # bound: Type
+_TypeType = TypeVar("_TypeType", bound="Type")
 _IdType = TypeVar("_IdType", bound=Hashable)
 
 _MOVED_FUNCTIONS = {
@@ -149,8 +148,8 @@ class Apply(Node, Generic[OpType]):
     def __init__(
         self,
         op: OpType,
-        inputs: Sequence[Variable],
-        outputs: Sequence[Variable],
+        inputs: Sequence["Variable"],
+        outputs: Sequence["Variable"],
     ):
         if not isinstance(inputs, Sequence):
             raise TypeError("The inputs of an Apply must be a sequence type")
@@ -229,7 +228,7 @@ class Apply(Node, Generic[OpType]):
     def __repr__(self):
         return str(self)
 
-    def clone(self, clone_inner_graph: bool = False) -> Apply[OpType]:
+    def clone(self, clone_inner_graph: bool = False) -> "Apply[OpType]":
         r"""Clone this `Apply` instance.
 
         Parameters
@@ -260,8 +259,8 @@ class Apply(Node, Generic[OpType]):
         return cp
 
     def clone_with_new_inputs(
-        self, inputs: Sequence[Variable], strict=True, clone_inner_graph=False
-    ) -> Apply[OpType]:
+        self, inputs: Sequence["Variable"], strict=True, clone_inner_graph=False
+    ) -> "Apply[OpType]":
         r"""Duplicate this `Apply` instance in a new graph.
 
         Parameters
@@ -581,7 +580,7 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
 
     def eval(
         self,
-        inputs_to_values: dict[Variable | str, Any] | None = None,
+        inputs_to_values: dict[Union["Variable", str], Any] | None = None,
         **kwargs,
     ):
         r"""Evaluate the `Variable` given a set of values for its inputs.
@@ -625,7 +624,7 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
 
         ignore_unused_input = kwargs.get("on_unused_input", None) in ("ignore", "warn")
 
-        def convert_string_keys_to_variables(inputs_to_values) -> dict[Variable, Any]:
+        def convert_string_keys_to_variables(inputs_to_values) -> dict["Variable", Any]:
             new_input_to_values = {}
             for key, value in inputs_to_values.items():
                 if isinstance(key, str):
@@ -730,7 +729,7 @@ class AtomicVariable(Variable[_TypeType, None]):
 class NominalVariable(Generic[_TypeType, _IdType], AtomicVariable[_TypeType]):
     """A variable that enables alpha-equivalent comparisons."""
 
-    __instances__: dict[tuple[Type, Hashable], NominalVariable] = {}
+    __instances__: dict[tuple["Type", Hashable], "NominalVariable"] = {}
 
     def __new__(cls, id: _IdType, typ: _TypeType, **kwargs):
         if (typ, id) not in cls.__instances__:
@@ -891,7 +890,7 @@ def clone(
 
 def clone_node_and_cache(
     node: Apply,
-    clone_d: dict,
+    clone_d: dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]],
     clone_inner_graphs=False,
     **kwargs,
 ) -> Apply | None:
@@ -912,7 +911,7 @@ def clone_node_and_cache(
         return None
 
     # Use a cached `Op` clone when available
-    new_op = clone_d.get(node.op)
+    new_op: Op | None = cast(Optional["Op"], clone_d.get(node.op))
 
     cloned_inputs: list[Variable] = [cast(Variable, clone_d[i]) for i in node.inputs]
 
@@ -946,10 +945,11 @@ def clone_get_equiv(
     outputs: Iterable[Variable],
     copy_inputs: bool = True,
     copy_orphans: bool = True,
-    memo: dict | None = None,
+    memo: dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]
+    | None = None,
     clone_inner_graphs: bool = False,
     **kwargs,
-) -> dict:
+) -> dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]:
     r"""Clone the graph between `inputs` and `outputs` and return a map of the cloned objects.
 
     This function works by recursively cloning inputs and rebuilding a directed
