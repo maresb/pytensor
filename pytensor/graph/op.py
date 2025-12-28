@@ -9,6 +9,7 @@ from typing import (
     Protocol,
     TypeVar,
     cast,
+    runtime_checkable,
 )
 
 import pytensor
@@ -42,6 +43,7 @@ ThunkCallableType = Callable[
 C = TypeVar("C", bound=Callable)
 
 
+@runtime_checkable
 class ThunkType(Protocol[C]):
     inputs: list[list[list[Any] | None]]
     outputs: list[list[list[Any] | None]]
