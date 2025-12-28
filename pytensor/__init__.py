@@ -27,7 +27,7 @@ import sys
 import warnings
 from functools import singledispatch
 from pathlib import Path
-from typing import Any, NoReturn, Optional
+from typing import Any, NoReturn
 
 from pytensor import _version
 

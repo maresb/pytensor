@@ -13,9 +13,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Generic,
-    Optional,
     TypeVar,
-    Union,
     cast,
 )
 
@@ -580,7 +578,7 @@ class Variable(Node, Generic[_TypeType, OptionalApplyType]):
 
     def eval(
         self,
-        inputs_to_values: dict[Union["Variable", str], Any] | None = None,
+        inputs_to_values: dict["Variable" | str, Any] | None = None,
         **kwargs,
     ):
         r"""Evaluate the `Variable` given a set of values for its inputs.
@@ -890,7 +888,7 @@ def clone(
 
 def clone_node_and_cache(
     node: Apply,
-    clone_d: dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]],
+    clone_d: dict[Apply | Variable | "Op", Apply | Variable | "Op"],
     clone_inner_graphs=False,
     **kwargs,
 ) -> Apply | None:
@@ -911,7 +909,7 @@ def clone_node_and_cache(
         return None
 
     # Use a cached `Op` clone when available
-    new_op: Op | None = cast(Optional["Op"], clone_d.get(node.op))
+    new_op: Op | None = cast("Op | None", clone_d.get(node.op))
 
     cloned_inputs: list[Variable] = [cast(Variable, clone_d[i]) for i in node.inputs]
 
@@ -945,11 +943,10 @@ def clone_get_equiv(
     outputs: Iterable[Variable],
     copy_inputs: bool = True,
     copy_orphans: bool = True,
-    memo: dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]
-    | None = None,
+    memo: dict[Apply | Variable | "Op", Apply | Variable | "Op"] | None = None,
     clone_inner_graphs: bool = False,
     **kwargs,
-) -> dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]:
+) -> dict[Apply | Variable | "Op", Apply | Variable | "Op"]:
     r"""Clone the graph between `inputs` and `outputs` and return a map of the cloned objects.
 
     This function works by recursively cloning inputs and rebuilding a directed

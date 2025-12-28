@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Sequence
 from functools import singledispatch
-from typing import TYPE_CHECKING, Any, NoReturn, Optional, Union
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from pytensor.graph.basic import Constant, Variable
 from pytensor.graph.op import Op
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike, NDArray
 
 
-TensorLike = Union[Variable, Sequence[Variable], "ArrayLike"]
+TensorLike = Variable | Sequence[Variable] | "ArrayLike"
 
 
 def as_tensor_variable(

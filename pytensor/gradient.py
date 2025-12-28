@@ -4,7 +4,7 @@ import time
 import warnings
 from collections.abc import Callable, Mapping, MutableSequence, Sequence
 from functools import partial, reduce
-from typing import TYPE_CHECKING, Literal, TypeVar, Union, overload
+from typing import TYPE_CHECKING, Literal, TypeVar, overload
 
 import numpy as np
 
@@ -1805,7 +1805,7 @@ def verify_grad(
     out_type: str | None = None,
     abs_tol: float | None = None,
     rel_tol: float | None = None,
-    mode: Union["Mode", str] | None = None,
+    mode: "Mode | str | None" = None,
     cast_to_output_type: bool = False,
     no_debug_ref: bool = True,
 ):

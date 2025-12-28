@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply, Variable
@@ -240,9 +240,9 @@ class LocalLinker(Linker):
 
     def make_thunk(
         self,
-        input_storage: Optional["InputStorageType"] = None,
-        output_storage: Optional["OutputStorageType"] = None,
-        storage_map: Optional["StorageMapType"] = None,
+        input_storage: "InputStorageType | None" = None,
+        output_storage: "OutputStorageType | None" = None,
+        storage_map: "StorageMapType | None" = None,
         **kwargs,
     ) -> tuple["BasicThunkType", "InputStorageType", "OutputStorageType"]:
         return self.make_all(
@@ -253,9 +253,9 @@ class LocalLinker(Linker):
 
     def make_all(
         self,
-        input_storage: Optional["InputStorageType"] = None,
-        output_storage: Optional["OutputStorageType"] = None,
-        storage_map: Optional["StorageMapType"] = None,
+        input_storage: "InputStorageType | None" = None,
+        output_storage: "OutputStorageType | None" = None,
+        storage_map: "StorageMapType | None" = None,
     ) -> tuple[
         "BasicThunkType",
         "InputStorageType",
@@ -298,7 +298,7 @@ class PerformLinker(LocalLinker):
         self,
         fgraph: FunctionGraph,
         no_recycling: Sequence[Variable] | None = None,
-        profile: Union[bool, "ProfileStats"] | None = None,
+        profile: "bool | ProfileStats | None" = None,
     ) -> "PerformLinker":
         """Associate a `FunctionGraph` with this `Linker`.
 
@@ -475,7 +475,7 @@ class WrapLinker(Linker):
         self,
         fgraph: FunctionGraph,
         no_recycling: Sequence["TensorVariable"] | None = None,
-        profile: Union[bool, "ProfileStats"] | None = None,
+        profile: "bool | ProfileStats | None" = None,
     ) -> "WrapLinker":
         """
 

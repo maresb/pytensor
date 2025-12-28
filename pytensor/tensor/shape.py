@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from numbers import Number
 from textwrap import dedent
 from types import EllipsisType
-from typing import TYPE_CHECKING, Union, cast
+from typing import TYPE_CHECKING, cast
 from typing import cast as typing_cast
 
 import numpy as np
@@ -860,7 +860,7 @@ def _vectorize_reshape(op, node, x, shape):
 
 def reshape(
     x: "TensorLike",
-    newshape: Union["TensorLike", Sequence["TensorLike"]],
+    newshape: "TensorLike | Sequence[TensorLike]",
     *,
     ndim: int | None = None,
 ) -> TensorVariable:

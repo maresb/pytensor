@@ -2,7 +2,6 @@ import typing
 import warnings
 from abc import abstractmethod
 from collections.abc import Callable, Hashable
-from typing import Optional
 
 from pytensor.graph.basic import Apply, Constant
 from pytensor.graph.utils import MethodNotDefined
@@ -178,7 +177,7 @@ class CLinkerObject:
 class CLinkerOp(CLinkerObject):
     """Interface definition for `Op` subclasses compiled by `CLinker`."""
 
-    params_type: Optional["ParamsType"] = None
+    params_type: "ParamsType | None" = None
 
     @abstractmethod
     def c_code(

@@ -8,7 +8,7 @@ import sys
 from collections import defaultdict
 from copy import copy
 from io import StringIO
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from pytensor.compile.compilelock import lock_ctx
 from pytensor.configdefaults import config
@@ -1063,7 +1063,7 @@ class CLinker(Linker):
         input_storage=None,
         output_storage=None,
         storage_map=None,
-        cache: Optional["ModuleCache"] = None,
+        cache: "ModuleCache | None" = None,
     ):
         """Compile `self.fgraph`.
 
@@ -1144,7 +1144,7 @@ class CLinker(Linker):
         input_storage=None,
         output_storage=None,
         storage_map=None,
-        cache: Optional["ModuleCache"] = None,
+        cache: "ModuleCache | None" = None,
         **kwargs,
     ):
         """Compile this linker's `self.fgraph` and return a function that performs the computations.
@@ -1588,7 +1588,7 @@ class CLinker(Linker):
         in_storage,
         out_storage,
         storage_map=None,
-        cache: Optional["ModuleCache"] = None,
+        cache: "ModuleCache | None" = None,
     ):
         """
         Returns a thunk that points to an instance of a C struct that

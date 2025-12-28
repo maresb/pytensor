@@ -5,7 +5,7 @@ from collections.abc import Callable, Sequence
 from copy import copy
 from functools import partial
 from itertools import chain
-from typing import Union, cast
+from typing import cast
 
 from pytensor.compile.function import function
 from pytensor.compile.function.pfunc import rebuild_collect_shared
@@ -257,9 +257,9 @@ class OpFromGraph(Op, HasInnerGraph):
         outputs: list[Variable],
         *,
         inline: bool = False,
-        lop_overrides: Union[Callable, "OpFromGraph", None] = None,
-        grad_overrides: Union[Callable, "OpFromGraph", None] = None,
-        rop_overrides: Union[Callable, "OpFromGraph", None] = None,
+        lop_overrides: "Callable | OpFromGraph | None" = None,
+        grad_overrides: "Callable | OpFromGraph | None" = None,
+        rop_overrides: "Callable | OpFromGraph | None" = None,
         connection_pattern: list[list[bool]] | None = None,
         strict: bool = False,
         name: str | None = None,

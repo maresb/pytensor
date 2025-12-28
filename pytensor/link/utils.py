@@ -14,7 +14,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     NoReturn,
-    Optional,
     TextIO,
     TypeVar,
     cast,
@@ -40,9 +39,9 @@ if TYPE_CHECKING:
 def map_storage(
     fgraph: FunctionGraph,
     order: Iterable[Apply],
-    input_storage: Optional["InputStorageType"] = None,
-    output_storage: Optional["OutputStorageType"] = None,
-    storage_map: Optional["StorageMapType"] = None,
+    input_storage: "InputStorageType | None" = None,
+    output_storage: "OutputStorageType | None" = None,
+    storage_map: "StorageMapType | None" = None,
 ) -> tuple["InputStorageType", "OutputStorageType", "StorageMapType"]:
     """Ensure there is storage (a length-1 list) for inputs, outputs, and interior nodes.
 
@@ -669,7 +668,7 @@ def fgraph_to_python(
     *,
     type_conversion_fn: Callable = lambda x, **kwargs: x,
     order: list[Apply] | None = None,
-    storage_map: Optional["StorageMapType"] = None,
+    storage_map: "StorageMapType | None" = None,
     fgraph_name: str = "fgraph_to_python",
     global_env: dict[Any, Any] | None = None,
     local_env: dict[Any, Any] | None = None,

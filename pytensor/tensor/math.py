@@ -2,7 +2,7 @@ import builtins
 import warnings
 from collections.abc import Sequence
 from textwrap import dedent
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.lib.array_utils import normalize_axis_tuple
@@ -3879,7 +3879,7 @@ def logsumexp(x, axis=None, keepdims=False):
 _matmul = Blockwise(_dot, name="Matmul")
 
 
-def matmul(x1: "ArrayLike", x2: "ArrayLike", dtype: Optional["DTypeLike"] = None):
+def matmul(x1: "ArrayLike", x2: "ArrayLike", dtype: "DTypeLike | None" = None):
     """Compute the matrix product of two tensor variables.
 
     Parameters
@@ -3943,7 +3943,7 @@ def matmul(x1: "ArrayLike", x2: "ArrayLike", dtype: Optional["DTypeLike"] = None
 def vecdot(
     x1: TensorLike,
     x2: TensorLike,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
 ) -> TensorVariable:
     """Compute the vector dot product of two arrays.
 
@@ -3991,7 +3991,7 @@ def vecdot(
 
 
 def matvec(
-    x1: TensorLike, x2: TensorLike, dtype: Optional["DTypeLike"] = None
+    x1: TensorLike, x2: TensorLike, dtype: "DTypeLike | None" = None
 ) -> TensorVariable:
     """Compute the matrix-vector product.
 
@@ -4040,7 +4040,7 @@ def matvec(
 
 
 def vecmat(
-    x1: TensorLike, x2: TensorLike, dtype: Optional["DTypeLike"] = None
+    x1: TensorLike, x2: TensorLike, dtype: "DTypeLike | None" = None
 ) -> TensorVariable:
     """Compute the vector-matrix product.
 
