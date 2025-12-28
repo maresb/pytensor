@@ -52,7 +52,8 @@ class ThunkType(Protocol[C]):
     perform: PerformMethodType
 
 
-def is_thunk_type(thunk: ThunkCallableType) -> ThunkType:
+def is_thunk_type(thunk: ThunkCallableType) -> Callable[[], None]:
+    """Cast a thunk to ThunkType for static type checking."""
     res = cast(ThunkType, thunk)
     return res
 
@@ -508,7 +509,7 @@ class Op(MetaObject):
         compute_map: ComputeMapType | None,
         no_recycling: list[Variable],
         debug: bool = False,
-    ) -> ThunkType:
+    ) -> Callable[[], None]:
         """Make a Python thunk.
 
         Like :meth:`Op.make_thunk` but only makes Python thunks.
@@ -562,7 +563,7 @@ class Op(MetaObject):
         compute_map: ComputeMapType,
         no_recycling: list[Variable],
         impl: str | None = None,
-    ) -> ThunkType:
+    ) -> Callable[[], None]:
         r"""Create a thunk.
 
         This function must return a thunk, that is a zero-arguments
