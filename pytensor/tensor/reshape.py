@@ -127,7 +127,7 @@ def join_dims(x: TensorLike, axis: Sequence[int] | int | None = None) -> TensorV
     axis = normalize_axis_tuple(axis, x.ndim)
 
     if len(axis) <= 1:
-        return x
+        return x  # type: ignore[unreachable,unused-ignore]
 
     if np.diff(axis).max() > 1:
         raise ValueError(
@@ -255,7 +255,7 @@ def split_dims(
         # (3, ) and (3, 3) to (3, 4)
         return type_cast(TensorVariable, x.squeeze(axis=axis))
 
-    [axis] = normalize_axis_tuple(axis, x.ndim)
+    [axis] = normalize_axis_tuple(axis, x.ndim)  # type: ignore[misc,unused-ignore]
     shape = as_tensor_variable(shape, dtype="int64", ndim=1)
 
     split_op = SplitDims(axis=axis)
