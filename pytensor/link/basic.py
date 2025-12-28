@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from pytensor.tensor.variable import TensorVariable
 
 
-ThunkAndContainersType = tuple["BasicThunkType", list["Container"], list["Container"]]
+ThunkAndContainersType = tuple[Callable, list["Container"], list["Container"]]
 
 
 class Container:
@@ -190,7 +190,7 @@ class Linker(ABC):
     @abstractmethod
     def make_thunk(
         self, **kwargs
-    ) -> tuple[Callable, "InputStorageType", "OutputStorageType"]:
+    ) -> tuple[Callable, list, list]:
         """
         This function must return a triplet (function, input_variables,
         output_variables) where function is a thunk that operates on the
@@ -240,11 +240,11 @@ class LocalLinker(Linker):
 
     def make_thunk(
         self,
-        input_storage: Optional["InputStorageType"] = None,
-        output_storage: Optional["OutputStorageType"] = None,
-        storage_map: Optional["StorageMapType"] = None,
+        input_storage: Optional[list] = None,
+        output_storage: Optional[list] = None,
+        storage_map: Optional[dict] = None,
         **kwargs,
-    ) -> tuple["BasicThunkType", "InputStorageType", "OutputStorageType"]:
+    ) -> tuple[Callable, list, list]:
         return self.make_all(
             input_storage=input_storage,
             output_storage=output_storage,
@@ -253,13 +253,13 @@ class LocalLinker(Linker):
 
     def make_all(
         self,
-        input_storage: Optional["InputStorageType"] = None,
-        output_storage: Optional["OutputStorageType"] = None,
-        storage_map: Optional["StorageMapType"] = None,
+        input_storage: Optional[list] = None,
+        output_storage: Optional[list] = None,
+        storage_map: Optional[dict] = None,
     ) -> tuple[
-        "BasicThunkType",
-        "InputStorageType",
-        "OutputStorageType",
+        Callable,
+        list,
+        list,
         list[ThunkAndContainersType],
         list[Apply],
     ]:
