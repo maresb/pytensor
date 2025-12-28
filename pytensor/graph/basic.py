@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 OpType = TypeVar("OpType", bound="Op")
 OptionalApplyType = TypeVar("OptionalApplyType", None, "Apply", covariant=True)
-_TypeType = TypeVar("_TypeType", bound="Type")
+_TypeType = TypeVar("_TypeType", bound="pytensor.graph.type.Type")
 _IdType = TypeVar("_IdType", bound=Hashable)
 
 _MOVED_FUNCTIONS = {
