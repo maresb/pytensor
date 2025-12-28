@@ -202,7 +202,8 @@ def hash_from_code(msg: str | bytes | np.ndarray) -> str:
     if isinstance(msg, str):
         msg = msg.encode()
     # Python 3 does not like module names that start with a digit.
-    return f"m{hashlib.sha256(msg).hexdigest()}"
+    # np.ndarray implements the buffer protocol but mypy doesn't recognize this
+    return f"m{hashlib.sha256(msg).hexdigest()}"  # type: ignore[arg-type]
 
 
 def uniq(seq: Sequence) -> list:
