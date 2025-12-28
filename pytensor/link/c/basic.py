@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger("pytensor.link.c.basic")
 
 
-def get_module_cache(init_args: dict[str, Any] | None = None) -> "ModuleCache":
+def get_module_cache(init_args: dict[str, Any] | None = None) -> "pytensor.link.c.cmodule.ModuleCache":
     """
 
     Parameters
@@ -556,7 +556,7 @@ class CLinker(Linker):
         super().__init__(scheduler=schedule)
 
     def accept(
-        self, fgraph: "FunctionGraph", no_recycling=None, profile=None
+        self, fgraph: "pytensor.graph.fg.FunctionGraph", no_recycling=None, profile=None
     ) -> "CLinker":
         r"""Associate this `Linker` with `fgraph`.
 
@@ -1063,7 +1063,7 @@ class CLinker(Linker):
         input_storage=None,
         output_storage=None,
         storage_map=None,
-        cache: Optional["ModuleCache"] = None,
+        cache: Optional["pytensor.link.c.cmodule.ModuleCache"] = None,
     ):
         """Compile `self.fgraph`.
 
@@ -1144,7 +1144,7 @@ class CLinker(Linker):
         input_storage=None,
         output_storage=None,
         storage_map=None,
-        cache: Optional["ModuleCache"] = None,
+        cache: Optional["pytensor.link.c.cmodule.ModuleCache"] = None,
         **kwargs,
     ):
         """Compile this linker's `self.fgraph` and return a function that performs the computations.
@@ -1588,7 +1588,7 @@ class CLinker(Linker):
         in_storage,
         out_storage,
         storage_map=None,
-        cache: Optional["ModuleCache"] = None,
+        cache: Optional["pytensor.link.c.cmodule.ModuleCache"] = None,
     ):
         """
         Returns a thunk that points to an instance of a C struct that
