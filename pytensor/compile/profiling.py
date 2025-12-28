@@ -48,7 +48,7 @@ total_fct_exec_time: float = 0.0
 total_graph_rewrite_time: float = 0.0
 total_time_linker: float = 0.0
 
-_atexit_print_list: list[pytensor.compile.profiling.ProfileStats] = []
+_atexit_print_list: list = []  # list[ProfileStats]
 _atexit_registered: bool = False
 
 
