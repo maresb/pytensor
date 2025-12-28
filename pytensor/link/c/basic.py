@@ -3,12 +3,14 @@ Defines Linkers that deal with C implementations.
 
 """
 
+from __future__ import annotations
+
 import logging
 import sys
 from collections import defaultdict
 from copy import copy
 from io import StringIO
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from pytensor.compile.compilelock import lock_ctx
 from pytensor.configdefaults import config
@@ -36,14 +38,15 @@ NoParams = object()
 
 
 if TYPE_CHECKING:
-    pass
+    from pytensor.graph.fg import FunctionGraph
+    from pytensor.link.c.cmodule import ModuleCache
 
 _logger = logging.getLogger("pytensor.link.c.basic")
 
 
 def get_module_cache(
     init_args: dict[str, Any] | None = None,
-) -> "pytensor.link.c.cmodule.ModuleCache":
+) -> ModuleCache:
     """
 
     Parameters
@@ -556,9 +559,7 @@ class CLinker(Linker):
         self.fgraph = None
         super().__init__(scheduler=schedule)
 
-    def accept(
-        self, fgraph: "pytensor.graph.fg.FunctionGraph", no_recycling=None, profile=None
-    ) -> "CLinker":
+    def accept(self, fgraph: FunctionGraph, no_recycling=None, profile=None) -> CLinker:
         r"""Associate this `Linker` with `fgraph`.
 
         The `no_recycling` argument can contain a list of `Variable`\s that
@@ -1064,7 +1065,7 @@ class CLinker(Linker):
         input_storage=None,
         output_storage=None,
         storage_map=None,
-        cache: Optional["pytensor.link.c.cmodule.ModuleCache"] = None,
+        cache: ModuleCache | None = None,
     ):
         """Compile `self.fgraph`.
 
@@ -1145,7 +1146,7 @@ class CLinker(Linker):
         input_storage=None,
         output_storage=None,
         storage_map=None,
-        cache: Optional["pytensor.link.c.cmodule.ModuleCache"] = None,
+        cache: ModuleCache | None = None,
         **kwargs,
     ):
         """Compile this linker's `self.fgraph` and return a function that performs the computations.
@@ -1589,7 +1590,7 @@ class CLinker(Linker):
         in_storage,
         out_storage,
         storage_map=None,
-        cache: Optional["pytensor.link.c.cmodule.ModuleCache"] = None,
+        cache: ModuleCache | None = None,
     ):
         """
         Returns a thunk that points to an instance of a C struct that

@@ -1,18 +1,18 @@
+from __future__ import annotations
+
 import linecache
 import sys
 import traceback
 from abc import ABCMeta
 from collections.abc import Sequence
 from io import StringIO
-from typing import TYPE_CHECKING, Any, TypeVar, Union
+from typing import TYPE_CHECKING, Any, TypeVar
 
 
 if TYPE_CHECKING:
-    pass
+    from pytensor.graph.basic import Apply, Variable
 
-T = TypeVar(
-    "T", bound=Union["pytensor.graph.basic.Apply", "pytensor.graph.basic.Variable"]
-)
+T = TypeVar("T", bound="Apply | Variable")
 
 
 def simple_extract_stack(

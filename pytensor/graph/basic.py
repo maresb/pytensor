@@ -33,14 +33,13 @@ from pytensor.graph.utils import (
 
 
 if TYPE_CHECKING:
+    from pytensor.graph.op import Op
     from pytensor.graph.type import Type
 
 
-OpType = TypeVar("OpType", bound="pytensor.graph.op.Op")
-OptionalApplyType = TypeVar(
-    "OptionalApplyType", None, "pytensor.graph.basic.Apply", covariant=True
-)
-_TypeType = TypeVar("_TypeType", bound="pytensor.graph.type.Type")
+OpType = TypeVar("OpType", bound="Op")
+OptionalApplyType = TypeVar("OptionalApplyType", None, "Apply", covariant=True)
+_TypeType = TypeVar("_TypeType", bound="Type")
 _IdType = TypeVar("_IdType", bound=Hashable)
 
 _MOVED_FUNCTIONS = {
@@ -891,9 +890,7 @@ def clone(
 
 def clone_node_and_cache(
     node: Apply,
-    clone_d: dict[
-        Apply | Variable | pytensor.graph.op.Op, Apply | Variable | pytensor.graph.op.Op
-    ],
+    clone_d: dict[Apply | Variable | Op, Apply | Variable | Op],
     clone_inner_graphs=False,
     **kwargs,
 ) -> Apply | None:
@@ -914,7 +911,7 @@ def clone_node_and_cache(
         return None
 
     # Use a cached `Op` clone when available
-    new_op = cast("pytensor.graph.op.Op | None", clone_d.get(node.op))
+    new_op = cast("Op | None", clone_d.get(node.op))
 
     cloned_inputs: list[Variable] = [cast(Variable, clone_d[i]) for i in node.inputs]
 
@@ -948,15 +945,10 @@ def clone_get_equiv(
     outputs: Iterable[Variable],
     copy_inputs: bool = True,
     copy_orphans: bool = True,
-    memo: dict[
-        Apply | Variable | pytensor.graph.op.Op, Apply | Variable | pytensor.graph.op.Op
-    ]
-    | None = None,
+    memo: dict[Apply | Variable | Op, Apply | Variable | Op] | None = None,
     clone_inner_graphs: bool = False,
     **kwargs,
-) -> dict[
-    Apply | Variable | pytensor.graph.op.Op, Apply | Variable | pytensor.graph.op.Op
-]:
+) -> dict[Apply | Variable | Op, Apply | Variable | Op]:
     r"""Clone the graph between `inputs` and `outputs` and return a map of the cloned objects.
 
     This function works by recursively cloning inputs and rebuilding a directed

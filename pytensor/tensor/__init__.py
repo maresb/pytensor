@@ -1,8 +1,10 @@
 """Symbolic tensor types and constructor functions."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
 from functools import singledispatch
-from typing import TYPE_CHECKING, Any, NoReturn, Optional, Union
+from typing import TYPE_CHECKING, Any, NoReturn, Optional
 
 from pytensor.graph.basic import Constant, Variable
 from pytensor.graph.op import Op
@@ -14,12 +16,12 @@ if TYPE_CHECKING:
 
 # Note: ArrayLike from numpy.typing is not runtime-checkable, so we use Any
 # for the array-like portion of this union to maintain beartype compatibility.
-TensorLike = Union[Variable, Sequence[Variable], Any]
+TensorLike = Variable | Sequence[Variable] | Any
 
 
 def as_tensor_variable(
     x: TensorLike, name: str | None = None, ndim: int | None = None, **kwargs
-) -> "pytensor.tensor.variable.TensorVariable":
+) -> pytensor.tensor.variable.TensorVariable:
     """Convert `x` into an equivalent `TensorVariable`.
 
     This function can be used to turn ndarrays, numbers, `ScalarType` instances,
@@ -55,7 +57,7 @@ def as_tensor_variable(
 @singledispatch
 def _as_tensor_variable(
     x: TensorLike, name: str | None, ndim: int | None, **kwargs
-) -> "pytensor.tensor.variable.TensorVariable":
+) -> pytensor.tensor.variable.TensorVariable:
     raise NotImplementedError(f"Cannot convert {x!r} to a tensor variable.")
 
 
