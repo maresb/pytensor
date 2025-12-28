@@ -7,6 +7,7 @@ ProfileStats object for runtime and memory profiling.
 # TODO: ensure field width for string fields makes columns line up
 # TODO: what to do about 'diff summary'? (ask Fred?)
 #
+from __future__ import annotations
 
 import atexit
 import copy
@@ -46,7 +47,7 @@ total_fct_exec_time: float = 0.0
 total_graph_rewrite_time: float = 0.0
 total_time_linker: float = 0.0
 
-_atexit_print_list: list["ProfileStats"] = []
+_atexit_print_list: list["pytensor.compile.profiling.ProfileStats"] = []
 _atexit_registered: bool = False
 
 
