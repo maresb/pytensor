@@ -12,12 +12,14 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike, NDArray
 
 
-TensorLike = Union[Variable, Sequence[Variable], "ArrayLike"]
+# Note: ArrayLike from numpy.typing is not runtime-checkable, so we use Any
+# for the array-like portion of this union to maintain beartype compatibility.
+TensorLike = Union[Variable, Sequence[Variable], Any]
 
 
 def as_tensor_variable(
     x: TensorLike, name: str | None = None, ndim: int | None = None, **kwargs
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Convert `x` into an equivalent `TensorVariable`.
 
     This function can be used to turn ndarrays, numbers, `ScalarType` instances,
@@ -53,7 +55,7 @@ def as_tensor_variable(
 @singledispatch
 def _as_tensor_variable(
     x: TensorLike, name: str | None, ndim: int | None, **kwargs
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     raise NotImplementedError(f"Cannot convert {x!r} to a tensor variable.")
 
 
