@@ -43,6 +43,8 @@ relies on the following elements to work properly :
 
 """
 
+from __future__ import annotations
+
 import dataclasses
 import logging
 import time
@@ -1519,7 +1521,7 @@ class Scan(Op, ScanMethodsMixin, HasInnerGraph):
     def inner_outputs(self):
         return self.fgraph.outputs
 
-    def clone(self) -> "Scan":
+    def clone(self) -> Scan:
         res = copy(self)
         res.fgraph = res.fgraph.clone()
         return res

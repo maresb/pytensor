@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import abstractmethod
 from typing import Any, Generic, TypeAlias, TypeVar
 
@@ -33,7 +35,7 @@ class Type(MetaObject, Generic[D]):
     The `Type` that will be created by a call to `Type.make_constant`.
     """
 
-    def in_same_class(self, otype: "Type") -> bool | None:
+    def in_same_class(self, otype: Type) -> bool | None:
         """Determine if another `Type` represents a subset from the same "class" of types represented by `self`.
 
         A "class" of types could be something like "float64 tensors with four
@@ -50,7 +52,7 @@ class Type(MetaObject, Generic[D]):
         """
         return self == otype
 
-    def is_super(self, otype: "Type") -> bool | None:
+    def is_super(self, otype: Type) -> bool | None:
         """Determine if `self` is a supertype of `otype`.
 
         This method effectively implements the type relation ``>``.
@@ -207,7 +209,7 @@ class Type(MetaObject, Generic[D]):
         """
         return self.constant_type(type=self, data=value, name=name)
 
-    def clone(self, *args, **kwargs) -> "Type":
+    def clone(self, *args, **kwargs) -> Type:
         """Clone a copy of this type with the given arguments/keyword values, if any."""
         return type(self)(*args, **kwargs)
 

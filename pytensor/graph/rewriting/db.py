@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import math
 import sys
@@ -5,7 +7,6 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from functools import cmp_to_key
 from io import StringIO
-from typing import Union
 
 from pytensor.configdefaults import config
 from pytensor.graph.rewriting import basic as pytensor_rewriting
@@ -32,7 +33,7 @@ class RewriteDatabase:
     def register(
         self,
         name: str,
-        rewriter: Union["RewriteDatabase", RewritesType],
+        rewriter: RewriteDatabase | RewritesType,
         *tags: str,
         use_db_name_as_tag=True,
         overwrite_existing=False,
@@ -191,10 +192,10 @@ class RewriteDatabaseQuery:
         include: Iterable[str | None],
         require: OrderedSet | Sequence[str] | None = None,
         exclude: OrderedSet | Sequence[str] | None = None,
-        subquery: dict[str, "RewriteDatabaseQuery"] | None = None,
+        subquery: dict[str, RewriteDatabaseQuery] | None = None,
         position_cutoff: float = math.inf,
         extra_rewrites: Sequence[
-            tuple[Union["RewriteDatabaseQuery", RewritesType], int | float]
+            tuple[RewriteDatabaseQuery | RewritesType, int | float]
         ]
         | None = None,
     ):
@@ -247,7 +248,7 @@ class RewriteDatabaseQuery:
         if not hasattr(self, "extra_rewrites"):
             self.extra_rewrites = []
 
-    def including(self, *tags: str) -> "RewriteDatabaseQuery":
+    def including(self, *tags: str) -> RewriteDatabaseQuery:
         """Add rewrites with the given tags."""
         return RewriteDatabaseQuery(
             self.include.union(tags),
@@ -258,7 +259,7 @@ class RewriteDatabaseQuery:
             self.extra_rewrites,
         )
 
-    def excluding(self, *tags: str) -> "RewriteDatabaseQuery":
+    def excluding(self, *tags: str) -> RewriteDatabaseQuery:
         """Remove rewrites with the given tags."""
         return RewriteDatabaseQuery(
             self.include,
@@ -269,7 +270,7 @@ class RewriteDatabaseQuery:
             self.extra_rewrites,
         )
 
-    def requiring(self, *tags: str) -> "RewriteDatabaseQuery":
+    def requiring(self, *tags: str) -> RewriteDatabaseQuery:
         """Filter for rewrites with the given tags."""
         return RewriteDatabaseQuery(
             self.include,
@@ -281,8 +282,8 @@ class RewriteDatabaseQuery:
         )
 
     def register(
-        self, *rewrites: tuple["RewriteDatabaseQuery", int | float]
-    ) -> "RewriteDatabaseQuery":
+        self, *rewrites: tuple[RewriteDatabaseQuery, int | float]
+    ) -> RewriteDatabaseQuery:
         """Include the given rewrites."""
         return RewriteDatabaseQuery(
             self.include,
@@ -337,7 +338,7 @@ class EquilibriumDB(RewriteDatabase):
     def register(
         self,
         name: str,
-        rewriter: Union["RewriteDatabase", RewritesType],
+        rewriter: RewriteDatabase | RewritesType,
         *tags: str,
         final_rewriter: bool = False,
         cleanup: bool = False,

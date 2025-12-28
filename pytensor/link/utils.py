@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import builtins
 import io
 import re
@@ -14,7 +16,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     NoReturn,
-    Optional,
     TextIO,
     TypeVar,
     cast,
@@ -40,10 +41,10 @@ if TYPE_CHECKING:
 def map_storage(
     fgraph: FunctionGraph,
     order: Iterable[Apply],
-    input_storage: Optional["InputStorageType"] = None,
-    output_storage: Optional["OutputStorageType"] = None,
-    storage_map: Optional["StorageMapType"] = None,
-) -> tuple["InputStorageType", "OutputStorageType", "StorageMapType"]:
+    input_storage: InputStorageType | None = None,
+    output_storage: OutputStorageType | None = None,
+    storage_map: StorageMapType | None = None,
+) -> tuple[InputStorageType, OutputStorageType, StorageMapType]:
     """Ensure there is storage (a length-1 list) for inputs, outputs, and interior nodes.
 
     Parameters
@@ -145,10 +146,10 @@ def streamline(
     fgraph: FunctionGraph,
     thunks: Sequence[Callable[[], None]],
     order: Sequence[Apply],
-    post_thunk_old_storage: list["StorageCellType"] | None = None,
-    no_recycling: list["StorageCellType"] | None = None,
+    post_thunk_old_storage: list[StorageCellType] | None = None,
+    no_recycling: list[StorageCellType] | None = None,
     nice_errors: bool = True,
-) -> "BasicThunkType":
+) -> BasicThunkType:
     """Construct a single thunk that runs a list of thunks.
 
     Parameters
@@ -669,7 +670,7 @@ def fgraph_to_python(
     *,
     type_conversion_fn: Callable = lambda x, **kwargs: x,
     order: list[Apply] | None = None,
-    storage_map: Optional["StorageMapType"] = None,
+    storage_map: StorageMapType | None = None,
     fgraph_name: str = "fgraph_to_python",
     global_env: dict[Any, Any] | None = None,
     local_env: dict[Any, Any] | None = None,

@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import copy
 from collections.abc import Generator, Sequence
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import pytensor
 from pytensor.graph.basic import (
@@ -20,7 +22,7 @@ if TYPE_CHECKING:
 def rewrite_graph(
     graph: Variable | Sequence[Variable] | FunctionGraph,
     include: Sequence[str] = ("canonicalize",),
-    custom_rewrite: Optional["GraphRewriter"] = None,
+    custom_rewrite: GraphRewriter | None = None,
     clone: bool = False,
     **kwargs,
 ) -> Variable | Sequence[Variable] | FunctionGraph:

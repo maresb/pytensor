@@ -5,12 +5,14 @@ manipulation of tensors.
 
 """
 
+from __future__ import annotations
+
 import builtins
 import warnings
 from collections.abc import Sequence
 from functools import partial
 from numbers import Number
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 from typing import cast as type_cast
 
 import numpy as np
@@ -1516,7 +1518,7 @@ def register_infer_shape(rewrite, *tags, **kwargs):
 
 def infer_static_shape(
     shape: Variable | Sequence[Variable | int],
-) -> tuple[Sequence["TensorLike"], Sequence[int | None]]:
+) -> tuple[Sequence[TensorLike], Sequence[int | None]]:
     """Infer the static shapes implied by the potentially symbolic elements in `shape`.
 
     `shape` will be validated and constant folded.  As a result, this function
@@ -2133,7 +2135,7 @@ def transpose(x, axes=None):
     return ret
 
 
-def matrix_transpose(x: "TensorLike") -> TensorVariable:
+def matrix_transpose(x: TensorLike) -> TensorVariable:
     """
     Transposes each 2-dimensional matrix tensor along the last two dimensions of a higher-dimensional tensor.
 
@@ -2900,7 +2902,7 @@ def roll(x, shift, axis=None):
     )
 
 
-def stack(tensors: Sequence["TensorLike"], axis: int = 0):
+def stack(tensors: Sequence[TensorLike], axis: int = 0):
     """Stack tensors in sequence on given axis (default is 0).
 
     Take a sequence of tensors or tensor-like constant and stack them on
@@ -3114,7 +3116,7 @@ def flatten(x, ndim=1):
 
 
 def tile(
-    A: "TensorLike", reps: Union[Sequence[Union[int, "TensorLike"]], "TensorLike"]
+    A: TensorLike, reps: Sequence[int | TensorLike] | TensorLike
 ) -> TensorVariable:
     """
     Tile input tensor `A` according to `reps`.
@@ -4479,7 +4481,7 @@ atleast_2d = partial(atleast_Nd, n=2)
 atleast_3d = partial(atleast_Nd, n=3)
 
 
-def expand_dims(a: "TensorLike", axis: Sequence[int] | int) -> TensorVariable:
+def expand_dims(a: TensorLike, axis: Sequence[int] | int) -> TensorVariable:
     """Expand the shape of an array.
 
     Insert a new axis that will appear at the `axis` position in the expanded
