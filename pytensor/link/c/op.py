@@ -28,6 +28,7 @@ class CThunkWrapperType(ThunkType):
 
 
 def is_cthunk_wrapper_type(thunk: Callable[[], None]) -> CThunkWrapperType:
+    """Cast a thunk to CThunkWrapperType for static type checking."""
     res = cast(CThunkWrapperType, thunk)
     return res
 

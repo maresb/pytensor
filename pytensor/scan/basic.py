@@ -25,7 +25,7 @@ from pytensor.updates import OrderedUpdates
 
 
 if typing.TYPE_CHECKING:
-    from pytensor.tensor.type import TensorVariable
+    from pytensor.tensor.variable import TensorVariable
 
 
 def get_updates_and_outputs(ls):

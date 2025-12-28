@@ -195,14 +195,15 @@ def output_subprocess_Popen(command: list[str], **params) -> tuple[bytes, bytes,
     return (*out, p.returncode)
 
 
-def hash_from_code(msg: str | bytes) -> str:
-    """Return the SHA256 hash of a string or bytes."""
+def hash_from_code(msg: str | bytes | np.ndarray) -> str:
+    """Return the SHA256 hash of a string, bytes, or buffer-like object."""
     # hashlib.sha256() requires an object that supports buffer interface,
     # but Python 3 (unicode) strings don't.
     if isinstance(msg, str):
         msg = msg.encode()
     # Python 3 does not like module names that start with a digit.
-    return f"m{hashlib.sha256(msg).hexdigest()}"
+    # np.ndarray implements the buffer protocol but mypy doesn't recognize this
+    return f"m{hashlib.sha256(msg).hexdigest()}"  # type: ignore[arg-type]
 
 
 def uniq(seq: Sequence) -> list:

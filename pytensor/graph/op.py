@@ -9,6 +9,7 @@ from typing import (
     Protocol,
     TypeVar,
     cast,
+    runtime_checkable,
 )
 
 import pytensor
@@ -25,7 +26,6 @@ from pytensor.graph.utils import (
 
 if TYPE_CHECKING:
     from pytensor.compile.function.types import Function
-    from pytensor.graph.fg import FunctionGraph
     from pytensor.graph.type import Type
 
 StorageCellType = list[Any | None]
@@ -42,6 +42,7 @@ ThunkCallableType = Callable[
 C = TypeVar("C", bound=Callable)
 
 
+@runtime_checkable
 class ThunkType(Protocol[C]):
     inputs: list[list[list[Any] | None]]
     outputs: list[list[list[Any] | None]]
@@ -51,6 +52,7 @@ class ThunkType(Protocol[C]):
 
 
 def is_thunk_type(thunk: ThunkCallableType) -> ThunkType:
+    """Cast a thunk to ThunkType for static type checking."""
     res = cast(ThunkType, thunk)
     return res
 
@@ -458,7 +460,9 @@ class Op(MetaObject):
 
         """
 
-    def do_constant_folding(self, fgraph: "FunctionGraph", node: Apply) -> bool:
+    def do_constant_folding(
+        self, fgraph: "pytensor.graph.fg.FunctionGraph", node: Apply
+    ) -> bool:
         """Determine whether or not constant folding should be performed for the given node.
 
         This allows each `Op` to determine if it wants to be constant
@@ -633,7 +637,7 @@ class _NoPythonOp(Op):
 class HasInnerGraph(ABC):
     r"""A mixin for an `Op` that contain an inner graph."""
 
-    fgraph: "FunctionGraph"
+    fgraph: "pytensor.graph.fg.FunctionGraph"
     """A `FunctionGraph` of the inner function."""
 
     @property

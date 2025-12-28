@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Union
 
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply, Variable
@@ -15,16 +15,10 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from pytensor.compile.profiling import ProfileStats
-    from pytensor.graph.op import (
-        BasicThunkType,
-        InputStorageType,
-        OutputStorageType,
-        StorageMapType,
-    )
     from pytensor.tensor.variable import TensorVariable
 
 
-ThunkAndContainersType = tuple["BasicThunkType", list["Container"], list["Container"]]
+ThunkAndContainersType = tuple[Callable, list["Container"], list["Container"]]
 
 
 class Container:
@@ -188,9 +182,7 @@ class Linker(ABC):
         return new
 
     @abstractmethod
-    def make_thunk(
-        self, **kwargs
-    ) -> tuple[Callable, "InputStorageType", "OutputStorageType"]:
+    def make_thunk(self, **kwargs) -> tuple[Callable, list, list]:
         """
         This function must return a triplet (function, input_variables,
         output_variables) where function is a thunk that operates on the
@@ -240,11 +232,11 @@ class LocalLinker(Linker):
 
     def make_thunk(
         self,
-        input_storage: Optional["InputStorageType"] = None,
-        output_storage: Optional["OutputStorageType"] = None,
-        storage_map: Optional["StorageMapType"] = None,
+        input_storage: list | None = None,
+        output_storage: list | None = None,
+        storage_map: dict | None = None,
         **kwargs,
-    ) -> tuple["BasicThunkType", "InputStorageType", "OutputStorageType"]:
+    ) -> tuple[Callable, list, list]:
         return self.make_all(
             input_storage=input_storage,
             output_storage=output_storage,
@@ -253,13 +245,13 @@ class LocalLinker(Linker):
 
     def make_all(
         self,
-        input_storage: Optional["InputStorageType"] = None,
-        output_storage: Optional["OutputStorageType"] = None,
-        storage_map: Optional["StorageMapType"] = None,
+        input_storage: list | None = None,
+        output_storage: list | None = None,
+        storage_map: dict | None = None,
     ) -> tuple[
-        "BasicThunkType",
-        "InputStorageType",
-        "OutputStorageType",
+        Callable,
+        list,
+        list,
         list[ThunkAndContainersType],
         list[Apply],
     ]:

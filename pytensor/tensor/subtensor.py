@@ -105,7 +105,9 @@ invalid_tensor_types = (
 
 def indices_from_subtensor(
     op_indices: Iterable[ScalarConstant],
-    idx_list: list[Type | slice | Variable] | None,
+    idx_list: list[Type | slice | Variable]
+    | tuple[Type | slice | Variable, ...]
+    | None,
 ) -> tuple[slice | Variable, ...]:
     """Recreate the index tuple from which a ``*Subtensor**`` ``Op`` was created.
 
