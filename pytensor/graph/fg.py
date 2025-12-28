@@ -3,7 +3,7 @@
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from typing import Any, Union, cast
+from typing import Any, cast
 
 import pytensor
 from pytensor.configdefaults import config
@@ -846,7 +846,7 @@ class FunctionGraph(MetaObject):
         self, check_integrity: bool = True, attach_feature: bool = True, **kwargs
     ) -> tuple[
         "FunctionGraph",
-        dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]],
+        dict[Apply | Variable | "Op", Apply | Variable | "Op"],
     ]:
         """Clone the graph and return a ``dict`` that maps old nodes to new nodes.
 
