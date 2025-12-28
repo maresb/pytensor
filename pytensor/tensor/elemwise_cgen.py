@@ -210,7 +210,7 @@ def make_alloc(loop_orders, dtype, sub, fortran="0"):
 
 
 def make_loop(
-    loop_orders: list[tuple[int | str, ...]],
+    loop_orders: list[list[int | str] | tuple[int | str, ...]],
     dtypes: list,
     loop_tasks: list,
     sub: dict[str, str],
