@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, Union
 if TYPE_CHECKING:
     from pytensor.graph.basic import Apply, Variable
 
-T = TypeVar("T", bound=Union["Apply", "Variable"])
+T = TypeVar("T", bound=Union["pytensor.graph.basic.Apply", "pytensor.graph.basic.Variable"])
 
 
 def simple_extract_stack(
