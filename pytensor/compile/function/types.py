@@ -362,7 +362,7 @@ class Function:
 
     def __init__(
         self,
-        vm: "VM",
+        vm: "pytensor.link.vm.VM",
         input_storage: list[Container],
         output_storage: list[Container],
         indices,

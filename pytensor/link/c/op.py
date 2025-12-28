@@ -27,7 +27,8 @@ class CThunkWrapperType(ThunkType):
     cthunk: ThunkType
 
 
-def is_cthunk_wrapper_type(thunk: Callable[[], None]) -> CThunkWrapperType:
+def is_cthunk_wrapper_type(thunk: Callable[[], None]) -> Callable[[], None]:
+    """Cast a thunk to CThunkWrapperType for static type checking."""
     res = cast(CThunkWrapperType, thunk)
     return res
 
@@ -41,7 +42,7 @@ class COp(Op, CLinkerOp):
         storage_map: StorageMapType,
         compute_map: ComputeMapType | None,
         no_recycling: Collection[Variable],
-    ) -> CThunkWrapperType:
+    ) -> Callable[[], None]:
         """Create a thunk for a C implementation.
 
         Like :meth:`Op.make_thunk`, but will only try to make a C thunk.
