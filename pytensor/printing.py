@@ -844,7 +844,7 @@ class Printer(ABC):
 
 
 @contextmanager
-def set_precedence(pstate: PrinterState, precedence: int = -1000):
+def set_precedence(pstate: PrinterState, precedence: int | float = -1000):
     """Temporarily set the precedence of a `PrinterState`."""
     old_precedence = getattr(pstate, "precedence", None)
     pstate.precedence = precedence
