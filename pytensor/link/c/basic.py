@@ -36,13 +36,14 @@ NoParams = object()
 
 
 if TYPE_CHECKING:
-    from pytensor.graph.fg import FunctionGraph
-    from pytensor.link.c.cmodule import ModuleCache
+    pass
 
 _logger = logging.getLogger("pytensor.link.c.basic")
 
 
-def get_module_cache(init_args: dict[str, Any] | None = None) -> "pytensor.link.c.cmodule.ModuleCache":
+def get_module_cache(
+    init_args: dict[str, Any] | None = None,
+) -> "pytensor.link.c.cmodule.ModuleCache":
     """
 
     Parameters

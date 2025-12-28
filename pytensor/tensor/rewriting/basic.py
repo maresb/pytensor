@@ -33,7 +33,6 @@ from pytensor.graph import FunctionGraph, Op
 from pytensor.graph.basic import Constant
 from pytensor.graph.rewriting.basic import (
     NodeProcessingGraphRewriter,
-    NodeRewriter,
     Rewriter,
     copy_stack_trace,
     dfs_rewriter,
@@ -153,9 +152,7 @@ def alloc_like(
     return rval
 
 
-def register_useless(
-    node_rewriter: RewriteDatabase | Rewriter | str, *tags, **kwargs
-):
+def register_useless(node_rewriter: RewriteDatabase | Rewriter | str, *tags, **kwargs):
     if isinstance(node_rewriter, str):
 
         def register(inner_rewriter: RewriteDatabase | Rewriter):

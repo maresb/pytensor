@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Union
 
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply, Variable
@@ -15,12 +15,6 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from pytensor.compile.profiling import ProfileStats
-    from pytensor.graph.op import (
-        BasicThunkType,
-        InputStorageType,
-        OutputStorageType,
-        StorageMapType,
-    )
     from pytensor.tensor.variable import TensorVariable
 
 
@@ -188,9 +182,7 @@ class Linker(ABC):
         return new
 
     @abstractmethod
-    def make_thunk(
-        self, **kwargs
-    ) -> tuple[Callable, list, list]:
+    def make_thunk(self, **kwargs) -> tuple[Callable, list, list]:
         """
         This function must return a triplet (function, input_variables,
         output_variables) where function is a thunk that operates on the
@@ -240,9 +232,9 @@ class LocalLinker(Linker):
 
     def make_thunk(
         self,
-        input_storage: Optional[list] = None,
-        output_storage: Optional[list] = None,
-        storage_map: Optional[dict] = None,
+        input_storage: list | None = None,
+        output_storage: list | None = None,
+        storage_map: dict | None = None,
         **kwargs,
     ) -> tuple[Callable, list, list]:
         return self.make_all(
@@ -253,9 +245,9 @@ class LocalLinker(Linker):
 
     def make_all(
         self,
-        input_storage: Optional[list] = None,
-        output_storage: Optional[list] = None,
-        storage_map: Optional[dict] = None,
+        input_storage: list | None = None,
+        output_storage: list | None = None,
+        storage_map: dict | None = None,
     ) -> tuple[
         Callable,
         list,

@@ -44,7 +44,7 @@ from pytensor.utils import (
 
 
 if TYPE_CHECKING:
-    from pytensor.link.c.basic import CLinker
+    pass
 
 
 class StdLibDirsAndLibsType(Protocol):

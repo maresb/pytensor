@@ -26,7 +26,6 @@ from pytensor.graph.utils import (
 
 if TYPE_CHECKING:
     from pytensor.compile.function.types import Function
-    from pytensor.graph.fg import FunctionGraph
     from pytensor.graph.type import Type
 
 StorageCellType = list[Any | None]
@@ -461,7 +460,9 @@ class Op(MetaObject):
 
         """
 
-    def do_constant_folding(self, fgraph: "pytensor.graph.fg.FunctionGraph", node: Apply) -> bool:
+    def do_constant_folding(
+        self, fgraph: "pytensor.graph.fg.FunctionGraph", node: Apply
+    ) -> bool:
         """Determine whether or not constant folding should be performed for the given node.
 
         This allows each `Op` to determine if it wants to be constant

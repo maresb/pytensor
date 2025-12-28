@@ -2,6 +2,7 @@
 ProfileStats object for runtime and memory profiling.
 
 """
+
 #
 # TODO: add tip to use specify_shape (is specify_shape even in library doc?)
 # TODO: ensure field width for string fields makes columns line up
@@ -47,7 +48,7 @@ total_fct_exec_time: float = 0.0
 total_graph_rewrite_time: float = 0.0
 total_time_linker: float = 0.0
 
-_atexit_print_list: list["pytensor.compile.profiling.ProfileStats"] = []
+_atexit_print_list: list[pytensor.compile.profiling.ProfileStats] = []
 _atexit_registered: bool = False
 
 
@@ -233,9 +234,9 @@ class ProfileStats:
     # Total time spent in Function.vm.__call__
     #
 
-    apply_time: dict[tuple["FunctionGraph", Apply], float]
+    apply_time: dict[tuple[FunctionGraph, Apply], float]
 
-    apply_callcount: dict[tuple["FunctionGraph", Apply], int]
+    apply_callcount: dict[tuple[FunctionGraph, Apply], int]
 
     apply_cimpl: dict[Apply, bool] | None = None
     # dict from node -> bool (1 if c, 0 if py)

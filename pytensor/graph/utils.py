@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, Any, TypeVar, Union
 
 
 if TYPE_CHECKING:
-    from pytensor.graph.basic import Apply, Variable
+    pass
 
-T = TypeVar("T", bound=Union["pytensor.graph.basic.Apply", "pytensor.graph.basic.Variable"])
+T = TypeVar(
+    "T", bound=Union["pytensor.graph.basic.Apply", "pytensor.graph.basic.Variable"]
+)
 
 
 def simple_extract_stack(

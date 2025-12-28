@@ -33,8 +33,7 @@ from pytensor.link.utils import raise_with_op
 
 
 if TYPE_CHECKING:
-    from pytensor.compile.mode import Mode
-    from pytensor.link.vm import VM
+    pass
 
 
 _logger = logging.getLogger("pytensor.compile.function.types")
