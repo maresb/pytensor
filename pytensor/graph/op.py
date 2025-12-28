@@ -460,7 +460,7 @@ class Op(MetaObject):
 
         """
 
-    def do_constant_folding(self, fgraph: "FunctionGraph", node: Apply) -> bool:
+    def do_constant_folding(self, fgraph: "pytensor.graph.fg.FunctionGraph", node: Apply) -> bool:
         """Determine whether or not constant folding should be performed for the given node.
 
         This allows each `Op` to determine if it wants to be constant
@@ -635,7 +635,7 @@ class _NoPythonOp(Op):
 class HasInnerGraph(ABC):
     r"""A mixin for an `Op` that contain an inner graph."""
 
-    fgraph: "FunctionGraph"
+    fgraph: "pytensor.graph.fg.FunctionGraph"
     """A `FunctionGraph` of the inner function."""
 
     @property
