@@ -1,9 +1,11 @@
 """A container for specifying and manipulating a graph with distinct inputs and outputs."""
 
+from __future__ import annotations
+
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from typing import Any, Union, cast
+from typing import Any, cast
 
 import pytensor
 from pytensor.configdefaults import config
@@ -838,15 +840,15 @@ class FunctionGraph(MetaObject):
     def __repr__(self):
         return f"FunctionGraph({', '.join(graph_as_string(self.inputs, self.outputs))})"
 
-    def clone(self, check_integrity=True) -> "FunctionGraph":
+    def clone(self, check_integrity=True) -> FunctionGraph:
         """Clone the graph."""
         return self.clone_get_equiv(check_integrity)[0]
 
     def clone_get_equiv(
         self, check_integrity: bool = True, attach_feature: bool = True, **kwargs
     ) -> tuple[
-        "FunctionGraph",
-        dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]],
+        FunctionGraph,
+        dict[Apply | Variable | Op, Apply | Variable | Op],
     ]:
         """Clone the graph and return a ``dict`` that maps old nodes to new nodes.
 

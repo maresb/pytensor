@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from pytensor.configdefaults import config
 from pytensor.graph.basic import Apply, Variable
@@ -118,7 +120,7 @@ class Container:
     def __repr__(self):
         return "<" + repr(self.storage[0]) + ">"
 
-    def __deepcopy__(self, memo: dict[int, Any]) -> "Container":
+    def __deepcopy__(self, memo: dict[int, Any]) -> Container:
         data_was_in_memo = id(self.storage[0]) in memo
         r = type(self)(
             deepcopy(self.type, memo=memo),
@@ -181,7 +183,7 @@ class Linker(ABC):
         """
         return self._allow_gc
 
-    def clone(self, allow_gc: bool | None = None) -> "Linker":
+    def clone(self, allow_gc: bool | None = None) -> Linker:
         new = copy(self)
         if allow_gc is not None:
             new._allow_gc = allow_gc
@@ -190,7 +192,7 @@ class Linker(ABC):
     @abstractmethod
     def make_thunk(
         self, **kwargs
-    ) -> tuple[Callable, "InputStorageType", "OutputStorageType"]:
+    ) -> tuple[Callable, InputStorageType, OutputStorageType]:
         """
         This function must return a triplet (function, input_variables,
         output_variables) where function is a thunk that operates on the
@@ -240,11 +242,11 @@ class LocalLinker(Linker):
 
     def make_thunk(
         self,
-        input_storage: Optional["InputStorageType"] = None,
-        output_storage: Optional["OutputStorageType"] = None,
-        storage_map: Optional["StorageMapType"] = None,
+        input_storage: InputStorageType | None = None,
+        output_storage: OutputStorageType | None = None,
+        storage_map: StorageMapType | None = None,
         **kwargs,
-    ) -> tuple["BasicThunkType", "InputStorageType", "OutputStorageType"]:
+    ) -> tuple[BasicThunkType, InputStorageType, OutputStorageType]:
         return self.make_all(
             input_storage=input_storage,
             output_storage=output_storage,
@@ -253,13 +255,13 @@ class LocalLinker(Linker):
 
     def make_all(
         self,
-        input_storage: Optional["InputStorageType"] = None,
-        output_storage: Optional["OutputStorageType"] = None,
-        storage_map: Optional["StorageMapType"] = None,
+        input_storage: InputStorageType | None = None,
+        output_storage: OutputStorageType | None = None,
+        storage_map: StorageMapType | None = None,
     ) -> tuple[
-        "BasicThunkType",
-        "InputStorageType",
-        "OutputStorageType",
+        BasicThunkType,
+        InputStorageType,
+        OutputStorageType,
         list[ThunkAndContainersType],
         list[Apply],
     ]:
@@ -298,8 +300,8 @@ class PerformLinker(LocalLinker):
         self,
         fgraph: FunctionGraph,
         no_recycling: Sequence[Variable] | None = None,
-        profile: Union[bool, "ProfileStats"] | None = None,
-    ) -> "PerformLinker":
+        profile: bool | ProfileStats | None = None,
+    ) -> PerformLinker:
         """Associate a `FunctionGraph` with this `Linker`.
 
         Parameters
@@ -445,7 +447,7 @@ class WrapLinker(Linker):
         self.linkers = linkers
         self.wrapper = wrapper
 
-    def __copy__(self) -> "WrapLinker":
+    def __copy__(self) -> WrapLinker:
         """
         Shallow copy of a WrapLinker.
 
@@ -474,9 +476,9 @@ class WrapLinker(Linker):
     def accept(
         self,
         fgraph: FunctionGraph,
-        no_recycling: Sequence["TensorVariable"] | None = None,
-        profile: Union[bool, "ProfileStats"] | None = None,
-    ) -> "WrapLinker":
+        no_recycling: Sequence[TensorVariable] | None = None,
+        profile: bool | ProfileStats | None = None,
+    ) -> WrapLinker:
         """
 
         Parameters
@@ -501,8 +503,8 @@ class WrapLinker(Linker):
 
     def pre(
         self,
-        f: "WrapLinker",
-        inputs: list["NDArray"] | list[float | None],
+        f: WrapLinker,
+        inputs: list[NDArray] | list[float | None],
         order: list[Apply],
         thunk_groups: list[tuple[Callable]],
     ) -> None:

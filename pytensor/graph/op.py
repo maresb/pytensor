@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import sys
 import warnings
@@ -193,8 +195,8 @@ class Op(MetaObject):
 
     """
 
-    itypes: Sequence["Type"] | None = None
-    otypes: Sequence["Type"] | None = None
+    itypes: Sequence[Type] | None = None
+    otypes: Sequence[Type] | None = None
 
     _output_type_depends_on_input_value = False
     """
@@ -458,7 +460,7 @@ class Op(MetaObject):
 
         """
 
-    def do_constant_folding(self, fgraph: "FunctionGraph", node: Apply) -> bool:
+    def do_constant_folding(self, fgraph: FunctionGraph, node: Apply) -> bool:
         """Determine whether or not constant folding should be performed for the given node.
 
         This allows each `Op` to determine if it wants to be constant
@@ -604,7 +606,7 @@ class Op(MetaObject):
         )
         return self.make_py_thunk(node, storage_map, compute_map, no_recycling)
 
-    def inplace_on_inputs(self, allowed_inplace_inputs: list[int]) -> "Op":
+    def inplace_on_inputs(self, allowed_inplace_inputs: list[int]) -> Op:
         """Try to return a version of self that tries to inplace in as many as `allowed_inplace_inputs`."""
         # TODO: Document this in the Create your own Op docs
         # By default, do nothing
@@ -633,12 +635,12 @@ class _NoPythonOp(Op):
 class HasInnerGraph(ABC):
     r"""A mixin for an `Op` that contain an inner graph."""
 
-    fgraph: "FunctionGraph"
+    fgraph: FunctionGraph
     """A `FunctionGraph` of the inner function."""
 
     @property
     @abstractmethod
-    def fn(self) -> "Function":
+    def fn(self) -> Function:
         """The compiled inner-graph function."""
 
     @property
