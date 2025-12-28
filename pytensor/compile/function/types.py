@@ -1450,7 +1450,7 @@ class FunctionMaker:
         outputs,
         additional_outputs,
         fgraph: FunctionGraph,
-        mode: "Mode",
+        mode: "pytensor.compile.mode.Mode",
         profile,
     ):
         rewriter = mode.optimizer
