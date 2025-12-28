@@ -597,7 +597,7 @@ class Function:
         self.n_returned_outputs = len(self.output_storage) - len(update_storage)
 
         # Function.__call__ is responsible for updating the inputs, unless the vm promises to do it itself
-        self.update_input_storage: tuple[int, Container] = ()
+        self.update_input_storage: tuple[tuple[int, Container], ...] = ()
         if getattr(vm, "need_update_inputs", True):
             self.update_input_storage = tuple(
                 zip(
