@@ -10,7 +10,7 @@ import warnings
 from collections.abc import Sequence
 from functools import partial
 from numbers import Number
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 from typing import cast as type_cast
 
 import numpy as np
@@ -3083,7 +3083,7 @@ def flatten(x, ndim=1):
 
 
 def tile(
-    A: "TensorLike", reps: Union[Sequence[Union[int, "TensorLike"]], "TensorLike"]
+    A: "TensorLike", reps: "Sequence[int | TensorLike] | TensorLike"
 ) -> TensorVariable:
     """
     Tile input tensor `A` according to `reps`.

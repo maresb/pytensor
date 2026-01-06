@@ -5,7 +5,6 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from functools import cmp_to_key
 from io import StringIO
-from typing import Union
 
 from pytensor.configdefaults import config
 from pytensor.graph.rewriting import basic as pytensor_rewriting
@@ -32,7 +31,7 @@ class RewriteDatabase:
     def register(
         self,
         name: str,
-        rewriter: Union["RewriteDatabase", RewritesType],
+        rewriter: "RewriteDatabase | RewritesType",
         *tags: str,
         use_db_name_as_tag=True,
         overwrite_existing=False,
@@ -194,7 +193,7 @@ class RewriteDatabaseQuery:
         subquery: dict[str, "RewriteDatabaseQuery"] | None = None,
         position_cutoff: float = math.inf,
         extra_rewrites: Sequence[
-            tuple[Union["RewriteDatabaseQuery", RewritesType], int | float]
+            tuple["RewriteDatabaseQuery | RewritesType", int | float]
         ]
         | None = None,
     ):
@@ -337,7 +336,7 @@ class EquilibriumDB(RewriteDatabase):
     def register(
         self,
         name: str,
-        rewriter: Union["RewriteDatabase", RewritesType],
+        rewriter: "RewriteDatabase | RewritesType",
         *tags: str,
         final_rewriter: bool = False,
         cleanup: bool = False,

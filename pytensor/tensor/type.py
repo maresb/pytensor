@@ -1,7 +1,7 @@
 import logging
 import warnings
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -782,7 +782,7 @@ ST = int | None
 def tensor(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[ST, ...] | None = None,
     **kwargs,
 ) -> "TensorVariable":
@@ -821,7 +821,7 @@ ulscalar = TensorType("uint64", ())
 def scalar(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
 ) -> "TensorVariable":
     """Return a symbolic scalar variable.
 
@@ -876,7 +876,7 @@ def _validate_static_shape(shape, ndim: int) -> tuple[ST, ...]:
 def vector(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[ST] | None = (None,),
 ) -> "TensorVariable":
     """Return a symbolic vector variable.
@@ -922,7 +922,7 @@ lmatrix = TensorType("int64", shape=(None, None))
 def matrix(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[ST, ST] | None = (None, None),
 ) -> "TensorVariable":
     """Return a symbolic matrix variable.
@@ -966,7 +966,7 @@ lrow = TensorType("int64", shape=(1, None))
 def row(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[Literal[1], ST] | None = (1, None),
 ) -> "TensorVariable":
     """Return a symbolic row variable (i.e. shape ``(1, None)``).
@@ -1010,7 +1010,7 @@ lcol = TensorType("int64", shape=(None, 1))
 def col(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[ST, Literal[1]] | None = (None, 1),
 ) -> "TensorVariable":
     """Return a symbolic column variable (i.e. shape ``(None, 1)``).
@@ -1052,7 +1052,7 @@ ltensor3 = TensorType("int64", shape=((None,) * 3))
 def tensor3(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[ST, ST, ST] | None = (None, None, None),
 ) -> "TensorVariable":
     """Return a symbolic 3D variable.
@@ -1092,7 +1092,7 @@ ltensor4 = TensorType("int64", shape=((None,) * 4))
 def tensor4(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[ST, ST, ST, ST] | None = (None, None, None, None),
 ) -> "TensorVariable":
     """Return a symbolic 4D variable.
@@ -1132,7 +1132,7 @@ ltensor5 = TensorType("int64", shape=((None,) * 5))
 def tensor5(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[ST, ST, ST, ST, ST] | None = (None, None, None, None, None),
 ) -> "TensorVariable":
     """Return a symbolic 5D variable.
@@ -1172,7 +1172,7 @@ ltensor6 = TensorType("int64", shape=((None,) * 6))
 def tensor6(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[ST, ST, ST, ST, ST, ST] | None = (
         None,
         None,
@@ -1219,7 +1219,7 @@ ltensor7 = TensorType("int64", shape=((None,) * 7))
 def tensor7(
     name: str | None = None,
     *,
-    dtype: Optional["DTypeLike"] = None,
+    dtype: "DTypeLike | None" = None,
     shape: tuple[ST, ST, ST, ST, ST, ST, ST] | None = (
         None,
         None,
