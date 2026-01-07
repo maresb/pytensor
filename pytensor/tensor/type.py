@@ -19,8 +19,6 @@ from pytensor.utils import apply_across_args
 if TYPE_CHECKING:
     from numpy.typing import DTypeLike
 
-    from pytensor.tensor.variable import TensorVariable
-
 
 _logger = logging.getLogger("pytensor.tensor.type")
 
@@ -785,7 +783,7 @@ def tensor(
     dtype: Optional["DTypeLike"] = None,
     shape: tuple[ST, ...] | None = None,
     **kwargs,
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     if name is not None:
         try:
             # Help catching errors with the new tensor API
@@ -822,7 +820,7 @@ def scalar(
     name: str | None = None,
     *,
     dtype: Optional["DTypeLike"] = None,
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic scalar variable.
 
     Parameters
@@ -878,7 +876,7 @@ def vector(
     *,
     dtype: Optional["DTypeLike"] = None,
     shape: tuple[ST] | None = (None,),
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic vector variable.
 
     Parameters
@@ -924,7 +922,7 @@ def matrix(
     *,
     dtype: Optional["DTypeLike"] = None,
     shape: tuple[ST, ST] | None = (None, None),
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic matrix variable.
 
     Parameters
@@ -968,7 +966,7 @@ def row(
     *,
     dtype: Optional["DTypeLike"] = None,
     shape: tuple[Literal[1], ST] | None = (1, None),
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic row variable (i.e. shape ``(1, None)``).
 
     Parameters
@@ -1012,7 +1010,7 @@ def col(
     *,
     dtype: Optional["DTypeLike"] = None,
     shape: tuple[ST, Literal[1]] | None = (None, 1),
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic column variable (i.e. shape ``(None, 1)``).
 
     Parameters
@@ -1054,7 +1052,7 @@ def tensor3(
     *,
     dtype: Optional["DTypeLike"] = None,
     shape: tuple[ST, ST, ST] | None = (None, None, None),
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic 3D variable.
 
     Parameters
@@ -1094,7 +1092,7 @@ def tensor4(
     *,
     dtype: Optional["DTypeLike"] = None,
     shape: tuple[ST, ST, ST, ST] | None = (None, None, None, None),
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic 4D variable.
 
     Parameters
@@ -1134,7 +1132,7 @@ def tensor5(
     *,
     dtype: Optional["DTypeLike"] = None,
     shape: tuple[ST, ST, ST, ST, ST] | None = (None, None, None, None, None),
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic 5D variable.
 
     Parameters
@@ -1181,7 +1179,7 @@ def tensor6(
         None,
         None,
     ),
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic 6D variable.
 
     Parameters
@@ -1229,7 +1227,7 @@ def tensor7(
         None,
         None,
     ),
-) -> "TensorVariable":
+) -> "pytensor.tensor.variable.TensorVariable":
     """Return a symbolic 7-D variable.
 
     Parameters

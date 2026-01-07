@@ -33,7 +33,6 @@ from pytensor.graph import FunctionGraph, Op
 from pytensor.graph.basic import Constant
 from pytensor.graph.rewriting.basic import (
     NodeProcessingGraphRewriter,
-    NodeRewriter,
     Rewriter,
     copy_stack_trace,
     dfs_rewriter,
@@ -153,9 +152,7 @@ def alloc_like(
     return rval
 
 
-def register_useless(
-    node_rewriter: RewriteDatabase | NodeRewriter | str, *tags, **kwargs
-):
+def register_useless(node_rewriter: RewriteDatabase | Rewriter | str, *tags, **kwargs):
     if isinstance(node_rewriter, str):
 
         def register(inner_rewriter: RewriteDatabase | Rewriter):
@@ -172,7 +169,7 @@ def register_useless(
 
 
 def register_canonicalize(
-    node_rewriter: RewriteDatabase | NodeRewriter | str, *tags: str, **kwargs
+    node_rewriter: RewriteDatabase | Rewriter | str, *tags: str, **kwargs
 ):
     if isinstance(node_rewriter, str):
 
@@ -189,7 +186,7 @@ def register_canonicalize(
 
 
 def register_stabilize(
-    node_rewriter: RewriteDatabase | NodeRewriter | str, *tags: str, **kwargs
+    node_rewriter: RewriteDatabase | Rewriter | str, *tags: str, **kwargs
 ):
     if isinstance(node_rewriter, str):
 
@@ -206,7 +203,7 @@ def register_stabilize(
 
 
 def register_specialize(
-    node_rewriter: RewriteDatabase | NodeRewriter | str, *tags: str, **kwargs
+    node_rewriter: RewriteDatabase | Rewriter | str, *tags: str, **kwargs
 ):
     if isinstance(node_rewriter, str):
 
@@ -223,7 +220,7 @@ def register_specialize(
 
 
 def register_uncanonicalize(
-    node_rewriter: RewriteDatabase | NodeRewriter | str, *tags: str, **kwargs
+    node_rewriter: RewriteDatabase | Rewriter | str, *tags: str, **kwargs
 ):
     if isinstance(node_rewriter, str):
 

@@ -553,7 +553,7 @@ def specify_shape(
 
     A single ``Ellipsis`` can be used to imply multiple ``None`` specified dimensions
     """
-    x = as_tensor_variable(x)  # type: ignore[arg-type]
+    x = as_tensor_variable(x)
 
     if not isinstance(shape, tuple | list):
         shape = (shape,)
@@ -561,7 +561,7 @@ def specify_shape(
     # If shape is a symbolic 1d vector of fixed length, we separate the items into a
     # tuple with one entry per shape dimension
     if len(shape) == 1 and shape[0] not in (None, Ellipsis):
-        shape_vector = ptb.as_tensor_variable(shape[0])  # type: ignore[arg-type]
+        shape_vector = ptb.as_tensor_variable(shape[0])
         if shape_vector.ndim == 1:
             try:
                 shape = tuple(shape_vector)
@@ -865,7 +865,7 @@ def reshape(
     ndim: int | None = None,
 ) -> TensorVariable:
     if ndim is None:
-        newshape = ptb.as_tensor_variable(newshape)  # type: ignore
+        newshape = ptb.as_tensor_variable(newshape)
         if newshape.type.ndim != 1:
             raise TypeError(
                 "New shape in reshape must be a vector or a list/tuple of"

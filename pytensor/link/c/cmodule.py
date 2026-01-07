@@ -3,6 +3,8 @@ Generate and compile C modules for Python.
 
 """
 
+from __future__ import annotations
+
 import atexit
 import importlib
 import logging
@@ -1190,7 +1192,7 @@ class ModuleCache:
         self._update_mappings(key, key_data, module.__file__, not key_broken)
         return key_data
 
-    def module_from_key(self, key, lnk: "CLinker"):
+    def module_from_key(self, key, lnk: CLinker):
         """
         Return a module from the cache, compiling it if necessary.
 

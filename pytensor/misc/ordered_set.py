@@ -14,7 +14,7 @@ class OrderedSet(MutableSet):
     def __contains__(self, value) -> bool:
         return value in self.values
 
-    def __iter__(self) -> Iterator:
+    def __iter__(self) -> Iterator[Any]:
         yield from self.values
 
     def __len__(self) -> int:

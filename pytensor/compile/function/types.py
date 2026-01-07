@@ -33,8 +33,7 @@ from pytensor.link.utils import raise_with_op
 
 
 if TYPE_CHECKING:
-    from pytensor.compile.mode import Mode
-    from pytensor.link.vm import VM
+    pass
 
 
 _logger = logging.getLogger("pytensor.compile.function.types")
@@ -362,7 +361,7 @@ class Function:
 
     def __init__(
         self,
-        vm: "VM",
+        vm: "pytensor.link.vm.VM",
         input_storage: list[Container],
         output_storage: list[Container],
         indices,
@@ -597,7 +596,7 @@ class Function:
         self.n_returned_outputs = len(self.output_storage) - len(update_storage)
 
         # Function.__call__ is responsible for updating the inputs, unless the vm promises to do it itself
-        self.update_input_storage: tuple[int, Container] = ()
+        self.update_input_storage: tuple[tuple[int, Container], ...] = ()
         if getattr(vm, "need_update_inputs", True):
             self.update_input_storage = tuple(
                 zip(
@@ -1450,7 +1449,7 @@ class FunctionMaker:
         outputs,
         additional_outputs,
         fgraph: FunctionGraph,
-        mode: "Mode",
+        mode: "pytensor.compile.mode.Mode",
         profile,
     ):
         rewriter = mode.optimizer

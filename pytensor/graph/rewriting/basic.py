@@ -2195,7 +2195,7 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
         failure_callback: FailureCallbackType | None = None,
         ignore_newtrees: bool = True,
         tracks_on_change_inputs: bool = False,
-        max_use_ratio: float | None = None,
+        max_use_ratio: float | int | None = None,
         final_rewriters: Sequence[GraphRewriter] | None = None,
         cleanup_rewriters: Sequence[GraphRewriter] | None = None,
     ):

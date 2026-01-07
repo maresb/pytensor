@@ -1468,7 +1468,7 @@ def broadcast_shape_iter(
     arrays: Iterable[TensorVariable | tuple[TensorVariable, ...]],
     arrays_are_shapes: bool = False,
     allow_runtime_broadcast: bool = False,
-) -> tuple[ps.ScalarVariable, ...]:
+) -> tuple[Variable, ...]:
     r"""Compute the shape resulting from broadcasting arrays.
 
 
