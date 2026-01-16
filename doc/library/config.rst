@@ -512,6 +512,10 @@ import ``pytensor`` and print the config variable, as in:
     disables C++ compilation when it is not.  On Darwin systems (e.g. Mac
     OS X), it looks for ``clang++`` and uses that when available.
 
+    The ``CXX`` environment variable is respected and takes precedence over
+    the automatic detection. This is useful for conda-forge environments where
+    the compiler is configured via environment variables.
+
     PyTensor prints a warning if it detects that no compiler is present.
 
     This value can point to any compiler binary (full path or not), but things may
