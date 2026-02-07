@@ -2554,7 +2554,10 @@ def _taylor_coefficients(
         coeff_at_x0 = graph_replace(deriv, {wrt: x0}, strict=False)
         coefficients.append(coeff_at_x0 / factorial_i)
         if i < n:
-            deriv = grad(deriv, wrt)
+            # Use disconnected_inputs="ignore" so that constant
+            # derivatives (where wrt is no longer in the graph) produce
+            # zeros instead of raising DisconnectedInputError.
+            deriv = grad(deriv, wrt, disconnected_inputs="ignore")
             # Simplify the derivative graph to prevent exponential blowup.
             deriv = rewrite_graph(deriv, include=("canonicalize", "stabilize"))
         factorial_i *= i + 1
