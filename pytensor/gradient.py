@@ -2613,6 +2613,8 @@ def taylor_series(
 
     x0 = as_tensor_variable(x0, dtype=wrt_tensor.type.dtype)
 
+    from pytensor.graph.rewriting.utils import rewrite_graph
+
     # f^{(0)}(x0)
     deriv = expression
     coeff_at_x0 = graph_replace(deriv, {wrt: x0}, strict=False)
@@ -2621,6 +2623,11 @@ def taylor_series(
     factorial_k = 1
     for k in range(1, n + 1):
         deriv = grad(deriv, wrt)
+        # Simplify the derivative graph to prevent exponential blowup.
+        # Without this, each successive grad differentiates through the
+        # entire unsimplified graph of the previous derivative, causing
+        # the symbolic expression to grow explosively.
+        deriv = rewrite_graph(deriv, include=("canonicalize", "stabilize"))
         factorial_k *= k
         coeff_at_x0 = graph_replace(deriv, {wrt: x0}, strict=False)
         result = result + (coeff_at_x0 / factorial_k) * (wrt - x0) ** k

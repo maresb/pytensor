@@ -1283,11 +1283,12 @@ class TestTaylorSeries:
         """Order 0 should return f(x0)."""
         x = dscalar("x")
         series = taylor_series(exp(x), wrt=x, n=0)
-        f = pytensor.function([x], series)
+        # At order 0 the result is f(x0) which doesn't depend on x,
+        # so we evaluate without providing x as an input.
+        f = pytensor.function([], series)
 
-        # exp(0) = 1, regardless of input x
-        assert f(0.0) == pytest.approx(1.0)
-        assert f(5.0) == pytest.approx(1.0)
+        # exp(0) = 1
+        assert f() == pytest.approx(1.0)
 
     def test_first_order(self):
         """Order 1 should return f(x0) + f'(x0)*(x - x0)."""
