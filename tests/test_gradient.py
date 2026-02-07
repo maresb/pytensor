@@ -24,6 +24,7 @@ from pytensor.gradient import (
     hessian,
     hessian_vector_product,
     jacobian,
+    stable_div,
     subgraph_grad,
     taylor_series,
     zero_grad,
@@ -1333,3 +1334,181 @@ class TestTaylorSeries:
         x = dscalar("x")
         with pytest.raises(ValueError, match="non-negative"):
             taylor_series(exp(x), wrt=x, n=-1)
+
+
+class TestStableDiv:
+    """Tests for the stable_div (removable singularity division) function."""
+
+    def test_sinc(self):
+        """sin(x)/x has a removable singularity of order 1 at x=0."""
+        from pytensor.tensor.math import sin
+
+        x = dscalar("x")
+        sinc = stable_div(sin(x), x, wrt=x, singularities=[(0, 1)])
+        f = pytensor.function([x], sinc)
+
+        # At the singularity: sin(0)/0 should give 1
+        np.testing.assert_allclose(f(0.0), 1.0, atol=1e-12)
+
+        # Away from singularity: should match sin(x)/x
+        for val in [0.1, 0.5, 1.0, -0.3]:
+            np.testing.assert_allclose(
+                f(val), np.sin(val) / val, rtol=1e-10
+            )
+
+    def test_sinc_gradient_at_zero(self):
+        """Gradient of sin(x)/x at x=0 should be 0."""
+        from pytensor.tensor.math import sin
+
+        x = dscalar("x")
+        sinc = stable_div(sin(x), x, wrt=x, singularities=[(0, 1)])
+        g = grad(sinc, wrt=x)
+        gf = pytensor.function([x], g)
+
+        # sinc'(0) = 0 (the function has a maximum at 0)
+        np.testing.assert_allclose(gf(0.0), 0.0, atol=1e-10)
+
+    def test_sinc_gradient_away_from_zero(self):
+        """Gradient of sin(x)/x away from x=0 should match finite diff."""
+        from pytensor.tensor.math import sin
+
+        x = dscalar("x")
+        sinc = stable_div(sin(x), x, wrt=x, singularities=[(0, 1)])
+        g = grad(sinc, wrt=x)
+        gf = pytensor.function([x], g)
+
+        for val in [0.5, 1.0, 2.0]:
+            # Finite difference approximation
+            h = 1e-7
+            fd = (np.sin(val + h) / (val + h) - np.sin(val - h) / (val - h)) / (2 * h)
+            np.testing.assert_allclose(gf(val), fd, rtol=1e-5)
+
+    def test_one_minus_cos_over_x_squared(self):
+        """(1-cos(x))/x^2 has a removable singularity of order 2 at x=0."""
+        from pytensor.tensor.math import cos
+
+        x = dscalar("x")
+        expr = stable_div(1 - cos(x), x**2, wrt=x, singularities=[(0, 2)])
+        f = pytensor.function([x], expr)
+
+        # At the singularity: limit is 1/2
+        np.testing.assert_allclose(f(0.0), 0.5, atol=1e-12)
+
+        # Away from singularity
+        for val in [0.1, 0.5, 1.0, -0.3]:
+            expected = (1 - np.cos(val)) / val**2
+            np.testing.assert_allclose(f(val), expected, rtol=1e-10)
+
+    def test_one_minus_cos_gradient_at_zero(self):
+        """Gradient of (1-cos(x))/x^2 at x=0 should be 0."""
+        from pytensor.tensor.math import cos
+
+        x = dscalar("x")
+        expr = stable_div(1 - cos(x), x**2, wrt=x, singularities=[(0, 2)])
+        g = grad(expr, wrt=x)
+        gf = pytensor.function([x], g)
+
+        # The function is even, so the derivative at 0 is 0
+        np.testing.assert_allclose(gf(0.0), 0.0, atol=1e-10)
+
+    def test_expm1_over_x(self):
+        """expm1(x)/x has a removable singularity of order 1 at x=0."""
+        from pytensor.tensor.math import expm1
+
+        x = dscalar("x")
+        expr = stable_div(expm1(x), x, wrt=x, singularities=[(0, 1)])
+        f = pytensor.function([x], expr)
+
+        # At the singularity: limit is 1
+        np.testing.assert_allclose(f(0.0), 1.0, atol=1e-12)
+
+        # Away from singularity
+        for val in [0.1, 0.5, -0.3]:
+            expected = np.expm1(val) / val
+            np.testing.assert_allclose(f(val), expected, rtol=1e-10)
+
+    def test_exp_minus_1_over_x(self):
+        """(exp(x)-1)/x using raw expressions, same as expm1(x)/x."""
+        x = dscalar("x")
+        expr = stable_div(exp(x) - 1, x, wrt=x, singularities=[(0, 1)])
+        f = pytensor.function([x], expr)
+
+        np.testing.assert_allclose(f(0.0), 1.0, atol=1e-12)
+        np.testing.assert_allclose(f(0.5), (np.exp(0.5) - 1) / 0.5, rtol=1e-10)
+
+    def test_j1_over_x(self):
+        """j1(x)/x (Bessel) has a removable singularity of order 1 at x=0."""
+        from scipy import special as sp
+
+        x = dscalar("x")
+        from pytensor.tensor.math import j1
+
+        expr = stable_div(j1(x), x, wrt=x, singularities=[(0, 1)])
+        f = pytensor.function([x], expr)
+
+        # limit of j1(x)/x as x->0 is 1/2
+        np.testing.assert_allclose(f(0.0), 0.5, atol=1e-12)
+
+        for val in [0.1, 0.5, 1.0]:
+            np.testing.assert_allclose(f(val), sp.j1(val) / val, rtol=1e-8)
+
+    def test_polynomial_ratio(self):
+        """x^2 / x should give x, singularity of order 1."""
+        x = dscalar("x")
+        expr = stable_div(x**2, x, wrt=x, singularities=[(0, 1)])
+        f = pytensor.function([x], expr)
+
+        for val in [0.0, 1.0, -2.0, 0.5]:
+            np.testing.assert_allclose(f(val), val, atol=1e-12)
+
+    def test_higher_order_polynomial_ratio(self):
+        """x^3 / x^2 should give x, singularity of order 2."""
+        x = dscalar("x")
+        expr = stable_div(x**3, x**2, wrt=x, singularities=[(0, 2)])
+        f = pytensor.function([x], expr)
+
+        for val in [0.0, 1.0, -2.0, 0.5]:
+            np.testing.assert_allclose(f(val), val, atol=1e-12)
+
+    def test_non_zero_singularity_point(self):
+        """Singularity at a non-zero point."""
+        from pytensor.tensor.math import sin
+
+        x = dscalar("x")
+        # sin(x - pi) / (x - pi) has a removable singularity at x=pi
+        expr = stable_div(
+            sin(x - np.pi), x - np.pi,
+            wrt=x, singularities=[(np.pi, 1)],
+        )
+        f = pytensor.function([x], expr)
+
+        # At x=pi: limit is 1
+        np.testing.assert_allclose(f(np.pi), 1.0, atol=1e-10)
+
+        # Away from pi
+        val = 3.0
+        np.testing.assert_allclose(
+            f(val), np.sin(val - np.pi) / (val - np.pi), rtol=1e-10
+        )
+
+    def test_second_derivative_at_singularity(self):
+        """Second derivative of sinc at x=0 should be -1/3."""
+        from pytensor.tensor.math import sin
+
+        x = dscalar("x")
+        sinc = stable_div(sin(x), x, wrt=x, singularities=[(0, 1)])
+        g2 = grad(grad(sinc, wrt=x), wrt=x)
+        g2f = pytensor.function([x], g2)
+
+        # sinc''(0) = -1/3
+        np.testing.assert_allclose(g2f(0.0), -1.0 / 3.0, atol=1e-8)
+
+    def test_top_level_import(self):
+        """stable_div should be importable from pytensor directly."""
+        assert pytensor.stable_div is stable_div
+
+    def test_invalid_wrt_ndim(self):
+        """Should raise ValueError when wrt is not scalar."""
+        x = vector("x")
+        with pytest.raises(ValueError, match="scalar"):
+            stable_div(x.sum(), x.sum(), wrt=x, singularities=[(0, 1)])

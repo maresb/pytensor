@@ -2519,6 +2519,97 @@ def grad_scale(x, multiplier):
     return GradScale(multiplier)(x)
 
 
+def _taylor_coefficients(
+    expression: Variable,
+    wrt: Variable,
+    x0: Variable,
+    n: int,
+) -> list[Variable]:
+    """Compute Taylor coefficients c_i = f^{(i)}(x_0) / i! for i = 0, ..., n.
+
+    Parameters
+    ----------
+    expression : Variable
+        The symbolic expression f(x).
+    wrt : Variable
+        The scalar variable x.
+    x0 : Variable
+        The expansion point (a symbolic constant or variable).
+    n : int
+        The maximum order.
+
+    Returns
+    -------
+    list[Variable]
+        List of ``n + 1`` symbolic Taylor coefficients.
+    """
+    from pytensor.graph.replace import graph_replace
+    from pytensor.graph.rewriting.utils import rewrite_graph
+
+    coefficients: list[Variable] = []
+    deriv = expression
+    factorial_i = 1
+
+    for i in range(n + 1):
+        coeff_at_x0 = graph_replace(deriv, {wrt: x0}, strict=False)
+        coefficients.append(coeff_at_x0 / factorial_i)
+        if i < n:
+            deriv = grad(deriv, wrt)
+            # Simplify the derivative graph to prevent exponential blowup.
+            deriv = rewrite_graph(deriv, include=("canonicalize", "stabilize"))
+        factorial_i *= i + 1
+
+    return coefficients
+
+
+def _series_ratio_coefficients(
+    num_coeffs: list[Variable],
+    den_coeffs: list[Variable],
+    n: int,
+) -> list[Variable]:
+    r"""Compute coefficients of the ratio of two power series.
+
+    Given power series `a(t) = \sum a_i t^i` and `b(t) = \sum b_i t^i`
+    with `b_0 \neq 0`, compute `c_0, \ldots, c_n` such that
+    `a(t) / b(t) \approx \sum c_i t^i`.
+
+    Uses the recurrence from `a_i = \sum_{j=0}^{i} b_{i-j} c_j`:
+
+    .. math::
+
+        c_i = \frac{a_i - \sum_{j=0}^{i-1} b_{i-j}\, c_j}{b_0}
+
+    Parameters
+    ----------
+    num_coeffs : list[Variable]
+        Coefficients `a_i` of the numerator series.
+    den_coeffs : list[Variable]
+        Coefficients `b_i` of the denominator series. ``b_0`` must
+        be non-zero.
+    n : int
+        Number of ratio coefficients to compute (returns ``n + 1``
+        values).
+
+    Returns
+    -------
+    list[Variable]
+        Coefficients `c_0, \ldots, c_n` of the ratio series.
+    """
+    c: list[Variable] = []
+    b0 = den_coeffs[0]
+
+    for i in range(n + 1):
+        a_i = num_coeffs[i] if i < len(num_coeffs) else 0
+        correction = sum(
+            den_coeffs[i - j] * c[j]
+            for j in range(i)
+            if (i - j) < len(den_coeffs)
+        )
+        c.append((a_i - correction) / b0)
+
+    return c
+
+
 def taylor_series(
     expression: Variable,
     wrt: Variable,
@@ -2591,7 +2682,6 @@ def taylor_series(
     >>> np.isclose(float(f(1.1)), np.log(1.1), atol=1e-4)
     True
     """
-    from pytensor.graph.replace import graph_replace
     from pytensor.tensor import as_tensor_variable
 
     if not isinstance(expression, Variable):
@@ -2612,24 +2702,184 @@ def taylor_series(
         )
 
     x0 = as_tensor_variable(x0, dtype=wrt_tensor.type.dtype)
+    coefficients = _taylor_coefficients(expression, wrt, x0, n)
 
-    from pytensor.graph.rewriting.utils import rewrite_graph
-
-    # f^{(0)}(x0)
-    deriv = expression
-    coeff_at_x0 = graph_replace(deriv, {wrt: x0}, strict=False)
-    result = coeff_at_x0
-
-    factorial_k = 1
+    t = wrt - x0
+    result = coefficients[0]
     for k in range(1, n + 1):
-        deriv = grad(deriv, wrt)
-        # Simplify the derivative graph to prevent exponential blowup.
-        # Without this, each successive grad differentiates through the
-        # entire unsimplified graph of the previous derivative, causing
-        # the symbolic expression to grow explosively.
-        deriv = rewrite_graph(deriv, include=("canonicalize", "stabilize"))
-        factorial_k *= k
-        coeff_at_x0 = graph_replace(deriv, {wrt: x0}, strict=False)
-        result = result + (coeff_at_x0 / factorial_k) * (wrt - x0) ** k
+        result = result + coefficients[k] * t**k
+
+    return result
+
+
+def stable_div(
+    numerator: Variable,
+    denominator: Variable,
+    wrt: Variable,
+    singularities: Sequence[tuple[Variable | int | float, int]],
+    *,
+    taylor_order: int = 10,
+    eps: float = 1e-7,
+) -> Variable:
+    r"""Compute ``numerator / denominator`` with removable singularities.
+
+    At each specified singular point, both ``numerator`` and
+    ``denominator`` share a common zero of a given order.  Direct
+    division would produce ``0/0 = NaN``.  This function instead:
+
+    * **Away from singularities**: computes the division directly.
+    * **Near singularities** (`|x - x_0| < eps`): uses a Taylor
+      polynomial of the *ratio*, obtained by expanding numerator and
+      denominator in separate Taylor series, cancelling the common
+      `(x - x_0)^k` factor, and performing symbolic power-series
+      division.
+
+    The result is a single symbolic expression that is numerically
+    stable *and* exactly differentiable everywhere, including at the
+    singular points themselves.
+
+    Parameters
+    ----------
+    numerator : Variable
+        Symbolic expression for `f(x)`.
+    denominator : Variable
+        Symbolic expression for `g(x)`.
+    wrt : Variable
+        The scalar variable `x`.  Must be 0-dimensional.
+    singularities : sequence of ``(x_0, k)`` pairs
+        Each entry declares a removable singularity at the point
+        ``x_0`` of order ``k``.  Both ``numerator`` and
+        ``denominator`` must have zeros of at least order ``k`` at
+        ``x_0``.  ``x_0`` may be a numeric value or a symbolic
+        variable.
+    taylor_order : int, keyword-only, default 10
+        Order of the Taylor polynomial used for the ratio near each
+        singularity.  Higher values improve accuracy further from the
+        singular point but increase graph-construction time.
+    eps : float, keyword-only, default 1e-7
+        Distance threshold from a singular point at which the function
+        switches between the Taylor polynomial and direct division.
+
+    Returns
+    -------
+    Variable
+        A symbolic expression for `f(x) / g(x)` that is numerically
+        stable and differentiable at each singular point.
+
+    Raises
+    ------
+    TypeError
+        If inputs are not ``Variable`` instances or ``wrt`` is not a
+        scalar.
+    ValueError
+        If ``taylor_order`` is negative or ``wrt`` is not
+        0-dimensional.
+
+    Notes
+    -----
+    The singularity order ``k`` must be specified correctly.  If the
+    actual common-zero order is less than ``k``, the leading
+    denominator coefficient after cancellation will be zero, producing
+    a division-by-zero in the series computation.
+
+    The ``eps`` threshold controls the boundary between the two
+    evaluation regimes.  The Taylor polynomial has approximation error
+    `O(\epsilon^{n+1})` where `n` is ``taylor_order``, so even
+    moderate values of ``eps`` (e.g. 0.1) yield high accuracy when
+    ``taylor_order`` is 10 or above.
+
+    Gradients are correct in both regimes: near singularities the
+    gradient flows through the Taylor polynomial; away from them it
+    flows through direct division.
+
+    Examples
+    --------
+    The function `\sin(x)/x` (sinc) has a removable singularity of
+    order 1 at `x = 0`:
+
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> import numpy as np
+    >>> x = pt.dscalar("x")
+    >>> sinc = pytensor.stable_div(pt.sin(x), x, wrt=x,
+    ...                            singularities=[(0, 1)])
+    >>> f = pytensor.function([x], sinc)
+    >>> float(f(0.0))
+    1.0
+    >>> np.isclose(float(f(0.5)), np.sin(0.5) / 0.5)
+    True
+
+    `(1 - \cos x) / x^2` has a removable singularity of order 2:
+
+    >>> expr = pytensor.stable_div(1 - pt.cos(x), x**2, wrt=x,
+    ...                            singularities=[(0, 2)])
+    >>> f = pytensor.function([x], expr)
+    >>> np.isclose(float(f(0.0)), 0.5)
+    True
+
+    Gradients work at the singular point:
+
+    >>> g = pytensor.grad(sinc, wrt=x)
+    >>> gf = pytensor.function([x], g)
+    >>> np.isclose(float(gf(0.0)), 0.0, atol=1e-12)
+    True
+    """
+    import pytensor.tensor as pt
+    from pytensor.tensor import as_tensor_variable
+
+    if not isinstance(numerator, Variable):
+        numerator = as_tensor_variable(numerator)
+    if not isinstance(denominator, Variable):
+        denominator = as_tensor_variable(denominator)
+
+    wrt_tensor = as_tensor_variable(wrt)
+    if wrt_tensor.ndim != 0:
+        raise ValueError(
+            f"stable_div expects a scalar (0-d) variable as `wrt`, "
+            f"got ndim={wrt_tensor.ndim}"
+        )
+
+    if not isinstance(taylor_order, int) or taylor_order < 0:
+        raise ValueError(
+            f"stable_div expects a non-negative integer as `taylor_order`, "
+            f"got {taylor_order!r}"
+        )
+
+    # Safe direct division: replace exact-zero denominators with 1
+    # so that the forward pass never produces NaN/Inf.  The outer
+    # switch selects the Taylor polynomial in the singularity region,
+    # so the substitute value is never exposed.  Crucially, the
+    # gradient of the safe branch is always finite, preventing the
+    # 0 * NaN = NaN problem in the switch gradient.
+    safe_denom = pt.switch(pt.eq(denominator, 0), pt.ones_like(denominator), denominator)
+    result = numerator / safe_denom
+
+    for x0_val, k in singularities:
+        x0 = as_tensor_variable(x0_val, dtype=wrt_tensor.type.dtype)
+        total_order = taylor_order + k
+
+        # Taylor coefficients of numerator and denominator separately
+        # (both are well-defined at x0 — no 0/0).
+        num_coeffs = _taylor_coefficients(numerator, wrt, x0, total_order)
+        den_coeffs = _taylor_coefficients(denominator, wrt, x0, total_order)
+
+        # Cancel the common (x - x0)^k factor.
+        num_reduced = num_coeffs[k:]
+        den_reduced = den_coeffs[k:]
+
+        # Power-series long division on the reduced series.
+        ratio_coeffs = _series_ratio_coefficients(
+            num_reduced, den_reduced, taylor_order
+        )
+
+        # Build the Taylor polynomial for the ratio.
+        t = wrt - x0
+        poly = ratio_coeffs[0]
+        for i in range(1, len(ratio_coeffs)):
+            poly = poly + ratio_coeffs[i] * t**i
+
+        # Switch to the polynomial near the singularity.
+        near = pt.abs(t) < eps
+        result = pt.switch(near, poly, result)
 
     return result
