@@ -25,6 +25,7 @@ from pytensor.gradient import (
     hessian_vector_product,
     jacobian,
     subgraph_grad,
+    taylor_series,
     zero_grad,
     zero_grad_,
 )
@@ -1207,3 +1208,127 @@ class TestHessianVectorProduct:
         hessp_x_eval, hessp_y_eval = hessp_fn(**test)
         np.testing.assert_allclose(hessp_x_eval, [2, 4, 6])
         np.testing.assert_allclose(hessp_y_eval, [-6, -4, -2])
+
+
+class TestTaylorSeries:
+    """Tests for the taylor_series (Maclaurin / Taylor expansion) function."""
+
+    def test_exp_maclaurin(self):
+        """exp(x) ≈ 1 + x + x²/2 + x³/6 around x=0."""
+        x = dscalar("x")
+        series = taylor_series(exp(x), wrt=x, n=10)
+        f = pytensor.function([x], series)
+
+        for val in [0.0, 0.1, 0.5, -0.3]:
+            np.testing.assert_allclose(f(val), np.exp(val), atol=1e-6)
+
+    def test_sin_maclaurin(self):
+        """sin(x) Maclaurin series to high order."""
+        from pytensor.tensor.math import sin
+
+        x = dscalar("x")
+        series = taylor_series(sin(x), wrt=x, n=11)
+        f = pytensor.function([x], series)
+
+        for val in [0.0, 0.1, 0.5, -0.3]:
+            np.testing.assert_allclose(f(val), np.sin(val), atol=1e-8)
+
+    def test_cos_maclaurin(self):
+        """cos(x) Maclaurin series to high order."""
+        from pytensor.tensor.math import cos
+
+        x = dscalar("x")
+        series = taylor_series(cos(x), wrt=x, n=10)
+        f = pytensor.function([x], series)
+
+        for val in [0.0, 0.1, 0.5, -0.3]:
+            np.testing.assert_allclose(f(val), np.cos(val), atol=1e-7)
+
+    def test_log_taylor_around_one(self):
+        """log(x) Taylor series around x0=1."""
+        from pytensor.tensor.math import log
+
+        x = dscalar("x")
+        series = taylor_series(log(x), wrt=x, n=15, x0=1)
+        f = pytensor.function([x], series)
+
+        for val in [0.9, 1.0, 1.1, 1.3]:
+            np.testing.assert_allclose(f(val), np.log(val), atol=1e-4)
+
+    def test_polynomial_exact(self):
+        """A polynomial should be recovered exactly."""
+        x = dscalar("x")
+        # f(x) = 3 + 2x + 5x^2
+        poly = 3 + 2 * x + 5 * x**2
+        series = taylor_series(poly, wrt=x, n=2)
+        f = pytensor.function([x], series)
+
+        for val in [-2.0, 0.0, 1.0, 3.5]:
+            np.testing.assert_allclose(
+                f(val), 3 + 2 * val + 5 * val**2, rtol=1e-12
+            )
+
+    def test_polynomial_taylor_non_zero_center(self):
+        """Polynomial expanded around x0=1 should still be exact."""
+        x = dscalar("x")
+        poly = 1 + x + x**2 + x**3
+        series = taylor_series(poly, wrt=x, n=3, x0=1)
+        f = pytensor.function([x], series)
+
+        for val in [-1.0, 0.0, 1.0, 2.0, 5.0]:
+            expected = 1 + val + val**2 + val**3
+            np.testing.assert_allclose(f(val), expected, rtol=1e-12)
+
+    def test_zero_order(self):
+        """Order 0 should return f(x0)."""
+        x = dscalar("x")
+        series = taylor_series(exp(x), wrt=x, n=0)
+        f = pytensor.function([x], series)
+
+        # exp(0) = 1, regardless of input x
+        assert f(0.0) == pytest.approx(1.0)
+        assert f(5.0) == pytest.approx(1.0)
+
+    def test_first_order(self):
+        """Order 1 should return f(x0) + f'(x0)*(x - x0)."""
+        x = dscalar("x")
+        # exp(x) around 0: 1 + x
+        series = taylor_series(exp(x), wrt=x, n=1)
+        f = pytensor.function([x], series)
+
+        np.testing.assert_allclose(f(0.0), 1.0)
+        np.testing.assert_allclose(f(1.0), 2.0)
+        np.testing.assert_allclose(f(-1.0), 0.0)
+
+    def test_symbolic_x0(self):
+        """x0 can be a symbolic variable."""
+        x = dscalar("x")
+        x0 = dscalar("x0")
+        series = taylor_series(exp(x), wrt=x, n=5, x0=x0)
+        f = pytensor.function([x, x0], series)
+
+        # Expand around x0=1, evaluate at x=1.1
+        result = f(1.1, 1.0)
+        np.testing.assert_allclose(result, np.exp(1.1), atol=1e-8)
+
+    def test_top_level_import(self):
+        """taylor_series should be importable from pytensor directly."""
+        assert pytensor.taylor_series is taylor_series
+
+    def test_invalid_expression_type(self):
+        """Should raise TypeError for non-Variable expression."""
+        x = dscalar("x")
+        with pytest.raises(TypeError, match="Variable"):
+            taylor_series(3.0, wrt=x, n=2)  # type: ignore[arg-type]
+
+    def test_invalid_wrt_ndim(self):
+        """Should raise ValueError when wrt is not scalar."""
+        x = vector("x")
+        with pytest.raises(ValueError, match="scalar"):
+            taylor_series(x.sum(), wrt=x, n=2)
+
+    def test_invalid_negative_order(self):
+        """Should raise ValueError for negative order."""
+        x = dscalar("x")
+        with pytest.raises(ValueError, match="non-negative"):
+            taylor_series(exp(x), wrt=x, n=-1)

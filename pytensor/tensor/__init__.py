@@ -101,7 +101,7 @@ def _get_vector_length_Constant(op: Op | Variable, var: Constant) -> int:
 
 import pytensor.tensor.exceptions
 import pytensor.tensor.rewriting
-from pytensor.gradient import grad, hessian, jacobian
+from pytensor.gradient import grad, hessian, jacobian, taylor_series
 
 # adds shared-variable constructors
 from pytensor.tensor import (

@@ -130,7 +130,7 @@ from pytensor.compile import (
 )
 from pytensor.compile.function import function, function_dump
 from pytensor.compile.function.types import FunctionMaker
-from pytensor.gradient import Lop, Rop, grad, subgraph_grad
+from pytensor.gradient import Lop, Rop, grad, subgraph_grad, taylor_series
 from pytensor.printing import debugprint as dprint
 from pytensor.printing import pp, pprint
 from pytensor.updates import OrderedUpdates

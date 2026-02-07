@@ -2517,3 +2517,112 @@ def grad_scale(x, multiplier):
     0.416...
     """
     return GradScale(multiplier)(x)
+
+
+def taylor_series(
+    expression: Variable,
+    wrt: Variable,
+    n: int,
+    x0: Variable | int | float = 0,
+) -> Variable:
+    """Compute the truncated Taylor series of an expression.
+
+    Returns the ``n``-th order Taylor polynomial of ``expression``
+    expanded around ``x0`` with respect to the scalar variable ``wrt``.
+    When ``x0=0`` (the default), this is the Maclaurin series.
+
+    .. math::
+
+        T_n(x) = \\sum_{k=0}^{n} \\frac{f^{(k)}(x_0)}{k!} (x - x_0)^k
+
+    Parameters
+    ----------
+    expression : Variable
+        The symbolic expression to expand. Must be a scalar with
+        respect to ``wrt``.
+    wrt : Variable
+        The scalar variable with respect to which the series is
+        expanded. Must be a 0-dimensional ``TensorVariable``.
+    n : int
+        The order of the Taylor polynomial (number of terms is
+        ``n + 1``). Must be non-negative.
+    x0 : Variable or numeric, optional
+        The point around which to expand. Defaults to ``0``
+        (Maclaurin series). Can be a symbolic variable or a Python
+        numeric value.
+
+    Returns
+    -------
+    Variable
+        A symbolic expression representing the truncated Taylor series.
+
+    Raises
+    ------
+    TypeError
+        If ``expression`` is not a ``Variable`` or ``wrt`` is not a
+        scalar ``TensorVariable``.
+    ValueError
+        If ``n`` is negative or ``wrt`` is not 0-dimensional.
+
+    Examples
+    --------
+    Maclaurin series of ``exp(x)`` to 3rd order:
+
+    >>> import pytensor
+    >>> import pytensor.tensor as pt
+    >>> x = pt.dscalar("x")
+    >>> series = pytensor.taylor_series(pt.exp(x), wrt=x, n=3)
+    >>> f = pytensor.function([x], series)
+    >>> float(f(0.0))
+    1.0
+
+    Taylor series of ``sin(x)`` around ``x0=0`` to 5th order:
+
+    >>> series = pytensor.taylor_series(pt.sin(x), wrt=x, n=5)
+    >>> f = pytensor.function([x], series)
+    >>> import numpy as np
+    >>> np.isclose(float(f(0.1)), np.sin(0.1), atol=1e-10)
+    True
+
+    Taylor series around a non-zero point:
+
+    >>> series = pytensor.taylor_series(pt.log(x), wrt=x, n=4, x0=1)
+    >>> f = pytensor.function([x], series)
+    >>> np.isclose(float(f(1.1)), np.log(1.1), atol=1e-4)
+    True
+    """
+    from pytensor.graph.replace import graph_replace
+    from pytensor.tensor import as_tensor_variable
+
+    if not isinstance(expression, Variable):
+        raise TypeError(
+            f"taylor_series expects a Variable as `expression`, got {type(expression)}"
+        )
+
+    wrt_tensor = as_tensor_variable(wrt)
+    if wrt_tensor.ndim != 0:
+        raise ValueError(
+            f"taylor_series expects a scalar (0-d) variable as `wrt`, "
+            f"got ndim={wrt_tensor.ndim}"
+        )
+
+    if not isinstance(n, int) or n < 0:
+        raise ValueError(
+            f"taylor_series expects a non-negative integer as `n`, got {n!r}"
+        )
+
+    x0 = as_tensor_variable(x0, dtype=wrt_tensor.type.dtype)
+
+    # f^{(0)}(x0)
+    deriv = expression
+    coeff_at_x0 = graph_replace(deriv, {wrt: x0}, strict=False)
+    result = coeff_at_x0
+
+    factorial_k = 1
+    for k in range(1, n + 1):
+        deriv = grad(deriv, wrt)
+        factorial_k *= k
+        coeff_at_x0 = graph_replace(deriv, {wrt: x0}, strict=False)
+        result = result + (coeff_at_x0 / factorial_k) * (wrt - x0) ** k
+
+    return result
