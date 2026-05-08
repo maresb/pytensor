@@ -87,7 +87,14 @@ class TaylorAtPoint:
 
     def coeff(self, m):
         """f^(m)(a) / m!  (symbolic constant)."""
-        return self.value_at_a(m) / float(math.factorial(m))
+        v = self.value_at_a(m)
+        fac = math.factorial(m)
+        if fac == 1:
+            # Avoid spurious True_div(v, 1.0) -- canonicalize folds it under
+            # FAST_RUN, but FAST_COMPILE leaves it in place, breaking the
+            # structural match between the K0 inside f and the K0 inside P.
+            return v
+        return v / float(fac)
 
     def numeric_coeff(self, m):
         """f^(m)(a) / m!  as a Python float."""
@@ -98,8 +105,7 @@ class TaylorAtPoint:
 
         c_l = (f^(j))^(l)(a) / l! = f^(j+l)(a) / l!
         """
-        # cast factorial to float -- big Python ints choke pytensor's tensor coercion
-        return [self.value_at_a(j + l) / float(math.factorial(l)) for l in range(K)]
+        return [self.coeff(j + l) for l in range(K)]
 
 
 def _first_nonvanishing(cache, start, count):
