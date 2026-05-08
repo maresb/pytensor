@@ -303,16 +303,14 @@ def test_n1_transcendental_f_with_nonzero_constant_term():
 
     R(x) = ((K0 + exp(x)) - (K0 + 1))/x = (exp(x) - 1)/x = expm1(x)/x.
 
-    auto_eps balances two bounds:
-    - eps_upper from polynomial truncation: ~0.148 at order=10 for exp.
-    - eps_lower from closed-branch cancellation: |c_0|/(10·|c_1|) = (K0+1)/10.
-
-    For modest K0 (eps_lower <= eps_upper), the polynomial covers |x|<eps
-    and closed handles larger x; both meet machine precision. We test K0
-    values up to 0.4 where eps_lower=0.14 stays within polynomial coverage.
+    Hits the formula path (v_trunc = c_11 = 1/11! != 0). Polynomial
+    branch covers |x| < eps_upper ≈ 0.148 (independent of K0); for
+    larger |x| we use the closed form, where pytensor's canonicalize
+    folds the (K0 - K0) cancellation symbolically -- so even huge K0
+    doesn't introduce numerical cancellation.
     """
     x = pt.dscalar("x")
-    for K0 in [0.0, 0.1, -0.2, 0.4]:
+    for K0 in [0.0, 1.0, 1e10, -1e5]:
         f = K0 + pt.exp(x)
         y = taylor_remainder(f, x, 0.0, 1, order=10)
         fn = pytensor.function([x], y)

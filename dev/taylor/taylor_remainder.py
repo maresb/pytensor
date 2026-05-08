@@ -138,21 +138,20 @@ def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
     given dtype, then apply a `safety` factor (default 0.75) to account
     for the empirical ~25% overshoot of the analytic formula.
 
-    Two error sources are modeled simultaneously:
+    Two regimes:
 
-    1. polynomial-branch truncation:  ~ |c_{n+order}/c_n| · eps^order
-       gives an upper bound  eps <= eps_upper  for poly accuracy;
-    2. closed-branch cancellation in (f - P_{n-1}):
-       ~ eps_machine · |c_0|/(|c_n| · eps^n)
-       gives a lower bound  eps >= eps_lower  for closed accuracy.
+    1. v_trunc != 0 (formula path): polynomial truncation gives the
+       binding constraint. The closed branch's potential cancellation
+       in (f - P_{n-1}) is left to pytensor's canonicalize, which folds
+       explicit-constant K0 - K0 patterns symbolically. (Adversarial
+       opaque f, e.g. inside an OpFromGraph, can defeat canonicalize;
+       in those cases pass `eps` explicitly.)
 
-    The chosen eps satisfies both bounds. When v_trunc = 0 (polynomial
-    truncation budget never bites), eps_upper = inf and only eps_lower
-    constrains. When c_0 = ... = c_{n-1} = 0 (P_{n-1} = 0 symbolically,
-    no subtraction needed), eps_lower = 0 and only eps_upper constrains.
-
-    Returns 0.0 when neither bound bites (e.g. R itself vanishes, or
-    polynomial is exact and our subtraction is trivial).
+    2. v_trunc = 0 (no truncation budget): fall back to the
+       cancellation-aware lower bound from the closed-branch error model
+       err_closed ≈ eps_machine · |c_0|/(|c_n| · |x-a|^n). Returns
+       eps = (eps_machine · |c_0|/(tol_rel · |c_n|))^(1/n), or 0 when
+       P_{n-1} is symbolically zero (no subtraction introduced).
 
     The formula is NOT capped at any constant -- doing so would violate
     scale invariance (the natural cap is the function's convergence radius,
@@ -180,53 +179,41 @@ def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
         # this fall-through.
         return 0.0
 
-    # ---- two error sources, two bounds on eps ----
+    # The binding constraint depends on whether the polynomial-truncation
+    # budget is finite.
     #
-    # Polynomial-truncation upper bound:
-    #     err_poly(eps) ≈ |c_{n+order}/c_n| · eps^order
-    #     err_poly <= tol_rel  ⟹  eps <= eps_upper.
-    # When c_{n+order} = 0 in our check window, eps_upper = inf.
+    # v_trunc != 0  (typical case):
+    #   Polynomial truncation gives  eps <= eps_upper  for poly accuracy.
+    #   Closed-branch cancellation in (f - P_{n-1}) is handled at runtime
+    #   by pytensor's canonicalize: when f's structure makes the K0 - K0
+    #   subtraction explicit-constant cancellation, canonicalize folds it
+    #   symbolically. We trust this for the formula path. (Adversarial
+    #   opaque f -- e.g. wrapped in OpFromGraph -- can defeat canonicalize;
+    #   for those, the user can pass `eps` explicitly.)
     #
-    # Closed-branch cancellation lower bound (from our (f - P_{n-1})
-    # subtraction; relevant when P_{n-1} ≠ 0 symbolically, i.e. some
-    # c_k != 0 for k < n):
-    #     err_closed(eps) ≈ eps_machine · |c_0|/(|c_n| · eps^n)
-    #     err_closed <= tol_rel  ⟹  eps >= eps_lower.
-    # When c_0 = c_1 = ... = c_{n-1} = 0, P_{n-1} = 0 symbolically and our
-    # subtraction is trivial; eps_lower = 0.
-    #
-    # Both must hold simultaneously: the chosen eps must lie in
-    # [eps_lower, eps_upper]. We pick the largest valid eps (= eps_upper
-    # when finite, else eps_lower) for maximum polynomial coverage.
-
-    if n > 0:
-        v_const, _ = _first_nonvanishing(cache, 0, n)
-    else:
-        v_const = 0.0
-    if v_const == 0.0:
-        eps_lower = 0.0
-    else:
-        eps_lower = (eps_machine * v_const / (tol_rel * v_lead)) ** (1.0 / n)
+    # v_trunc = 0  (corner case, e.g. polynomial f or extreme subnormal):
+    #   No polynomial-truncation bound. Fall back to a cancellation-aware
+    #   lower bound on eps from
+    #       err_closed(eps) ≈ eps_machine · |c_0|/(|c_n| · eps^n)
+    #   so that even if canonicalize doesn't fold, closed accuracy is
+    #   maintained for |x-a| >= eps. When c_0 = ... = c_{n-1} = 0
+    #   (P_{n-1} symbolically zero), no subtraction is introduced and
+    #   eps_lower = 0 (closed is fine for any x != a).
 
     v_trunc, k_trunc = _first_nonvanishing(cache, n + order, max_extra + 1)
     if v_trunc == 0.0:
-        # No polynomial-truncation upper bound; only the cancellation
-        # lower bound applies.
-        return eps_lower
+        if n == 0:
+            return 0.0
+        v_const, _ = _first_nonvanishing(cache, 0, n)
+        if v_const == 0.0:
+            return 0.0
+        return (eps_machine * v_const / (tol_rel * v_lead)) ** (1.0 / n)
 
     # NB: compute the ratio v_lead/v_trunc *before* multiplying by tol_rel
     # to avoid floating-point underflow when v_lead is subnormal -- the
     # ratio is K-invariant, but `tol_rel * v_lead` underflows for K
     # near smallest_subnormal.
-    eps_upper = safety * (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
-
-    if eps_upper < eps_lower:
-        # Infeasible: at any eps in this window, EITHER polynomial
-        # truncation OR closed cancellation exceeds tol. The user can
-        # raise `order` to widen eps_upper. We return eps_lower
-        # (cancellation-safe; sacrifices a little polynomial accuracy).
-        return eps_lower
-    return eps_upper
+    return safety * (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
 
 
 def _smallest_subnormal(dtype):
