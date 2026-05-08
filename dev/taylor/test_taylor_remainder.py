@@ -272,6 +272,54 @@ def test_no_overflow_warning_for_normal_c_n():
             taylor_remainder(f, x, 0.0, 1, order=10)
 
 
+def test_n1_polynomial_f_with_nonzero_constant_term():
+    """f(x) = K0 + K*x + L*x^2 with K0 != 0, n=1.
+
+    R(x) = (f - K0)/x = K + L*x.  c_0=K0, c_1=K, c_2=L; c_3 onward vanish so
+    auto_eps lands on the eps=0 path. The closed expression  (f - K0)/x
+    looks numerically dangerous (catastrophic cancellation when |K0|
+    dominates), but pytensor's canonicalize folds the K0 - K0 symbolically
+    before evaluation -- so closed reduces to K + L*x and stays accurate at
+    arbitrarily small x.
+
+    Verified across several K0 magnitudes including 1e10 and 1e-10.
+    """
+    x = pt.dscalar("x")
+    K, L = 2.0, 3.0
+    for K0 in [0.0, 1.0, 1e10, 1e-10, -1e5]:
+        f = K0 + K * x + L * x**2
+        y = taylor_remainder(f, x, 0.0, 1, order=10)
+        fn = pytensor.function([x], y)
+        for v in [0.0, 1e-15, 1e-10, 1e-3, 0.5]:
+            ref = K + L * v
+            out = float(fn(v))
+            assert math.isclose(out, ref, rel_tol=1e-12, abs_tol=1e-15), (
+                f"K0={K0}, x={v}: got {out}, expected {ref}"
+            )
+
+
+def test_n1_transcendental_f_with_nonzero_constant_term():
+    """f(x) = K0 + exp(x) at a=0 with K0 != 0, n=1.
+
+    R(x) = ((K0 + exp(x)) - (K0 + 1))/x = (exp(x) - 1)/x = expm1(x)/x.
+    c_0 = K0 + 1 (nonzero), c_1 = 1, c_2 = 1/2, ..., c_11 = 1/11!.
+    v_trunc = 1/11! != 0, so we hit the formula path with finite eps.
+    The polynomial branch covers small |x| where the closed form
+    exp(x) - 1 cancels.
+    """
+    x = pt.dscalar("x")
+    for K0 in [0.0, 1.0, 1e10, -1e5]:
+        f = K0 + pt.exp(x)
+        y = taylor_remainder(f, x, 0.0, 1, order=10)
+        fn = pytensor.function([x], y)
+        for v in [0.0, 1e-15, 1e-10, 1e-3, 0.5]:
+            ref = 1.0 if v == 0 else math.expm1(v) / v
+            out = float(fn(v))
+            assert math.isclose(out, ref, rel_tol=1e-12, abs_tol=1e-15), (
+                f"K0={K0}, x={v}: got {out}, expected {ref}"
+            )
+
+
 def test_iterated_grad_at_a_in_eps_zero_path():
     """For f = x + x^3, n=1: R(x) = (x + x^3)/x = 1 + x^2. With order=10
     the higher coefficients vanish, so auto_eps -> 0. The eps=0 switch must
