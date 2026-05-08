@@ -159,6 +159,8 @@ lines-after-imports = 2
 "tests/compile/debug/test_monitormode.py" = ["T201"]
 "scripts/run_mypy.py" = ["T201"]
 "scripts/bump_numba_upper_bound.py" = ["T201"]
+# Exploration / development scripts that print results to stdout
+"dev/**/*.py" = ["T201"]
 # Test modules of optional backends that use `pytest.importorskip`, skip "E402"
 "tests/link/jax/**/test_*.py" = ["E402"]
 "tests/link/numba/**/test_*.py" = ["E402"]
