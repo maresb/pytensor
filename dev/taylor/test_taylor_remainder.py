@@ -272,6 +272,29 @@ def test_no_overflow_warning_for_normal_c_n():
             taylor_remainder(f, x, 0.0, 1, order=10)
 
 
+def test_iterated_grad_at_a_in_eps_zero_path():
+    """For f = x + x^3, n=1: R(x) = (x + x^3)/x = 1 + x^2. With order=10
+    the higher coefficients vanish, so auto_eps -> 0. The eps=0 switch must
+    still expose the polynomial's higher-order derivatives at x=a, not just
+    the leading constant.
+
+    Regression: an earlier `pt.switch(t==0, c_n_const, closed)` returned
+    R''(0) = 0 because the constant has zero gradients. Fixed by switching
+    to the full polynomial expression so d^k/dx^k recovers k! * c_{n+k}.
+    """
+    x = pt.dscalar("x")
+    f = x + x**3
+    cur = taylor_remainder(f, x, 0.0, 1, order=10)
+    assert auto_eps(TaylorAtPoint(f, x, 0.0), n=1, order=10) == 0.0
+    expected = {0: 1.0, 1: 0.0, 2: 2.0, 3: 0.0}
+    for k, ref in expected.items():
+        out = float(pytensor.function([x], cur)(0.0))
+        assert math.isclose(out, ref, abs_tol=1e-12), (
+            f"k={k}: got {out}, expected {ref}"
+        )
+        cur = pt.grad(cur, x)
+
+
 def test_polynomial_window_with_all_higher_orders_vanishing():
     """If f is itself a polynomial with no nonzero higher-order coeffs,
     auto_eps returns 0.0 -- meaning "defer to user's f for x != a"."""
