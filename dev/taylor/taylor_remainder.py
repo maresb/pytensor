@@ -1,0 +1,456 @@
+"""taylor_remainder defined implicitly by
+
+    f(x)  =  P_{n-1}(x - a)  +  R(x) · (x - a)^n,
+
+where P_{n-1} is the degree-(n-1) Taylor polynomial of f at a and R is the
+n-th Taylor remainder, with R(a) = f^(n)(a)/n!. The public `taylor_remainder`
+routine returns a stable graph for R evaluated across x = a.
+
+Implementation: switch(|x-a| < eps, polynomial branch, closed-form branch),
+where the closed-form branch evaluates the algebraically equivalent but
+numerically singular expression (f(x) - P_{n-1}(x-a)) / (x-a)^n.
+
+Memoization: a TaylorAtPoint cache shares f^(m)(a) values across all calls,
+so building taylor_remainder(f^(j), x, a, m) for many (j, m) pairs only
+costs one chain of grads, not many.
+
+Auto-eps: by default, eps is chosen so the polynomial truncation error is
+at machine-epsilon scale (sized from x.dtype), by inspecting the first
+omitted Taylor coefficient.
+"""
+
+import math
+import warnings
+
+import numpy as np
+
+import pytensor
+import pytensor.tensor as pt
+from pytensor.graph.replace import clone_replace
+from pytensor.graph.rewriting.utils import rewrite_graph
+
+
+pytensor.config.on_opt_error = "ignore"
+
+
+class TaylorRemainderUnderflowWarning(UserWarning):
+    """The leading Taylor coefficient is small enough that the closed branch
+    of taylor_remainder may underflow within the polynomial-branch window."""
+
+
+class TaylorRemainderOverflowWarning(UserWarning):
+    """The leading Taylor coefficient is large enough that the polynomial-
+    branch leading term may overflow at the boundary |x-a| = eps."""
+
+
+class TaylorAtPoint:
+    """Memoizes f, f', f'', ... and f^(m)(a) for m = 0, 1, 2, ...
+
+    Each value is built lazily on demand. Reuse across multiple taylor_remainder
+    calls with the same (f, x, a) avoids redundant grad+canonicalize work.
+    """
+
+    def __init__(self, f, x, a):
+        self.f = f
+        self.x = x
+        self.a = a
+        self._a_const = pt.constant(a, dtype=x.dtype)
+        self._derivs = [f]
+        self._values = []  # f^(m)(a) as symbolic constants
+        self._numeric = {}  # m -> float(f^(m)(a))
+
+    def deriv(self, m):
+        while len(self._derivs) <= m:
+            try:
+                d = pt.grad(self._derivs[-1], self.x)
+            except pytensor.gradient.DisconnectedInputError:
+                # f^(k) is a constant (e.g. f is a polynomial); higher
+                # derivatives are all zero.
+                d = pt.constant(0.0, dtype=self.x.dtype)
+            d = rewrite_graph(d, include=("canonicalize",))
+            self._derivs.append(d)
+        return self._derivs[m]
+
+    def value_at_a(self, m):
+        while len(self._values) <= m:
+            d = self.deriv(len(self._values))
+            v = clone_replace(d, {self.x: self._a_const})
+            v = rewrite_graph(v, include=("canonicalize",))
+            self._values.append(v)
+        return self._values[m]
+
+    def numeric_value_at_a(self, m):
+        """f^(m)(a) as a Python float.  Cached -- only compiled once per m."""
+        if m not in self._numeric:
+            self._numeric[m] = float(self.value_at_a(m).eval())
+        return self._numeric[m]
+
+    def coeff(self, m):
+        """f^(m)(a) / m!  (symbolic constant)."""
+        return self.value_at_a(m) / float(math.factorial(m))
+
+    def numeric_coeff(self, m):
+        """f^(m)(a) / m!  as a Python float."""
+        return self.numeric_value_at_a(m) / math.factorial(m)
+
+    def coeffs_of_deriv(self, j, K):
+        """Taylor coefficients [c_0, ..., c_{K-1}] of f^(j) at a.
+
+        c_l = (f^(j))^(l)(a) / l! = f^(j+l)(a) / l!
+        """
+        # cast factorial to float -- big Python ints choke pytensor's tensor coercion
+        return [self.value_at_a(j + l) / float(math.factorial(l)) for l in range(K)]
+
+
+def _first_nonvanishing(cache, start, count):
+    """Return (|c_k|, k) for the first k in [start, start+count) with c_k != 0.
+
+    Compares against 0 exactly: pytensor's canonicalize folds mathematically
+    zero expressions to literal zero, so any nonzero result -- however small --
+    represents a genuine nonzero coefficient (e.g. 1e-50 from a scaled f).
+    """
+    for k in range(start, start + count):
+        try:
+            v = abs(cache.numeric_coeff(k))
+        except Exception:
+            v = 0.0
+        if v != 0.0:
+            return v, k
+    return 0.0, start + count
+
+
+def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
+    # TODO: `max_extra=4` is a heuristic for finding the next nonzero
+    # coefficient when c_{n+order} = 0. It works for series with regularly-
+    # placed zeros (e.g., even/odd parity) but could miss pathologically
+    # sparse series with longer runs of zero coefficients. Revisit if such
+    # cases come up.
+    """Threshold for switching from polynomial branch to closed-form branch.
+
+    The polynomial truncation relative error at |t|=eps is approximately
+        |c_{n+order} / c_n| · eps^order
+    (or the first nonzero term beyond order if c_{n+order}=0; or, if the
+    leading c_n vanishes too, the first nonzero c_k for k>=n). The formula
+    is scale-invariant in f -- multiplying f by a constant doesn't change
+    eps, since the ratio of coefficients is unchanged.
+
+    We pick eps so this relative error reaches ~10·eps_machine for the
+    given dtype, then apply a `safety` factor (default 0.75) to account
+    for the empirical ~25% overshoot of the analytic formula.
+
+    Returns 0.0 when no truncation budget can be evaluated (leading c_n
+    vanishes, or all checked higher-order coefficients vanish). In those
+    cases the polynomial branch is either zero or merely "matches f within
+    the coefficients we looked at," and we cannot rule out f having beyond-
+    window terms that the polynomial would silently discard. Returning 0.0
+    tells `taylor_remainder` to defer to the user's closed-form expression
+    for all x != a, substituting the polynomial limit only at x = a.
+
+    The formula is NOT capped at any constant -- doing so would violate
+    scale invariance (the natural cap is the function's convergence radius,
+    which lives in the units of x).
+
+    `dtype` defaults to the dtype of the cache's input variable.
+
+    Empirical validation: dev/taylor/taylor_eps_experiment.py,
+                          dev/taylor/safety_calibration.py.
+    """
+    if dtype is None:
+        dtype = np.dtype(cache.x.dtype)
+    else:
+        dtype = np.dtype(dtype)
+    eps_machine = float(np.finfo(dtype).eps)
+    tol_rel = 10.0 * eps_machine
+
+    # Leading coefficient of R: first nonzero c_k for k >= n (typically c_n).
+    v_lead, k_lead = _first_nonvanishing(cache, n, order)
+    if v_lead == 0.0:
+        # R itself effectively vanishes in our coefficient window. The
+        # closed branch is the user's expression for f(x)/(x-a)^n, which
+        # is well-defined for x != a. Use it everywhere except x = a,
+        # where it would be 0/0; the polynomial substitutes the limit
+        # value (zero in this case) only at that one point.
+        return 0.0
+
+    # First omitted coefficient: c_{n+order} or the first nonzero beyond it.
+    v_trunc, k_trunc = _first_nonvanishing(cache, n + order, max_extra + 1)
+    if v_trunc == 0.0:
+        # The next several coefficients in our check window vanish, but we
+        # cannot conclude that f really is a polynomial -- f could have
+        # higher-order terms beyond `n + order + max_extra` that we never
+        # looked at. Trusting the polynomial branch in that case would
+        # silently discard those terms. Defer to the user's closed-form
+        # expression for x != a, and substitute the polynomial value only
+        # at the one singular point x = a.
+        return 0.0
+
+    # NB: compute the ratio v_lead/v_trunc *before* multiplying by tol_rel to
+    # avoid floating-point underflow when v_lead is subnormal -- the
+    # ratio is K-invariant (and well-conditioned), but `tol_rel · v_lead`
+    # underflows for K near the dtype's smallest_subnormal.
+    return safety * (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
+
+
+def _smallest_subnormal(dtype):
+    """Smallest positive subnormal float in `dtype`."""
+    info = np.finfo(dtype)
+    if hasattr(info, "smallest_subnormal"):
+        return float(info.smallest_subnormal)
+    # numpy < 1.22 fallback
+    return math.ldexp(1.0, info.minexp - info.nmant)
+
+
+def check_underflow_safety(cache, n, eps, *, dtype=None, safety=10.0):
+    """Issue a warning if the closed branch may underflow within |x| < eps.
+
+    The closed branch of taylor_remainder evaluates  (f(x) - P_{n-1}(x-a))/(x-a)^n
+    at  |x-a| >= eps. Near the boundary, this magnitude behaves like
+    |c_n| · eps^n. If that quantity is below `safety · smallest_subnormal`, the
+    user's f(x) computation is at risk of underflowing to zero, returning 0
+    where the true value is c_n.
+
+    No warning is issued when c_n = 0 (f vanishes to higher order than n;
+    the user's expression doesn't have the leading c_n·x^n term to underflow).
+
+    See `check_overflow_safety` for the symmetric large-|c_n| condition.
+    """
+    if dtype is None:
+        dtype = np.dtype(cache.x.dtype)
+    else:
+        dtype = np.dtype(dtype)
+    smallest_subnormal = _smallest_subnormal(dtype)
+
+    try:
+        c_n = abs(cache.numeric_coeff(n))
+    except Exception:
+        return
+    if c_n == 0.0:
+        return
+
+    closed_magnitude = c_n * eps**n
+    threshold = safety * smallest_subnormal
+    if closed_magnitude < threshold:
+        warnings.warn(
+            f"taylor_remainder: leading coefficient |c_{n}| = {c_n:.3g} is small "
+            f"enough that the closed branch may underflow within the polynomial-"
+            f"branch window |x-a| < {eps:.3g}.  At |x-a|=eps, the closed-branch "
+            f"numerator scale is |c_{n}|·eps^{n} = {closed_magnitude:.2e}, below "
+            f"the safety threshold {safety}·smallest_subnormal = {threshold:.2e}.  "
+            f"Consider raising `order` to widen `eps`, passing a larger `eps` "
+            f"explicitly, or using `taylor_remainder_poly` if x stays bounded.",
+            TaylorRemainderUnderflowWarning,
+            stacklevel=3,
+        )
+
+
+def check_overflow_safety(cache, n, eps, *, dtype=None, safety=10.0):
+    """Issue a warning if the polynomial-branch leading term may overflow.
+
+    Symmetric to `check_underflow_safety`. The polynomial branch evaluates
+    a sum dominated by  c_n + O(eps)  near the boundary |x-a| = eps; more
+    generally the closed-branch numerator scales as  |c_n| · eps^n.
+    If that quantity exceeds `largest_finite / safety`, evaluation of the
+    closed-branch numerator (or the polynomial sum) may overflow to inf.
+
+    Whether this can fire depends on whether eps > 1 is achievable. Auto_eps
+    tends to give eps < 1 for float64 with moderate `order`, but at high order
+    or low precision (float32, float16) eps can exceed 1 -- e.g. we measure
+    auto_eps ≈ 2 for sin/expm1 in float32 at order=14. Combined with
+    |c_n| close to largest_finite, the polynomial-branch leading term overflows.
+
+    No warning is issued when c_n = 0.
+    """
+    if dtype is None:
+        dtype = np.dtype(cache.x.dtype)
+    else:
+        dtype = np.dtype(dtype)
+    largest_finite = float(np.finfo(dtype).max)
+
+    try:
+        c_n = abs(cache.numeric_coeff(n))
+    except Exception:
+        return
+    if c_n == 0.0:
+        return
+
+    closed_magnitude = c_n * eps**n
+    threshold = largest_finite / safety
+    if not math.isfinite(closed_magnitude) or closed_magnitude > threshold:
+        warnings.warn(
+            f"taylor_remainder: leading coefficient |c_{n}| = {c_n:.3g} is large "
+            f"enough that the polynomial-branch leading term may overflow at the "
+            f"boundary |x-a| = {eps:.3g}.  At |x-a|=eps, the closed-branch "
+            f"numerator scale is |c_{n}|·eps^{n} = {closed_magnitude:.2e}, above "
+            f"the safety threshold largest_finite/{safety} = {threshold:.2e}.  "
+            f"Consider rescaling f, passing a smaller `eps` explicitly, or "
+            f"reducing `order`.",
+            TaylorRemainderOverflowWarning,
+            stacklevel=3,
+        )
+
+
+def closed_branch_needed(cache, n, order, t_max, *, dtype=None, max_extra=4):
+    """Return True if the polynomial branch alone is insufficient over |t| <= t_max.
+
+    When False, you can drop the closed branch entirely -- polynomial achieves
+    ~10·eps_machine relative accuracy throughout the input range, saving a
+    transcendental call per element.
+    """
+    if dtype is None:
+        dtype = np.dtype(cache.x.dtype)
+    else:
+        dtype = np.dtype(dtype)
+    eps_machine = float(np.finfo(dtype).eps)
+    tol_rel = 10.0 * eps_machine
+
+    v_lead, k_lead = _first_nonvanishing(cache, n, order)
+    if v_lead == 0.0:
+        return False
+    v_trunc, k_trunc = _first_nonvanishing(cache, n + order, max_extra + 1)
+    if v_trunc == 0.0:
+        return False
+    # relative truncation at t_max: |c_trunc / c_lead| · t_max^(k_trunc - k_lead)
+    return (v_trunc / v_lead) * t_max ** (k_trunc - k_lead) > tol_rel
+
+
+def taylor_remainder(f, x, a, n, *, order=10, eps=None, dtype=None, cache=None):
+    """Numerically stable evaluation of the n-th Taylor remainder of f at a.
+
+    The n-th Taylor remainder R is defined by
+
+        f(x)  =  P_{n-1}(x - a)  +  R(x) · (x - a)^n,
+
+    where P_{n-1} is the degree-(n-1) Taylor polynomial of f at a:
+
+        P_{n-1}(t)  =  Σ_{k=0..n-1}  f^(k)(a) / k!  ·  t^k.
+
+    Equivalently, R(x) = (f(x) - P_{n-1}(x-a)) / (x-a)^n -- but that closed
+    form has 0/0 at x=a, with R(a) = f^(n)(a) / n!. This routine returns
+    a graph that evaluates R stably across x=a.
+
+    Internally evaluated as
+
+        switch(|x - a| < eps,
+               polynomial branch (degree order-1 truncation of R's series),
+               closed form (f(x) - P_{n-1}(x-a)) / (x-a)^n)
+
+    Parameters
+    ----------
+    f : Variable
+        Symbolic expression in `x`.
+    x : Variable
+        Input variable. Its dtype is fixed at variable creation and is
+        used to size the auto-chosen eps.
+    a : float
+        Expansion point.
+    n : int
+        Order of the Taylor remainder.
+    order : int, default 10
+        Polynomial-branch length. Must exceed the number of derivatives you
+        plan to take through the resulting graph (each grad pass shortens
+        the polynomial branch by one).
+    eps : float, optional
+        Switch threshold. If None, chosen by `auto_eps` to drive polynomial
+        truncation error to ~10·eps_machine for the relevant dtype. The
+        chosen value is a Python float baked into the graph.
+    dtype : dtype, optional
+        Override for the dtype used to size auto-chosen eps. Defaults to
+        `x.dtype`. Ignored when `eps` is given explicitly.
+    cache : TaylorAtPoint, optional
+        Shared cache of f^(m)(a) values. Pass one to memoize derivative
+        evaluations across multiple taylor_remainder calls.
+    """
+    if cache is None:
+        cache = TaylorAtPoint(f, x, a)
+    coeffs = cache.coeffs_of_deriv(0, n + order)
+    t = x - a
+
+    poly = coeffs[n]
+    for k in range(1, order):
+        poly = poly + coeffs[n + k] * t**k
+
+    if n == 0:
+        closed = f
+    else:
+        P = coeffs[0]
+        for k in range(1, n):
+            P = P + coeffs[k] * t**k
+        closed = (f - P) / t**n
+
+    if eps is None:
+        eps = auto_eps(cache, n, order, dtype=dtype)
+
+    if eps == 0:
+        # Degenerate case (R vanishes, or polynomial is exact within our
+        # check window). Use closed everywhere except exactly x=a, where
+        # closed has 0/0 -- substitute the polynomial limit value c_n there.
+        return pt.switch(pt.eq(t, 0), cache.coeff(n), closed)
+
+    check_underflow_safety(cache, n, eps, dtype=dtype)
+    check_overflow_safety(cache, n, eps, dtype=dtype)
+
+    return pt.switch(pt.abs(t) < eps, poly, closed)
+
+
+def taylor_remainder_poly(f, x, a, n, *, order=10, cache=None):
+    """Polynomial-only approximation of the n-th Taylor remainder of f at a.
+
+    Truncates the power series of R from
+        f(x)  =  P_{n-1}(x - a)  +  R(x) · (x - a)^n
+    to its first `order` terms, returning
+
+        Σ_{k=0..order-1}  f^(k+n)(a) / (k+n)!  ·  (x - a)^k.
+
+    Equals `taylor_remainder` up to a truncation error O((x-a)^order). Use
+    this when (x-a) stays small enough that the closed-form branch is
+    unnecessary -- it's faster, has trivial gradients, and removes the switch.
+    """
+    if cache is None:
+        cache = TaylorAtPoint(f, x, a)
+    coeffs = cache.coeffs_of_deriv(0, n + order)
+    t = x - a
+    return sum(coeffs[n + k] * t**k for k in range(order))
+
+
+def main():
+    x = pt.dscalar("x")
+
+    # Auto-chosen eps for three test functions and a closed-branch necessity
+    # check at |t| <= 0.5.
+    funcs = [
+        ("log1p(x)/x     ", pt.log1p(x), 1),
+        ("exp(-x^2/2)    ", pt.exp(-(x**2) / 2.0), 0),
+        ("(cos(x)-1)/x^2 ", pt.cos(x) - 1, 2),
+    ]
+    for name, f_expr, n in funcs:
+        cache_ = TaylorAtPoint(f_expr, x, 0.0)
+        for order in (8, 10, 12, 14):
+            eps_ = auto_eps(cache_, n, order)
+            need = closed_branch_needed(cache_, n, order, t_max=0.5)
+            print(
+                f"  {name}  n={n}  order={order:>2}  "
+                f"auto_eps={eps_:>8.3g}  closed_branch_needed(|t|<=0.5)={need}"
+            )
+        print()
+
+    # Iterated grad of log1p / x with shared cache.
+    print("\n=== iterated grad of taylor_remainder(log1p, x, 0, 1) ===")
+    cache = TaylorAtPoint(pt.log1p(x), x, 0.0)
+    cur = taylor_remainder(pt.log1p(x), x, 0.0, 1, order=10, cache=cache)
+    cur = rewrite_graph(cur, include=("canonicalize",))
+
+    def ref(k):
+        return (-1) ** k * math.factorial(k) / (k + 1)
+
+    for k in range(8):
+        fn = pytensor.function([x], cur)
+        v = float(fn(0.0))
+        r = ref(k)
+        ok = "ok" if abs(v - r) <= 1e-9 * max(1.0, abs(r)) else "FAIL"
+        print(f"  k={k}  {ok}  val={v:>16.10g}  ref={r:>16.10g}")
+        cur = pt.grad(cur, x)
+        cur = rewrite_graph(cur, include=("canonicalize",))
+
+
+if __name__ == "__main__":
+    main()
