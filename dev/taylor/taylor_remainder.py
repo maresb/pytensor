@@ -6,9 +6,42 @@ where P_{n-1} is the degree-(n-1) Taylor polynomial of f at a and R is the
 n-th Taylor remainder, with R(a) = f^(n)(a)/n!. The public `taylor_remainder`
 routine returns a stable graph for R evaluated across x = a.
 
-Implementation: switch(|x-a| < eps, polynomial branch, closed-form branch),
-where the closed-form branch evaluates the algebraically equivalent but
-numerically singular expression (f(x) - P_{n-1}(x-a)) / (x-a)^n.
+Contract on f (the user's input).
+================================
+
+We assume the user-supplied f(x) is computed as accurately as the input
+dtype allows -- i.e., f is "pristine": its evaluation has at most
+~eps_machine relative error (within the dtype's representation limits).
+Concretely, this means:
+  - User has chosen stable libm primitives where they exist
+    (e.g. `pt.expm1(x)` not `pt.exp(x) - 1`, `pt.log1p(x)` not
+    `pt.log(1 + x)`).
+  - User's expression doesn't introduce gratuitous cancellation
+    (e.g. `pt.cos(x) - 1` is acceptable as f -- our polynomial branch
+    handles the cancellation -- but `pt.exp(x) * pt.exp(-x) - 1` is not).
+
+Under this contract, ALL numerical error in the output of `taylor_remainder`
+is introduced by the operations WE add on top of f:
+
+  (a) The subtraction `f(x) - P_{n-1}(x - a)` (closed branch only): when
+      P_{n-1} != 0 the magnitudes of the two operands are similar near a,
+      causing catastrophic cancellation. PyTensor's canonicalize folds
+      explicit-constant K0 - K0 patterns symbolically, which eliminates
+      this for the typical case; for opaque f (e.g. wrapped in
+      `OpFromGraph`) the cancellation persists at runtime.
+
+  (b) The division by (x - a)^n (closed branch only): amplifies absolute
+      errors in the numerator by 1/|x-a|^n.
+
+  (c) Polynomial truncation at order `order` (polynomial branch only):
+      contributes ~|c_{n+order}/c_n| · |x-a|^order in relative terms.
+
+The `auto_eps` switch threshold balances (a)+(b) against (c): polynomial
+branch covers the cancellation-prone region, closed branch handles
+larger |x-a|. If f violates the contract (its own evaluation has more
+than ~eps_machine relative error), the error from f's evaluation
+propagates into the closed branch and is NOT modeled here -- the user
+must either fix f or pass `eps` explicitly.
 
 Memoization: a TaylorAtPoint cache shares f^(m)(a) values across all calls,
 so building taylor_remainder(f^(j), x, a, m) for many (j, m) pairs only
