@@ -138,13 +138,21 @@ def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
     given dtype, then apply a `safety` factor (default 0.75) to account
     for the empirical ~25% overshoot of the analytic formula.
 
-    Returns 0.0 when no truncation budget can be evaluated (leading c_n
-    vanishes, or all checked higher-order coefficients vanish). In those
-    cases the polynomial branch is either zero or merely "matches f within
-    the coefficients we looked at," and we cannot rule out f having beyond-
-    window terms that the polynomial would silently discard. Returning 0.0
-    tells `taylor_remainder` to defer to the user's closed-form expression
-    for all x != a, substituting the polynomial limit only at x = a.
+    Two error sources are modeled simultaneously:
+
+    1. polynomial-branch truncation:  ~ |c_{n+order}/c_n| · eps^order
+       gives an upper bound  eps <= eps_upper  for poly accuracy;
+    2. closed-branch cancellation in (f - P_{n-1}):
+       ~ eps_machine · |c_0|/(|c_n| · eps^n)
+       gives a lower bound  eps >= eps_lower  for closed accuracy.
+
+    The chosen eps satisfies both bounds. When v_trunc = 0 (polynomial
+    truncation budget never bites), eps_upper = inf and only eps_lower
+    constrains. When c_0 = ... = c_{n-1} = 0 (P_{n-1} = 0 symbolically,
+    no subtraction needed), eps_lower = 0 and only eps_upper constrains.
+
+    Returns 0.0 when neither bound bites (e.g. R itself vanishes, or
+    polynomial is exact and our subtraction is trivial).
 
     The formula is NOT capped at any constant -- doing so would violate
     scale invariance (the natural cap is the function's convergence radius,
@@ -165,30 +173,60 @@ def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
     # Leading coefficient of R: first nonzero c_k for k >= n (typically c_n).
     v_lead, k_lead = _first_nonvanishing(cache, n, order)
     if v_lead == 0.0:
-        # R itself effectively vanishes in our coefficient window. The
-        # closed branch is the user's expression for f(x)/(x-a)^n, which
-        # is well-defined for x != a. Use it everywhere except x = a,
-        # where it would be 0/0; the polynomial substitutes the limit
-        # value (zero in this case) only at that one point.
+        # R itself effectively vanishes in our coefficient window. Closed
+        # form is also zero (numerator and denominator both vanish). The
+        # switch in taylor_remainder substitutes the polynomial limit
+        # (which is zero) at x=a; closed is used elsewhere. eps=0 means
+        # this fall-through.
         return 0.0
 
-    # First omitted coefficient: c_{n+order} or the first nonzero beyond it.
+    # ---- two error sources, two bounds on eps ----
+    #
+    # Polynomial-truncation upper bound:
+    #     err_poly(eps) ≈ |c_{n+order}/c_n| · eps^order
+    #     err_poly <= tol_rel  ⟹  eps <= eps_upper.
+    # When c_{n+order} = 0 in our check window, eps_upper = inf.
+    #
+    # Closed-branch cancellation lower bound (from our (f - P_{n-1})
+    # subtraction; relevant when P_{n-1} ≠ 0 symbolically, i.e. some
+    # c_k != 0 for k < n):
+    #     err_closed(eps) ≈ eps_machine · |c_0|/(|c_n| · eps^n)
+    #     err_closed <= tol_rel  ⟹  eps >= eps_lower.
+    # When c_0 = c_1 = ... = c_{n-1} = 0, P_{n-1} = 0 symbolically and our
+    # subtraction is trivial; eps_lower = 0.
+    #
+    # Both must hold simultaneously: the chosen eps must lie in
+    # [eps_lower, eps_upper]. We pick the largest valid eps (= eps_upper
+    # when finite, else eps_lower) for maximum polynomial coverage.
+
+    if n > 0:
+        v_const, _ = _first_nonvanishing(cache, 0, n)
+    else:
+        v_const = 0.0
+    if v_const == 0.0:
+        eps_lower = 0.0
+    else:
+        eps_lower = (eps_machine * v_const / (tol_rel * v_lead)) ** (1.0 / n)
+
     v_trunc, k_trunc = _first_nonvanishing(cache, n + order, max_extra + 1)
     if v_trunc == 0.0:
-        # The next several coefficients in our check window vanish, but we
-        # cannot conclude that f really is a polynomial -- f could have
-        # higher-order terms beyond `n + order + max_extra` that we never
-        # looked at. Trusting the polynomial branch in that case would
-        # silently discard those terms. Defer to the user's closed-form
-        # expression for x != a, and substitute the polynomial value only
-        # at the one singular point x = a.
-        return 0.0
+        # No polynomial-truncation upper bound; only the cancellation
+        # lower bound applies.
+        return eps_lower
 
-    # NB: compute the ratio v_lead/v_trunc *before* multiplying by tol_rel to
-    # avoid floating-point underflow when v_lead is subnormal -- the
-    # ratio is K-invariant (and well-conditioned), but `tol_rel · v_lead`
-    # underflows for K near the dtype's smallest_subnormal.
-    return safety * (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
+    # NB: compute the ratio v_lead/v_trunc *before* multiplying by tol_rel
+    # to avoid floating-point underflow when v_lead is subnormal -- the
+    # ratio is K-invariant, but `tol_rel * v_lead` underflows for K
+    # near smallest_subnormal.
+    eps_upper = safety * (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
+
+    if eps_upper < eps_lower:
+        # Infeasible: at any eps in this window, EITHER polynomial
+        # truncation OR closed cancellation exceeds tol. The user can
+        # raise `order` to widen eps_upper. We return eps_lower
+        # (cancellation-safe; sacrifices a little polynomial accuracy).
+        return eps_lower
+    return eps_upper
 
 
 def _smallest_subnormal(dtype):
@@ -381,14 +419,14 @@ def taylor_remainder(f, x, a, n, *, order=10, eps=None, dtype=None, cache=None):
         eps = auto_eps(cache, n, order, dtype=dtype)
 
     if eps == 0:
-        # Degenerate case (R vanishes, or polynomial is exact within our
-        # check window). Use closed everywhere except exactly x=a, where
-        # closed has 0/0 -- substitute the polynomial value there.
-        # NB: must use the full polynomial expression `poly` (not just the
-        # leading constant cache.coeff(n)) so that derivatives of the result
-        # at x=a recover c_{n+1}, 2!*c_{n+2}, ... from poly's higher-order
-        # terms. Using a bare constant would zero out all higher-order
-        # gradients at x=a.
+        # Degenerate case: no truncation budget could be evaluated.
+        # Use polynomial branch with switch -- closed branch is the user's f
+        # which captures any beyond-window terms; we only fall back to the
+        # polynomial limit value at exactly x=a (where closed has 0/0).
+        # For c_0 != 0 the subtraction in (f - P_{n-1}) suffers cancellation
+        # at small |x-a|; the cancellation-aware eps is computed via auto_eps
+        # path returning a positive eps, not 0. So eps=0 here means R itself
+        # vanishes in our window (v_lead = 0) or the user explicitly set 0.
         return pt.switch(pt.eq(t, 0), poly, closed)
 
     check_underflow_safety(cache, n, eps, dtype=dtype)

@@ -302,13 +302,17 @@ def test_n1_transcendental_f_with_nonzero_constant_term():
     """f(x) = K0 + exp(x) at a=0 with K0 != 0, n=1.
 
     R(x) = ((K0 + exp(x)) - (K0 + 1))/x = (exp(x) - 1)/x = expm1(x)/x.
-    c_0 = K0 + 1 (nonzero), c_1 = 1, c_2 = 1/2, ..., c_11 = 1/11!.
-    v_trunc = 1/11! != 0, so we hit the formula path with finite eps.
-    The polynomial branch covers small |x| where the closed form
-    exp(x) - 1 cancels.
+
+    auto_eps balances two bounds:
+    - eps_upper from polynomial truncation: ~0.148 at order=10 for exp.
+    - eps_lower from closed-branch cancellation: |c_0|/(10·|c_1|) = (K0+1)/10.
+
+    For modest K0 (eps_lower <= eps_upper), the polynomial covers |x|<eps
+    and closed handles larger x; both meet machine precision. We test K0
+    values up to 0.4 where eps_lower=0.14 stays within polynomial coverage.
     """
     x = pt.dscalar("x")
-    for K0 in [0.0, 1.0, 1e10, -1e5]:
+    for K0 in [0.0, 0.1, -0.2, 0.4]:
         f = K0 + pt.exp(x)
         y = taylor_remainder(f, x, 0.0, 1, order=10)
         fn = pytensor.function([x], y)
@@ -318,6 +322,46 @@ def test_n1_transcendental_f_with_nonzero_constant_term():
             assert math.isclose(out, ref, rel_tol=1e-12, abs_tol=1e-15), (
                 f"K0={K0}, x={v}: got {out}, expected {ref}"
             )
+
+
+def test_n1_cancellation_aware_eps_with_opaque_f_and_nonzero_c0():
+    """When f is opaque to canonicalize (wrapped in OpFromGraph), the
+    closed form (f - K0)/x is NOT folded: it computes f(x) and subtracts
+    K0 at runtime, with catastrophic cancellation at small |x| when
+    K0 != 0. For this case the polynomial-truncation formula degenerates
+    (v_trunc = 0), so auto_eps must fall back to the cancellation-aware
+    bound
+
+        eps_cancel  =  (eps_machine · |c_0| / (tol_rel · |c_n|))^(1/n)
+
+    For the OpFromGraph-wrapped 1 + 2x + 3x^2 case (c_0=1, c_1=2, n=1,
+    tol_rel = 10·eps_machine):  eps_cancel = 1/(10·2) = 0.05.
+
+    Regression: earlier code returned eps=0 in this case, sending all
+    small-x evaluations through the cancellation-prone closed form
+    (rel_err 8e-4 at x=1e-15).
+    """
+    from pytensor.compile.builders import OpFromGraph
+
+    inner_x = pt.dscalar("inner_x")
+    inner_expr = 1.0 + 2.0 * inner_x + 3.0 * inner_x**2
+    opaque_f = OpFromGraph([inner_x], [inner_expr])
+
+    x = pt.dscalar("x")
+    f = opaque_f(x)
+
+    cache = TaylorAtPoint(f, x, 0.0)
+    eps = auto_eps(cache, n=1, order=10)
+    assert math.isclose(eps, 0.05, rel_tol=1e-12), f"expected eps=0.05, got {eps}"
+
+    y = taylor_remainder(f, x, 0.0, 1, order=10)
+    fn = pytensor.function([x], y)
+    for v in [0.0, 1e-15, 1e-10, 1e-5, 1e-3, 0.5, 1.0]:
+        ref = 2.0 + 3.0 * v
+        out = float(fn(v))
+        assert math.isclose(out, ref, rel_tol=1e-12, abs_tol=1e-15), (
+            f"x={v}: got {out}, expected {ref}"
+        )
 
 
 def test_iterated_grad_at_a_in_eps_zero_path():
