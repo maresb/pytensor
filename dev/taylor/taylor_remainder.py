@@ -383,8 +383,13 @@ def taylor_remainder(f, x, a, n, *, order=10, eps=None, dtype=None, cache=None):
     if eps == 0:
         # Degenerate case (R vanishes, or polynomial is exact within our
         # check window). Use closed everywhere except exactly x=a, where
-        # closed has 0/0 -- substitute the polynomial limit value c_n there.
-        return pt.switch(pt.eq(t, 0), cache.coeff(n), closed)
+        # closed has 0/0 -- substitute the polynomial value there.
+        # NB: must use the full polynomial expression `poly` (not just the
+        # leading constant cache.coeff(n)) so that derivatives of the result
+        # at x=a recover c_{n+1}, 2!*c_{n+2}, ... from poly's higher-order
+        # terms. Using a bare constant would zero out all higher-order
+        # gradients at x=a.
+        return pt.switch(pt.eq(t, 0), poly, closed)
 
     check_underflow_safety(cache, n, eps, dtype=dtype)
     check_overflow_safety(cache, n, eps, dtype=dtype)
