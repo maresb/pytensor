@@ -19,16 +19,19 @@ Concretely, this means:
   - User's expression doesn't introduce gratuitous cancellation
     (e.g. `pt.cos(x) - 1` is acceptable as f -- our polynomial branch
     handles the cancellation -- but `pt.exp(x) * pt.exp(-x) - 1` is not).
-  - f's symbolic derivatives f^(m)(a) are computable to arbitrary order
-    m (we need up to m = n + order + max_extra) and each evaluates to
-    ~eps_machine relative accuracy at x=a. PyTensor handles the symbolic
-    differentiation via `pt.grad` chains, with canonicalize simplifying
-    each derivative; for most analytic f this works, but pathological
-    cases (e.g. `cos(K*x^2)` whose grad chain blows up pytensor's
-    recursion limit, or expressions whose derivatives canonicalize fails
-    to simplify) violate the contract. In those cases the user must
-    pre-compute f^(m)(a) and pre-populate the TaylorAtPoint cache rather
-    than relying on the lazy grad chain.
+  - f's Taylor coefficients c_m = f^(m)(a)/m! up to m = n + order +
+    max_extra are available to ~eps_machine relative accuracy. By
+    default these are computed lazily by TaylorAtPoint via repeated
+    `pt.grad`. That works for most analytic f, but the chain-rule
+    expansion blows up exponentially in graph size for compositions
+    like `cos(K*x**2)` where canonicalize can't consolidate the
+    repeated `sin`/`cos` factors (each grad roughly doubles the graph;
+    by m=14 a single derivative substitution becomes minutes). For
+    such f, compute the coefficients with `mpmath.taylor` or a
+    closed-form formula and feed them in via
+    `cache.populate_from_coefficients(coeffs)` -- the closed branch
+    still uses your `f` expression at runtime, only the polynomial-
+    branch coefficients come from outside.
 
 Under this contract, ALL numerical error in the output of `taylor_remainder`
 is introduced by the operations WE add on top of f:
@@ -207,6 +210,32 @@ class TaylorAtPoint:
         c_l = (f^(j))^(l)(a) / l! = f^(j+l)(a) / l!
         """
         return [self.coeff(j + l) for l in range(K)]
+
+    def populate_from_coefficients(self, taylor_coefficients):
+        """Pre-fill the cache with externally-computed Taylor coefficients
+        [c_0, c_1, ..., c_N] of f at a, bypassing pytensor's grad chain.
+
+        Use this when f's symbolic differentiation through pytensor is
+        impractical -- e.g., deeply-composed transcendentals like
+        `cos(K*x**2)` whose grad chain expands exponentially in graph
+        size (each chain-rule application introduces new `sin/cos`
+        product terms that canonicalize cannot consolidate). For such
+        f, computing coefficients with mpmath.taylor (or a closed-form
+        formula) and feeding them in here keeps `taylor_remainder` fast
+        and accurate without changing its closed branch (which still
+        uses the user's `f` expression at runtime).
+
+        Coefficients are stored as f^(m)(a) = m!·c_m so that
+        `numeric_coeff(m)` and `value_at_a(m)` return consistent values.
+        Only indices not already populated are filled; existing entries
+        are left untouched.
+        """
+        for m, c_m in enumerate(taylor_coefficients):
+            if m < len(self._values):
+                continue
+            v_m = math.factorial(m) * float(c_m)
+            self._values.append(pt.constant(v_m, dtype=self.x.dtype))
+            self._numeric[m] = v_m
 
 
 def _first_nonvanishing(cache, start, count):
