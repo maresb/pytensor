@@ -28,6 +28,7 @@ import math
 import warnings
 
 import mpmath as mp
+import numpy as np
 import pytest
 from taylor_remainder import (
     TaylorAtPoint,
@@ -239,6 +240,84 @@ def test_n3_polynomial_parity4_sparse(a, b, c, d):
         assert rel <= tol, (
             f"a={a} b={b} c={c} d={d} x={v}: got {out}, ref {ref}, "
             f"rel_err {rel:.2e} > tol {tol:.2e}"
+        )
+
+
+# ---- parity-4 sparsity via cos(K·x²) using mpmath-computed coefficients ----
+
+
+def _populate_cache_via_mpmath(cache, f_mp_callable, a, n_coeffs):
+    """Populate `cache` with Taylor coefficients of `f_mp_callable` at
+    a, using mpmath. Threshold below dtype eps_machine·max(|c_i|) to
+    silence numerical-differentiation noise that would otherwise be
+    picked up by _first_nonvanishing in auto_eps."""
+    coeffs_mp = mp.taylor(f_mp_callable, a, n_coeffs - 1)
+    coeffs = [float(c) for c in coeffs_mp]
+    threshold = float(np.finfo(np.float64).eps) * max(abs(c) for c in coeffs)
+    coeffs = [0.0 if abs(c) < threshold else c for c in coeffs]
+    cache.populate_from_coefficients(coeffs)
+
+
+@pytest.mark.parametrize("K", [0.1, 1.0, 10.0])
+def test_n3_cos_Kxsq_parity4_via_mpmath(K):
+    """f = cos(K·x²), n=3: parity-4 sparsity (k_lead=4, k_trunc=16,
+    gap=12), eps scales as 1/sqrt(K).
+
+    cos(K·x²) is mathematically well-behaved but its symbolic grad
+    chain in pytensor blows up exponentially -- by m=14 a single
+    derivative substitution takes minutes. We bypass that by computing
+    coefficients with mpmath and pre-populating the cache; the closed
+    branch still uses pt.cos(K*x**2) at runtime. The test exercises
+    the same principled tolerance pattern as the other n=3 tests.
+    """
+    x = pt.dscalar("x")
+    f = pt.cos(K * x**2)
+
+    def f_mp(y, K=K):
+        return mp.cos(K * y**2)
+
+    cache = TaylorAtPoint(f, x, 0.0)
+    # Need coefficients up to n + order + max_extra - 1 = 16
+    _populate_cache_via_mpmath(cache, f_mp, 0.0, n_coeffs=18)
+    assert cache.numeric_coeff(3) == 0.0  # parity-4
+    assert cache.numeric_coeff(4) != 0.0
+    assert cache.numeric_coeff(15) == 0.0  # noise filtered
+    assert cache.numeric_coeff(16) != 0.0
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", TaylorRemainderClosedCancellationWarning)
+        eps = auto_eps(cache, n=3, order=10)
+        y = taylor_remainder(f, x, 0.0, 3, order=10, cache=cache)
+    fn = pytensor.function([x], y)
+
+    def _R_cos_Kxsq_high_precision(K, v):
+        """Reference R(v) = (cos(K·v²) - 1)/v³ at very high precision.
+        At small v, cos(K·v²) - 1 has catastrophic cancellation that
+        mpmath at 60 dps cannot resolve (the leading -K²·v⁴/2 term is
+        ~v⁴ smaller than cos's value 1, so 60 dps loses ~50 digits).
+        We bump to 200 dps locally to recover the true mathematical value."""
+        if v == 0:
+            return 0.0
+        with mp.workdps(200):
+            mv = mp.mpf(v)
+            return float((mp.cos(K * mv**2) - 1) / mv**3)
+
+    poly_tol = poly_branch_rel_err_bound(order=10)
+    sweep = [0.0, 1e-12, 1e-6, 1e-3, 0.01, 0.05, 0.1, 0.3]
+    for v in sweep:
+        ref = _R_cos_Kxsq_high_precision(K, v)
+        out = float(fn(v))
+        assert math.isfinite(out), f"K={K} x={v}: not finite"
+        ref_safe = abs(ref) if abs(ref) > 1e-300 else max(1.0, abs(K) ** 2)
+        rel = abs(out - ref) / ref_safe
+        tol = (
+            poly_tol
+            if v < eps
+            else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
+        )
+        assert rel <= tol, (
+            f"K={K} x={v} (eps={eps:.3g}): "
+            f"got {out}, ref {ref}, rel_err {rel:.2e} > tol {tol:.2e}"
         )
 
 
