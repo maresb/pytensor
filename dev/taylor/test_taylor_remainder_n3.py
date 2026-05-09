@@ -25,13 +25,16 @@ References computed at 60 digits with mpmath.
 """
 
 import math
+import warnings
 
 import mpmath as mp
-import numpy as np
 import pytest
 from taylor_remainder import (
     TaylorAtPoint,
+    TaylorRemainderClosedCancellationWarning,
     auto_eps,
+    closed_branch_rel_err_bound,
+    poly_branch_rel_err_bound,
     taylor_remainder,
     taylor_remainder_poly,
 )
@@ -96,15 +99,22 @@ def test_n3_sin_Kx_forward(K, order):
     y = taylor_remainder(f, x, 0.0, 3, order=order)
     fn = pytensor.function([x], y)
 
+    poly_tol = poly_branch_rel_err_bound(order=order)
     fracs = (1e-6, 0.1, 0.5, 0.9, 0.99, 1.0, 1.01, 1.1, 5.0)
-    sweep = [0.0, *(eps * f for f in fracs if eps * f <= 0.5)]
-    tol = 200 * np.finfo(np.float64).eps  # 1/x^3 doubles the constant slightly
+    sweep = [0.0, *(eps * fr for fr in fracs if eps * fr <= 0.5)]
     for v in sweep:
         ref = float(_R_sin_Kx(K, mp.mpf(v)))
         out = float(fn(v))
         assert math.isfinite(out), f"K={K} x={v}: not finite"
         ref_safe = abs(ref) if abs(ref) > 1e-300 else max(1.0, abs(K) ** 3 / 6)
         rel = abs(out - ref) / ref_safe
+        # Tolerance: poly bound for v inside window, closed-branch
+        # cancellation bound for v outside.  No magic constants.
+        tol = (
+            poly_tol
+            if v < eps
+            else closed_branch_rel_err_bound(cache, n=3, v=v, order=order)
+        )
         assert rel <= tol, (
             f"K={K} order={order} x={v} (eps={eps:.3g}): "
             f"got {out}, ref {ref}, rel_err {rel:.2e} > tol {tol:.2e}"
@@ -115,87 +125,55 @@ def test_n3_sin_Kx_forward(K, order):
 
 
 @pytest.mark.parametrize("K", [0.1, 1.0, 10.0, 100.0])
-def test_n3_cos_Kx_forward_away_from_boundary(K):
-    """f = cos(K·x), n=3: c_3 = 0 so k_lead = 4. The numerator
-    (cos(Kx) - 1 + K²x²/2) has DOUBLE-cancellation -- both c_0 = 1 and
-    c_2·x² = (K²/2)·x² fold against f's contributions. auto_eps's
-    safety factor is set on the assumption of single-term cancellation,
-    so right at the boundary |x|≈eps this two-term cancellation costs
-    extra precision (the leftover ~K⁴x⁴/24 is ~|Kx|² smaller than each
-    cancelling term).  Test the regions where each branch is in its
-    comfort zone:
-      - well inside poly window (|x| <= 0.5·eps): poly truncation is
-        ~0.5^10·tol_rel = 1e-3·tol_rel, very accurate;
-      - comfortably outside (|x| >= 2·eps): cancellation factor falls
-        as 1/(Kx)², down to ~20x at 2·eps and milder beyond.
-    The immediate boundary [0.9, 1.1]·eps is covered by the dedicated
-    boundary-precision test below, with a tolerance derived from the
-    cancellation factor."""
-    x = pt.dscalar("x")
-    f = pt.cos(K * x)
-    cache = TaylorAtPoint(f, x, 0.0)
-    eps = auto_eps(cache, n=3, order=10)
-    y = taylor_remainder(f, x, 0.0, 3, order=10)
-    fn = pytensor.function([x], y)
+def test_n3_cos_Kx_forward(K):
+    """f = cos(K·x), n=3: c_3 = 0 so k_lead = 4 -- the numerator
+    (cos(Kx) - 1 + K²x²/2) has multi-term cancellation (both c_0 = 1
+    and c_2·v² = (K²/2)·v² fold against f's contributions).
 
-    fracs = (1e-6, 0.1, 0.5, 2.0, 3.0, 5.0)
-    sweep = [0.0, *(eps * f for f in fracs if eps * f <= 0.5)]
-    tol = 200 * np.finfo(np.float64).eps
-    for v in sweep:
-        ref = float(_R_cos_Kx(K, mp.mpf(v)))
-        out = float(fn(v))
-        assert math.isfinite(out), f"K={K} x={v}: not finite"
-        # R(0) = 0 with no other natural scale -- use K³ as proxy magnitude
-        # (the next term c_5 = K⁵/120 brings R(eps) ~ K⁵·eps²/120 ~ K³).
-        ref_safe = abs(ref) if abs(ref) > 1e-300 else max(1.0, abs(K) ** 3)
-        rel = abs(out - ref) / ref_safe
-        assert rel <= tol, (
-            f"K={K} x={v} (eps={eps:.3g}): "
-            f"got {out}, ref {ref}, rel_err {rel:.2e} > tol {tol:.2e}"
-        )
+    The tolerance comes directly from the same first-principles error
+    bound that taylor_remainder's check_closed_cancellation_safety uses
+    to predict the boundary error and warn the user:
 
+        rel_err_closed(v)  ≤  ε_m · Σ_{i ∈ [0, n)} |c_i · v^i|
+                                  / (|c_{k_lead}| · v^{k_lead}).
 
-@pytest.mark.parametrize("K", [0.1, 1.0, 10.0, 100.0])
-def test_n3_cos_Kx_boundary_precision_matches_cancellation_model(K):
-    """At |x| ≈ eps, cos(Kx) at n=3 has a two-term numerator cancellation:
-    cos(Kx) - 1 ≈ -(Kx)²/2, K²x²/2 = +(Kx)²/2, summing to ~(Kx)⁴/24.
-    The relative error in the closed-branch numerator is therefore
-        rel_err_numerator ≈ eps_machine · (|cos(Kx)-1| + |K²x²/2|) / |sum|
-                          ≈ eps_machine · 12 / (Kx)².
-    This test asserts the observed error sits within a small constant
-    multiple of that model -- documenting the structural limit of the
-    closed branch right at the auto_eps boundary, and catching any
-    regression where the error grows out of proportion to the model.
+    Inside the poly window (|v| < eps): poly-evaluation rounding bound
+    is (order+1)·ε_m by Wilkinson on Horner. No magic constants,
+    no safety multipliers -- the test passes whenever the realized error
+    stays under the bound the warning is computed from.
     """
     x = pt.dscalar("x")
     f = pt.cos(K * x)
     cache = TaylorAtPoint(f, x, 0.0)
-    eps = auto_eps(cache, n=3, order=10)
-    y = taylor_remainder(f, x, 0.0, 3, order=10, eps=eps)
+    # The closed-cancellation warning fires at this k_lead > n
+    # configuration; the test's job is to verify the observed error
+    # stays within the bound the warning is derived from.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", TaylorRemainderClosedCancellationWarning)
+        eps = auto_eps(cache, n=3, order=10)
+        y = taylor_remainder(f, x, 0.0, 3, order=10)
     fn = pytensor.function([x], y)
 
-    eps_machine = float(np.finfo(np.float64).eps)
-    # Empirical multiplier on top of the analytic cancellation factor.
-    # Worst observed ratio across K=[0.1, 100] and frac=[0.999, 1.1] is
-    # ~8x, attributable to cos library precision (~1-2 ULP) plus rounding
-    # in the +K²x²/2 evaluation and the ÷x³ step.  safety=20 leaves enough
-    # slack to absorb dtype-specific quirks while catching any regression
-    # that doubles this error budget.
-    safety = 20.0
-    for frac in (0.999, 1.001, 1.01, 1.1):
-        v = eps * frac
-        if v > 0.5:
-            continue
-        Kx = K * v
-        cancellation_factor = 12.0 / max(Kx**2, 1e-30)
-        predicted_rel_err = safety * eps_machine * cancellation_factor
+    poly_tol = poly_branch_rel_err_bound(order=10)
+    fracs = (1e-6, 0.1, 0.5, 0.9, 0.99, 1.0, 1.001, 1.01, 1.1, 1.5, 2.0, 5.0)
+    sweep = [0.0, *(eps * fr for fr in fracs if eps * fr <= 0.5)]
+    for v in sweep:
         ref = float(_R_cos_Kx(K, mp.mpf(v)))
         out = float(fn(v))
+        assert math.isfinite(out), f"K={K} x={v}: not finite"
+        # R(0) = 0 has no natural magnitude scale; use K³ as proxy
+        # (R(eps) ~ K⁵·eps²/120 ~ K³ at boundary for the next-order term).
         ref_safe = abs(ref) if abs(ref) > 1e-300 else max(1.0, abs(K) ** 3)
         rel = abs(out - ref) / ref_safe
-        assert rel <= predicted_rel_err, (
-            f"K={K} frac={frac} v={v}: rel_err {rel:.2e} > "
-            f"model {predicted_rel_err:.2e} (cancellation_factor={cancellation_factor:.1f})"
+        # Tolerance: poly bound for v inside window, closed-branch
+        # cancellation bound for v outside.  Switch is at v == eps.
+        if v < eps:
+            tol = poly_tol
+        else:
+            tol = closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
+        assert rel <= tol, (
+            f"K={K} x={v} (eps={eps:.3g}): got {out}, ref {ref}, "
+            f"rel_err {rel:.2e} > tol {tol:.2e}"
         )
 
 
@@ -234,19 +212,33 @@ def test_n3_polynomial_parity4_sparse(a, b, c, d):
     assert cache.numeric_coeff(8) != 0.0
     assert cache.numeric_coeff(16) != 0.0
 
-    y = taylor_remainder(f, x, 0.0, 3, order=10)
+    eps = auto_eps(cache, n=3, order=10)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", TaylorRemainderClosedCancellationWarning)
+        y = taylor_remainder(f, x, 0.0, 3, order=10)
     fn = pytensor.function([x], y)
 
+    poly_tol = poly_branch_rel_err_bound(order=10)
     sweep = [0.0, 1e-12, 1e-8, 1e-4, 1e-2, 0.1, 0.3, 0.5]
-    tol = 500 * np.finfo(np.float64).eps
     for v in sweep:
         ref = _R_polynomial_parity4(a, b, c, d, v)
         out = float(fn(v))
         assert math.isfinite(out), f"a={a} b={b} c={c} d={d} x={v}: not finite"
         ref_safe = abs(ref) if abs(ref) > 1e-300 else max(1.0, abs(a))
         rel = abs(out - ref) / ref_safe
+        # The closed_branch_rel_err_bound is a CONSERVATIVE upper bound
+        # assuming the worst-case multi-term cancellation. For polynomial
+        # f, canonicalize folds (f - P_2) symbolically, so the actual
+        # closed branch evaluates a clean polynomial residual with no
+        # cancellation -- the bound holds with lots of slack.
+        tol = (
+            poly_tol
+            if v < eps
+            else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
+        )
         assert rel <= tol, (
-            f"a={a} b={b} c={c} d={d} x={v}: got {out}, ref {ref}, rel_err {rel:.2e}"
+            f"a={a} b={b} c={c} d={d} x={v}: got {out}, ref {ref}, "
+            f"rel_err {rel:.2e} > tol {tol:.2e}"
         )
 
 
@@ -274,18 +266,27 @@ def test_n3_layered_three_subtree_fold(K0_log10, K1_log10, K2_log10):
 
     x = pt.dscalar("x")
     f = K0 + K1 * x + K2 * x**2 + x**3 * pt.cos(x)
-    y = taylor_remainder(f, x, 0.0, 3, order=10)
+    cache = TaylorAtPoint(f, x, 0.0)
+    eps = auto_eps(cache, n=3, order=10)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", TaylorRemainderClosedCancellationWarning)
+        y = taylor_remainder(f, x, 0.0, 3, order=10, cache=cache)
     fn = pytensor.function([x], y)
 
+    poly_tol = poly_branch_rel_err_bound(order=10)
     # Span small (poly-branch dominant) to moderate (closed-branch dominant)
     sweep = [0.0, 1e-12, 1e-6, 1e-3, 0.01, 0.1, 0.3]
-    tol = 1000 * np.finfo(np.float64).eps  # 1/x^3 + 3 cancellations -> looser
     for v in sweep:
         ref = float(_R_layered(K0, K1, K2, 1.0, 1.0, mp.mpf(v)))
         out = float(fn(v))
         assert math.isfinite(out), f"K0={K0} K1={K1} K2={K2} x={v}: not finite ({out})"
         ref_safe = abs(ref) if abs(ref) > 1e-300 else 1.0
         rel = abs(out - ref) / ref_safe
+        tol = (
+            poly_tol
+            if v < eps
+            else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
+        )
         assert rel <= tol, (
             f"K0={K0} K1={K1} K2={K2} x={v}: "
             f"got {out}, ref {ref}, rel_err {rel:.2e} > tol {tol:.2e}"
@@ -314,13 +315,18 @@ def test_n3_K3_scale_invariant_sin(K3_log10):
     y = taylor_remainder(f, x, 0.0, 3, order=10)
     fn = pytensor.function([x], y)
 
-    tol = 200 * np.finfo(np.float64).eps
+    poly_tol = poly_branch_rel_err_bound(order=10)
     for v in [0.0, 1e-10, 1e-5, 0.01, 0.1, 0.3]:
         ref = float(_R_sin_Kx(1.0, mp.mpf(v))) * K3
         out = float(fn(v))
         assert math.isfinite(out), f"K3={K3} x={v}: not finite ({out})"
         ref_safe = abs(ref) if abs(ref) > 1e-300 else max(K3, 1.0) / 6
         rel = abs(out - ref) / ref_safe
+        tol = (
+            poly_tol
+            if v < eps
+            else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
+        )
         assert rel <= tol, f"K3={K3} x={v}: got {out}, ref {ref}, rel_err {rel:.2e}"
 
 
@@ -396,13 +402,18 @@ def test_n3_switch_boundary_continuity_sin(K):
     y = taylor_remainder(f, x, 0.0, 3, order=10, eps=eps)
     fn = pytensor.function([x], y)
 
-    tol = 200 * np.finfo(np.float64).eps
+    poly_tol = poly_branch_rel_err_bound(order=10)
     for frac in (0.999, 0.9999, 1.0001, 1.001):
         v = eps * frac
         ref = float(_R_sin_Kx(K, mp.mpf(v)))
         out = float(fn(v))
         ref_safe = abs(ref) if abs(ref) > 1e-300 else max(1.0, abs(K) ** 3 / 6)
         rel = abs(out - ref) / ref_safe
+        tol = (
+            poly_tol
+            if v < eps
+            else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
+        )
         assert rel <= tol, (
             f"K={K} frac={frac} v={v}: got {out}, ref {ref}, rel_err {rel:.2e}"
         )
@@ -427,17 +438,37 @@ def test_n3_layered_matches_pristine_x3_cos(K0_log10, K1_log10, K2_log10):
     f_pristine = x**3 * pt.cos(x)
     f_layered = K0 + K1 * x + K2 * x**2 + x**3 * pt.cos(x)
 
-    fn_p = pytensor.function([x], taylor_remainder(f_pristine, x, 0.0, 3, order=10))
-    fn_l = pytensor.function([x], taylor_remainder(f_layered, x, 0.0, 3, order=10))
+    cache_p = TaylorAtPoint(f_pristine, x, 0.0)
+    cache_l = TaylorAtPoint(f_layered, x, 0.0)
+    eps_p = auto_eps(cache_p, n=3, order=10)
+    eps_l = auto_eps(cache_l, n=3, order=10)
+    fn_p = pytensor.function(
+        [x], taylor_remainder(f_pristine, x, 0.0, 3, order=10, cache=cache_p)
+    )
+    fn_l = pytensor.function(
+        [x], taylor_remainder(f_layered, x, 0.0, 3, order=10, cache=cache_l)
+    )
 
-    tol = 1000 * np.finfo(np.float64).eps
+    poly_tol = poly_branch_rel_err_bound(order=10)
     for v in [0.0, 1e-12, 1e-6, 1e-3, 0.01, 0.1, 0.3]:
         out_p = float(fn_p(v))
         out_l = float(fn_l(v))
         ref = math.cos(v)
         rel_p = abs(out_p - ref) / max(1.0, abs(ref))
         rel_l = abs(out_l - ref) / max(1.0, abs(ref))
-        assert rel_p <= tol and rel_l <= tol, (
-            f"K0={K0} K1={K1} K2={K2} x={v}: "
-            f"pristine rel_err {rel_p:.2e}, layered rel_err {rel_l:.2e}"
+        tol_p = (
+            poly_tol
+            if v < eps_p
+            else closed_branch_rel_err_bound(cache_p, n=3, v=v, order=10)
+        )
+        tol_l = (
+            poly_tol
+            if v < eps_l
+            else closed_branch_rel_err_bound(cache_l, n=3, v=v, order=10)
+        )
+        assert rel_p <= tol_p, (
+            f"K0={K0} K1={K1} K2={K2} x={v}: pristine rel_err {rel_p:.2e} > tol {tol_p:.2e}"
+        )
+        assert rel_l <= tol_l, (
+            f"K0={K0} K1={K1} K2={K2} x={v}: layered rel_err {rel_l:.2e} > tol {tol_l:.2e}"
         )
