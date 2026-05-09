@@ -43,6 +43,58 @@ than ~eps_machine relative error), the error from f's evaluation
 propagates into the closed branch and is NOT modeled here -- the user
 must either fix f or pass `eps` explicitly.
 
+The canonicalize asymmetry.
+===========================
+
+The closed branch is built as a symbolic expression (f - P_{n-1})/t^n
+and handed to PyTensor. canonicalize then folds whatever it symbolically
+can. This folding is asymmetric across f's structure:
+
+  - Polynomial f (e.g. `K0 + K1*x + K2*x^2 + K3*x^3*g(x)`): canonicalize
+    folds (f - P_{n-1}) all the way down to the residual polynomial,
+    eliminating runtime subtractions entirely. The closed branch is then
+    computed essentially exactly, INDEPENDENT of (a)+(b) above.
+
+  - Transcendental f (e.g. `cos(K*x)`): canonicalize folds explicit
+    constants like K0 - K0 = 0 and K1*x - K1*x = 0, but cannot fold a
+    transcendental call against its symbolic Taylor coefficients. The
+    runtime subtraction (e.g. `cos(K*x) - 1 + K^2*x^2/2`) survives, and
+    (a)+(b) apply with their full force.
+
+This asymmetry is desirable: canonicalize gives polynomial f tighter
+precision than the worst-case error model would predict. Defeating
+canonicalize (by wrapping the closed branch or f itself in an opaque op)
+would force the runtime cancellation in BOTH cases, degrading polynomial
+f's near-exact precision to match the transcendental worst case. We
+instead design auto_eps and the warnings around the worst-case error
+model and let canonicalize over-deliver where it can.
+
+The closed-cancellation gap (and the warning).
+==============================================
+
+When k_lead > n -- i.e., f's n-th derivative at a vanishes, so the
+leading R coefficient sits at index k_lead > n -- the closed branch's
+relative error has the form
+
+    rel_err_closed(v)  ~  ε_m * Σ_{i ∈ [0, n)} |c_i * v^i| / (|c_{k_lead}| * v^{k_lead}),
+
+with the 1/v^{k_lead} divisor growing rapidly as v shrinks. auto_eps's
+poly-truncation-only formula does NOT account for this multi-term
+cancellation, and at the resulting eps the closed branch can have
+relative error well above tol_rel = 10*eps_machine. This is the case
+for e.g. cos(K*x) at n=3 (c_3 = 0, k_lead = 4): with order=10, the
+boundary error is ~3e-13 instead of the ~tol_rel that auto_eps's model
+predicts.
+
+`check_closed_cancellation_safety` uses `closed_branch_rel_err_bound`
+to compute the expected boundary error and warns the user when it
+exceeds tol_rel. The fix is to bump `order` (which widens the polynomial
+window) until the gap closes, OR to pass `eps` explicitly. We do NOT
+silently widen eps here because that would pull the polynomial branch
+into a regime where its truncation error exceeds tol_rel for polynomial
+f cases that canonicalize was successfully covering -- the asymmetry
+penalizes the wrong direction.
+
 Memoization: a TaylorAtPoint cache shares f^(m)(a) values across all calls,
 so building taylor_remainder(f^(j), x, a, m) for many (j, m) pairs only
 costs one chain of grads, not many.
