@@ -128,6 +128,12 @@ class TaylorRemainderOverflowWarning(UserWarning):
     branch leading term may overflow at the boundary |x-a| = eps."""
 
 
+class TaylorRemainderClosedCancellationWarning(UserWarning):
+    """The closed branch's multi-term cancellation makes its relative
+    error exceed tol_rel at the auto-chosen eps. Increase `order` to
+    close the gap (or pass `eps` explicitly to a preferred crossover)."""
+
+
 class TaylorAtPoint:
     """Memoizes f, f', f'', ... and f^(m)(a) for m = 0, 1, 2, ...
 
@@ -405,6 +411,141 @@ def check_overflow_safety(cache, n, eps, *, dtype=None, safety=10.0):
         )
 
 
+def _subtracted_terms_combined_magnitude(cache, n, v):
+    """Σ_{i ∈ [0, n)} |c_i · v^i|: the combined magnitude of operands
+    entering the subtraction (f - P_{n-1}) at |x-a| = v.
+
+    By Wilkinson's bound for floating-point summation, computing
+    `f(v) - Σ c_i·v^i` gives an absolute error bounded by
+        ε_m · (|f(v)| + Σ|c_i·v^i|)  +  higher-order accumulation,
+    and within the radius of convergence |f(v)| ≤ Σ_{i=0}^∞ |c_i·v^i|,
+    so this combined sum (extended formally to all of f's series, but
+    truncated to [0,n) for the cache values we have) is the leading
+    term in the bound. We omit the higher-order n·ε_m accumulation
+    factor; empirically that overcounts the rounding errors actually
+    realized in fp arithmetic.
+
+    Returns 0 when P_{n-1} ≡ 0 symbolically (c_0 = ... = c_{n-1} = 0),
+    in which case no subtraction is introduced and there is no
+    cancellation contribution.
+    """
+    total = 0.0
+    for i in range(n):
+        try:
+            mag = abs(cache.numeric_coeff(i)) * (abs(v) ** i if i > 0 else 1.0)
+        except Exception:
+            mag = 0.0
+        total += mag
+    return total
+
+
+def closed_branch_rel_err_bound(cache, n, v, order, *, dtype=None):
+    """Upper bound on the closed branch's relative error at |x-a| = v.
+
+    Derivation. Under the pristine-f contract (f's evaluation has
+    relative error ≤ ε_m), the closed branch's numerator absolute
+    error is bounded by
+
+        |abs_err_numerator| ≤ ε_m · Σ_{i ∈ [0, n)} |c_i · v^i|       (Wilkinson, leading term)
+
+    The numerator's true magnitude at |x-a|=v is |c_{k_lead}| · v^{k_lead}
+    where k_lead is the smallest k ≥ n with c_k ≠ 0. Dividing by v^n
+    preserves relative error (one extra rounding, absorbed into ε_m), so
+
+        rel_err_closed(v)  ≤  ε_m · Σ|c_i·v^i| / (|c_{k_lead}| · v^{k_lead}).
+
+    Two regimes:
+      - k_lead == n (typical): the formula reduces to the single-term
+        cancellation model, with closed_branch_rel_err_bound bounded
+        below tol_rel at the auto_eps boundary by construction.
+      - k_lead > n (c_n vanishes -- e.g. cos(Kx) at n=3 has c_3=0,
+        k_lead=4): the 1/v^{k_lead} divisor amplifies precision loss
+        as v shrinks, giving a 1/v^{k_lead-n} factor on top of the
+        single-term scale. auto_eps does NOT account for this, so
+        check_closed_cancellation_safety warns the user.
+
+    Returns ∞ when v=0 (closed branch undefined) or when R itself
+    vanishes in the cache's coefficient window.
+    """
+    if v == 0:
+        return float("inf")
+    v_lead, k_lead = _first_nonvanishing(cache, n, order)
+    if v_lead == 0.0:
+        return float("inf")
+    if dtype is None:
+        dtype = np.dtype(cache.x.dtype)
+    eps_machine = float(np.finfo(np.dtype(dtype)).eps)
+    combined = _subtracted_terms_combined_magnitude(cache, n, abs(v))
+    # Cancellation contribution: ε_m · Σ|c_i·v^i| / (|c_kl|·v^kl).
+    # Plus a 1·ε_m floor: even with zero cancellation, the final
+    # division (numerator / v^n) introduces one ULP of rounding error.
+    cancellation = combined / (v_lead * abs(v) ** k_lead) if combined > 0 else 0.0
+    return eps_machine * (cancellation + 1.0)
+
+
+def poly_branch_rel_err_bound(order, *, dtype=None):
+    """Upper bound on the polynomial branch's relative error from
+    floating-point evaluation: (order+1)·ε_m by Wilkinson's bound on
+    Horner-method summation of `order` terms (each multiplication and
+    addition contributes one ULP).
+
+    Holds when truncation error is sub-dominant (i.e., |x-a| < eps where
+    eps was chosen by auto_eps to drive truncation below tol_rel).
+    """
+    if dtype is None:
+        dtype = np.float64
+    eps_machine = float(np.finfo(np.dtype(dtype)).eps)
+    return (order + 1) * eps_machine
+
+
+def check_closed_cancellation_safety(cache, n, eps, order, *, dtype=None, max_extra=4):
+    """Issue a warning if multi-term cancellation makes the closed branch's
+    boundary error exceed tol_rel.
+
+    The bound is computed by `closed_branch_rel_err_bound` (which captures
+    both single-term and multi-term cancellation). The warning fires when
+    k_lead > n (i.e., c_n = 0 -- f's n-th derivative vanishes at a) AND
+    the predicted boundary error exceeds tol_rel = 10·ε_m. For k_lead = n
+    (typical case) auto_eps's polynomial-truncation formula already
+    balances closed-branch single-term cancellation against poly
+    truncation; no warning is needed.
+    """
+    if dtype is None:
+        dtype = np.dtype(cache.x.dtype)
+    else:
+        dtype = np.dtype(dtype)
+    eps_machine = float(np.finfo(dtype).eps)
+    tol_rel = 10.0 * eps_machine
+
+    v_lead, k_lead = _first_nonvanishing(cache, n, order)
+    if v_lead == 0.0 or k_lead == n:
+        return  # no multi-term cancellation
+    combined = _subtracted_terms_combined_magnitude(cache, n, eps)
+    if combined == 0.0:
+        return  # P_{n-1} ≡ 0 symbolically, no subtraction
+    if eps <= 0.0:
+        return
+
+    rel_err_at_boundary = closed_branch_rel_err_bound(cache, n, eps, order, dtype=dtype)
+    if rel_err_at_boundary <= tol_rel:
+        return
+
+    eps_lower = (eps_machine * combined / (tol_rel * v_lead)) ** (1.0 / k_lead)
+    warnings.warn(
+        f"taylor_remainder: closed branch's multi-term cancellation predicts "
+        f"relative error ~{rel_err_at_boundary:.2e} at |x-a|=eps, exceeding "
+        f"tol_rel={tol_rel:.2e}.  This arises because c_{n}=0 (k_lead={k_lead}>n={n}), "
+        f"so the numerator (f - P_{{n-1}}) is built by subtracting terms of combined "
+        f"magnitude ~{combined:.3g} to obtain a result of magnitude ~|c_{{{k_lead}}}|·eps^{k_lead}"
+        f"={v_lead * eps**k_lead:.3g}.  The polynomial branch covers x < eps={eps:.3g} "
+        f"with rel_err <= tol_rel; the closed branch only reaches tol_rel for "
+        f"|x| >= {eps_lower:.3g}.  Increase `order` to widen the polynomial window "
+        f"and close the gap, or pass `eps` explicitly.",
+        TaylorRemainderClosedCancellationWarning,
+        stacklevel=3,
+    )
+
+
 def closed_branch_needed(cache, n, order, t_max, *, dtype=None, max_extra=4):
     """Return True if the polynomial branch alone is insufficient over |t| <= t_max.
 
@@ -509,6 +650,7 @@ def taylor_remainder(f, x, a, n, *, order=10, eps=None, dtype=None, cache=None):
 
     check_underflow_safety(cache, n, eps, dtype=dtype)
     check_overflow_safety(cache, n, eps, dtype=dtype)
+    check_closed_cancellation_safety(cache, n, eps, order, dtype=dtype)
 
     return pt.switch(pt.abs(t) < eps, poly, closed)
 
