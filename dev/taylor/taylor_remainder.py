@@ -19,6 +19,16 @@ Concretely, this means:
   - User's expression doesn't introduce gratuitous cancellation
     (e.g. `pt.cos(x) - 1` is acceptable as f -- our polynomial branch
     handles the cancellation -- but `pt.exp(x) * pt.exp(-x) - 1` is not).
+  - f's symbolic derivatives f^(m)(a) are computable to arbitrary order
+    m (we need up to m = n + order + max_extra) and each evaluates to
+    ~eps_machine relative accuracy at x=a. PyTensor handles the symbolic
+    differentiation via `pt.grad` chains, with canonicalize simplifying
+    each derivative; for most analytic f this works, but pathological
+    cases (e.g. `cos(K*x^2)` whose grad chain blows up pytensor's
+    recursion limit, or expressions whose derivatives canonicalize fails
+    to simplify) violate the contract. In those cases the user must
+    pre-compute f^(m)(a) and pre-populate the TaylorAtPoint cache rather
+    than relying on the lazy grad chain.
 
 Under this contract, ALL numerical error in the output of `taylor_remainder`
 is introduced by the operations WE add on top of f:
