@@ -375,15 +375,6 @@ def auto_eps(cache, n, order, *, dtype=None, max_extra=4):
     return (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
 
 
-def _smallest_subnormal(dtype):
-    """Smallest positive subnormal float in `dtype`."""
-    info = np.finfo(dtype)
-    if hasattr(info, "smallest_subnormal"):
-        return float(info.smallest_subnormal)
-    # numpy < 1.22 fallback
-    return math.ldexp(1.0, info.minexp - info.nmant)
-
-
 def check_underflow_safety(cache, n, eps, *, dtype=None, safety=10.0):
     """Issue a warning if the closed branch may underflow within |x| < eps.
 
@@ -402,7 +393,7 @@ def check_underflow_safety(cache, n, eps, *, dtype=None, safety=10.0):
         dtype = np.dtype(cache.x.dtype)
     else:
         dtype = np.dtype(dtype)
-    smallest_subnormal = _smallest_subnormal(dtype)
+    smallest_subnormal = float(np.finfo(dtype).smallest_subnormal)
 
     try:
         c_n = abs(cache.numeric_coeff(n))
