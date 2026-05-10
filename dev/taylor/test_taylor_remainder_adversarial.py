@@ -197,13 +197,12 @@ def test_adversarial_opaque_polynomial(K_log10, K0_choice):
 
     x = pt.dscalar("x")
     f = opaque(x)
-    # Pre-populate the cache with the polynomial's known coefficients --
-    # otherwise auto_eps's truncation scan (c_n+order .. c_n+order+max_extra)
-    # forces ~5 grads through OpFromGraph at ~0.2s each, dominating runtime.
+    # Use the explicit-coefficients constructor mode -- otherwise
+    # auto_eps's truncation scan forces ~5 grads through OpFromGraph
+    # at ~0.2s each, dominating runtime.
     from taylor_remainder import TaylorAtPoint
 
-    cache = TaylorAtPoint(f, x, 0.0)
-    cache.populate_from_coefficients([K0, K, K] + [0.0] * 13)
+    cache = TaylorAtPoint(f, x, 0.0, coefficients=[K0, K, K] + [0.0] * 13)
     y = taylor_remainder(f, x, 0.0, 1, order=10, cache=cache)
     fn = pytensor.function([x], y)
 

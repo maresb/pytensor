@@ -243,16 +243,22 @@ def test_n3_polynomial_parity4_sparse(a, b, c, d):
 # ---- parity-4 sparsity via cos(K·x²) using mpmath-computed coefficients ----
 
 
-def _populate_cache_via_mpmath(cache, f_mp_callable, a, n_coeffs):
-    """Populate `cache` with Taylor coefficients of `f_mp_callable` at
-    a, using mpmath. Threshold below dtype eps_machine·max(|c_i|) to
-    silence numerical-differentiation noise that would otherwise be
-    picked up by _first_nonvanishing in auto_eps."""
+def _mpmath_taylor_coefficients(f_mp_callable, a, n_coeffs):
+    """Compute Taylor coefficients of `f_mp_callable` at `a` via mpmath,
+    threshold-filtered for numerical-differentiation noise.
+
+    `mp.taylor` uses finite differences and produces ~1e-66 noise at
+    coefficients that should be exactly zero (parity gaps); thresholding
+    below eps_machine * max(|c_i|) recovers the true zeros so that
+    `_first_nonvanishing` in `auto_eps` doesn't latch on to noise.
+
+    Returns a list of floats suitable for the
+    `TaylorAtPoint(..., coefficients=...)` constructor.
+    """
     coeffs_mp = mp.taylor(f_mp_callable, a, n_coeffs - 1)
     coeffs = [float(c) for c in coeffs_mp]
     threshold = float(np.finfo(np.float64).eps) * max(abs(c) for c in coeffs)
-    coeffs = [0.0 if abs(c) < threshold else c for c in coeffs]
-    cache.populate_from_coefficients(coeffs)
+    return [0.0 if abs(c) < threshold else c for c in coeffs]
 
 
 @pytest.mark.parametrize("K", [0.1, 1.0, 10.0])
@@ -273,9 +279,10 @@ def test_n3_cos_Kxsq_parity4_via_mpmath(K):
     def f_mp(y, K=K):
         return mp.cos(K * y**2)
 
-    cache = TaylorAtPoint(f, x, 0.0)
     # Need coefficients up to n + order + max_extra - 1 = 16
-    _populate_cache_via_mpmath(cache, f_mp, 0.0, n_coeffs=18)
+    cache = TaylorAtPoint(
+        f, x, 0.0, coefficients=_mpmath_taylor_coefficients(f_mp, 0.0, n_coeffs=18)
+    )
     assert cache.numeric_coeff(3) == 0.0  # parity-4
     assert cache.numeric_coeff(4) != 0.0
     assert cache.numeric_coeff(15) == 0.0  # noise filtered
@@ -369,10 +376,9 @@ def test_n3_layered_three_subtree_fold(K0_log10, K1_log10, K2_log10):
 
     x = pt.dscalar("x")
     f = K0 + K1 * x + K2 * x**2 + x**3 * pt.cos(x)
-    # Pre-populate the cache to skip auto_eps's slow truncation scan
-    # (~0.7s of grads through (K0+K1*x+K2*x^2+x^3*cos(x))'s long chain rule).
-    cache = TaylorAtPoint(f, x, 0.0)
-    cache.populate_from_coefficients(_layered_x3cosx_coeffs(K0, K1, K2))
+    # Use explicit-coefficients mode to skip auto_eps's slow truncation
+    # scan (~0.7s of grads through (K0+K1*x+K2*x^2+x^3*cos(x))'s chain rule).
+    cache = TaylorAtPoint(f, x, 0.0, coefficients=_layered_x3cosx_coeffs(K0, K1, K2))
     eps = auto_eps(cache, n=3, order=10)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", TaylorRemainderClosedCancellationWarning)
@@ -534,9 +540,8 @@ def _x3_cos_x_pristine_fn():
     the pristine half)."""
     x = pt.dscalar("x")
     f = x**3 * pt.cos(x)
-    cache = TaylorAtPoint(f, x, 0.0)
-    # Pre-populate to skip auto_eps's grad-chain scan.
-    cache.populate_from_coefficients(_layered_x3cosx_coeffs(0.0, 0.0, 0.0))
+    # Explicit-coefficients mode to skip auto_eps's grad-chain scan.
+    cache = TaylorAtPoint(f, x, 0.0, coefficients=_layered_x3cosx_coeffs(0.0, 0.0, 0.0))
     eps = auto_eps(cache, n=3, order=10)
     fn = pytensor.function([x], taylor_remainder(f, x, 0.0, 3, order=10, cache=cache))
     return fn, cache, eps
@@ -560,8 +565,9 @@ def test_n3_layered_matches_pristine_x3_cos(
 
     x = pt.dscalar("x")
     f_layered = K0 + K1 * x + K2 * x**2 + x**3 * pt.cos(x)
-    cache_l = TaylorAtPoint(f_layered, x, 0.0)
-    cache_l.populate_from_coefficients(_layered_x3cosx_coeffs(K0, K1, K2))
+    cache_l = TaylorAtPoint(
+        f_layered, x, 0.0, coefficients=_layered_x3cosx_coeffs(K0, K1, K2)
+    )
     eps_l = auto_eps(cache_l, n=3, order=10)
     fn_l = pytensor.function(
         [x], taylor_remainder(f_layered, x, 0.0, 3, order=10, cache=cache_l)
