@@ -330,15 +330,18 @@ def test_n1_cancellation_aware_eps_with_opaque_f_and_nonzero_c0():
     (v_trunc = 0), so auto_eps must fall back to the cancellation-aware
     bound
 
-        eps_cancel  =  (eps_machine · |c_0| / (tol_rel · |c_n|))^(1/n)
+        eps_cancel  =  (eps_machine · |c_0| / (tol_rel · |c_{k_lead}|))^(1/k_lead)
 
-    For the OpFromGraph-wrapped 1 + 2x + 3x^2 case (c_0=1, c_1=2, n=1,
-    tol_rel = 10·eps_machine):  eps_cancel = 1/(10·2) = 0.05.
+    For the OpFromGraph-wrapped 1 + 2x + 3x^2 case at n=1: c_0=1, c_1=2,
+    k_lead=1, tol_rel = 2·(order+1)·eps_machine = 22·eps_machine for
+    order=10.  So eps_cancel = 1/(22·2) = 1/44.
 
     Regression: earlier code returned eps=0 in this case, sending all
     small-x evaluations through the cancellation-prone closed form
     (rel_err 8e-4 at x=1e-15).
     """
+    from taylor_remainder import _tol_rel
+
     from pytensor.compile.builders import OpFromGraph
 
     inner_x = pt.dscalar("inner_x")
@@ -350,7 +353,12 @@ def test_n1_cancellation_aware_eps_with_opaque_f_and_nonzero_c0():
 
     cache = TaylorAtPoint(f, x, 0.0)
     eps = auto_eps(cache, n=1, order=10)
-    assert math.isclose(eps, 0.05, rel_tol=1e-12), f"expected eps=0.05, got {eps}"
+    eps_machine = float(np.finfo(np.float64).eps)
+    tol_rel = _tol_rel(10, np.float64)
+    expected = (eps_machine * 1.0 / (tol_rel * 2.0)) ** (1.0 / 1)
+    assert math.isclose(eps, expected, rel_tol=1e-12), (
+        f"expected eps={expected}, got {eps}"
+    )
 
     y = taylor_remainder(f, x, 0.0, 1, order=10)
     fn = pytensor.function([x], y)
@@ -393,6 +401,37 @@ def test_polynomial_window_with_all_higher_orders_vanishing():
     cache = TaylorAtPoint(f, x, 0.0)
     eps = auto_eps(cache, n=3, order=10)
     assert eps == 0.0
+
+
+def test_auto_eps_fallback_uses_k_lead_for_sparse_leading_coefficient():
+    """auto_eps's v_trunc=0 fallback uses 1/k_lead (not 1/n) so that
+    sparse-leading-coefficient cases get the correct exponent.
+
+    For f = K0 + K2·x² (a polynomial, so v_trunc = 0 for any order >= 1)
+    at n=1: c_0 = K0, c_1 = 0, c_2 = K2.  So k_lead = 2, not 1.
+    The cancellation-aware bound is
+        eps_lower = (eps_machine · |c_0| / (tol_rel · |c_2|))^(1/2)
+                  = sqrt(eps_machine · K0 / (tol_rel · K2)).
+
+    The earlier bug used `1/n = 1/1`, returning eps_machine·K0/(tol_rel·K2)
+    -- a much smaller eps that hurt nothing for polynomial f (canonicalize
+    folds the closed branch) but would mis-size the polynomial window for
+    transcendental f with the same sparse-leading shape.
+    """
+    from taylor_remainder import _tol_rel
+
+    K0, K2 = 1.0, 3.0
+    x = pt.dscalar("x")
+    f = K0 + K2 * x**2  # c_1 = 0, k_lead = 2
+    cache = TaylorAtPoint(f, x, 0.0)
+    eps = auto_eps(cache, n=1, order=10)
+
+    eps_machine = float(np.finfo(np.float64).eps)
+    tol_rel = _tol_rel(10, np.float64)
+    expected = (eps_machine * K0 / (tol_rel * K2)) ** (1.0 / 2)
+    assert math.isclose(eps, expected, rel_tol=1e-12), (
+        f"expected eps={expected} from 1/k_lead formula, got {eps}"
+    )
 
 
 if __name__ == "__main__":
