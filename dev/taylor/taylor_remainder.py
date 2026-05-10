@@ -255,7 +255,27 @@ def _first_nonvanishing(cache, start, count):
     return 0.0, start + count
 
 
-def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
+def _tol_rel(order, dtype):
+    """Target relative error for auto_eps's branch-balancing.
+
+    Set to 2x `poly_branch_rel_err_bound(order)` -- twice the
+    polynomial-branch rounding floor -- so that the analytical eps
+    formula leaves equal budget for poly truncation and poly-evaluation
+    rounding. With this choice, at the chosen eps:
+        rel_err_total  ≈  trunc(eps) + poly_rounding
+                        ≈  tol_rel/2 + tol_rel/2  =  tol_rel
+    and `check_closed_cancellation_safety` warns iff the closed branch
+    *adds* more error than this whole budget covers.
+
+    The 2x multiplier is the only design constant here; using 1x would
+    tie poly truncation = poly rounding exactly with no slack, and
+    using a larger constant inflates the "acceptable" bound without
+    physical justification.
+    """
+    return 2.0 * poly_branch_rel_err_bound(order, dtype=dtype)
+
+
+def auto_eps(cache, n, order, *, dtype=None, max_extra=4):
     # TODO: `max_extra=4` is a heuristic for finding the next nonzero
     # coefficient when c_{n+order} = 0. It works for series with regularly-
     # placed zeros (e.g., even/odd parity) but could miss pathologically
@@ -270,9 +290,10 @@ def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
     is scale-invariant in f -- multiplying f by a constant doesn't change
     eps, since the ratio of coefficients is unchanged.
 
-    We pick eps so this relative error reaches ~10·eps_machine for the
-    given dtype, then apply a `safety` factor (default 0.75) to account
-    for the empirical ~25% overshoot of the analytic formula.
+    We pick eps so this relative error reaches `tol_rel`, the target set
+    by `_tol_rel` -- 2x the polynomial-branch rounding floor, derived from
+    Wilkinson's bound. No empirical safety factor: under the principled
+    tol_rel, the analytical formula already includes the necessary margin.
 
     Two regimes:
 
@@ -285,9 +306,12 @@ def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
 
     2. v_trunc = 0 (no truncation budget): fall back to the
        cancellation-aware lower bound from the closed-branch error model
-       err_closed ≈ eps_machine · |c_0|/(|c_n| · |x-a|^n). Returns
-       eps = (eps_machine · |c_0|/(tol_rel · |c_n|))^(1/n), or 0 when
-       P_{n-1} is symbolically zero (no subtraction introduced).
+       err_closed ≈ eps_machine · |c_0|/(|c_{k_lead}| · |x-a|^{k_lead}).
+       Returns eps = (eps_machine · |c_0|/(tol_rel · |c_{k_lead}|))^(1/k_lead),
+       using k_lead (not n) so that sparse-leading-coefficient cases
+       (c_n = 0, e.g. f = K_0 + K_2·x^2 at n=1 has k_lead = 2) get the
+       correct exponent. Returns 0 when P_{n-1} is symbolically zero
+       (no subtraction introduced).
 
     The formula is NOT capped at any constant -- doing so would violate
     scale invariance (the natural cap is the function's convergence radius,
@@ -295,15 +319,14 @@ def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
 
     `dtype` defaults to the dtype of the cache's input variable.
 
-    Empirical validation: dev/taylor/taylor_eps_experiment.py,
-                          dev/taylor/safety_calibration.py.
+    Empirical validation: dev/taylor/taylor_eps_experiment.py.
     """
     if dtype is None:
         dtype = np.dtype(cache.x.dtype)
     else:
         dtype = np.dtype(dtype)
     eps_machine = float(np.finfo(dtype).eps)
-    tol_rel = 10.0 * eps_machine
+    tol_rel = _tol_rel(order, dtype)
 
     # Leading coefficient of R: first nonzero c_k for k >= n (typically c_n).
     v_lead, k_lead = _first_nonvanishing(cache, n, order)
@@ -330,7 +353,7 @@ def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
     # v_trunc = 0  (corner case, e.g. polynomial f or extreme subnormal):
     #   No polynomial-truncation bound. Fall back to a cancellation-aware
     #   lower bound on eps from
-    #       err_closed(eps) ≈ eps_machine · |c_0|/(|c_n| · eps^n)
+    #       err_closed(eps) ≈ eps_machine · |c_0|/(|c_{k_lead}| · eps^{k_lead})
     #   so that even if canonicalize doesn't fold, closed accuracy is
     #   maintained for |x-a| >= eps. When c_0 = ... = c_{n-1} = 0
     #   (P_{n-1} symbolically zero), no subtraction is introduced and
@@ -343,13 +366,13 @@ def auto_eps(cache, n, order, *, dtype=None, safety=0.75, max_extra=4):
         v_const, _ = _first_nonvanishing(cache, 0, n)
         if v_const == 0.0:
             return 0.0
-        return (eps_machine * v_const / (tol_rel * v_lead)) ** (1.0 / n)
+        return (eps_machine * v_const / (tol_rel * v_lead)) ** (1.0 / k_lead)
 
     # NB: compute the ratio v_lead/v_trunc *before* multiplying by tol_rel
     # to avoid floating-point underflow when v_lead is subnormal -- the
     # ratio is K-invariant, but `tol_rel * v_lead` underflows for K
     # near smallest_subnormal.
-    return safety * (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
+    return (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
 
 
 def _smallest_subnormal(dtype):
@@ -522,19 +545,37 @@ def closed_branch_rel_err_bound(cache, n, v, order, *, dtype=None):
     return eps_machine * (cancellation + 1.0)
 
 
-def poly_branch_rel_err_bound(order, *, dtype=None):
-    """Upper bound on the polynomial branch's relative error from
-    floating-point evaluation: (order+1)·ε_m by Wilkinson's bound on
-    Horner-method summation of `order` terms (each multiplication and
-    addition contributes one ULP).
+def poly_branch_rel_err_bound(order, *, dtype=None, cache=None, n=None, v=None):
+    """Upper bound on the polynomial branch's relative error.
 
-    Holds when truncation error is sub-dominant (i.e., |x-a| < eps where
-    eps was chosen by auto_eps to drive truncation below tol_rel).
+    Has two sources, both bounded:
+
+      rounding:    (2·order + 1)·ε_m   (Wilkinson on Horner-method, `order`
+                   multiplications + `order` additions plus the final result;
+                   `taylor_remainder` builds the polynomial by Horner since
+                   the same commit that added this documentation)
+      truncation:  |c_{k_trunc}/c_{k_lead}| · v^{k_trunc - k_lead}
+                   (relative magnitude of the first omitted term, from the
+                   cache's coefficient inventory)
+
+    If `cache`, `n`, `v` are all provided, returns rounding + truncation.
+    Otherwise returns rounding alone (for use when the truncation budget
+    is irrelevant, e.g. inside the polynomial branch's interior).
     """
     if dtype is None:
-        dtype = np.float64
+        dtype = np.float64 if cache is None else cache.x.dtype
     eps_machine = float(np.finfo(np.dtype(dtype)).eps)
-    return (order + 1) * eps_machine
+    rounding = (2 * order + 1) * eps_machine
+    if cache is None or n is None or v is None or v == 0:
+        return rounding
+    v_lead, k_lead = _first_nonvanishing(cache, n, order)
+    if v_lead == 0.0:
+        return rounding
+    v_trunc, k_trunc = _first_nonvanishing(cache, n + order, 5)
+    if v_trunc == 0.0:
+        return rounding
+    truncation = (v_trunc / v_lead) * abs(v) ** (k_trunc - k_lead)
+    return rounding + truncation
 
 
 def check_closed_cancellation_safety(cache, n, eps, order, *, dtype=None, max_extra=4):
@@ -554,7 +595,7 @@ def check_closed_cancellation_safety(cache, n, eps, order, *, dtype=None, max_ex
     else:
         dtype = np.dtype(dtype)
     eps_machine = float(np.finfo(dtype).eps)
-    tol_rel = 10.0 * eps_machine
+    tol_rel = _tol_rel(order, dtype)
 
     v_lead, k_lead = _first_nonvanishing(cache, n, order)
     if v_lead == 0.0 or k_lead == n:
@@ -589,15 +630,14 @@ def closed_branch_needed(cache, n, order, t_max, *, dtype=None, max_extra=4):
     """Return True if the polynomial branch alone is insufficient over |t| <= t_max.
 
     When False, you can drop the closed branch entirely -- polynomial achieves
-    ~10·eps_machine relative accuracy throughout the input range, saving a
+    `tol_rel`-level relative accuracy throughout the input range, saving a
     transcendental call per element.
     """
     if dtype is None:
         dtype = np.dtype(cache.x.dtype)
     else:
         dtype = np.dtype(dtype)
-    eps_machine = float(np.finfo(dtype).eps)
-    tol_rel = 10.0 * eps_machine
+    tol_rel = _tol_rel(order, dtype)
 
     v_lead, k_lead = _first_nonvanishing(cache, n, order)
     if v_lead == 0.0:
@@ -661,16 +701,25 @@ def taylor_remainder(f, x, a, n, *, order=10, eps=None, dtype=None, cache=None):
     coeffs = cache.coeffs_of_deriv(0, n + order)
     t = x - a
 
-    poly = coeffs[n]
-    for k in range(1, order):
-        poly = poly + coeffs[n + k] * t**k
+    # Horner-method evaluation:  poly = ((c_{n+order-1}·t + c_{n+order-2})·t + ...) · t + c_n
+    # Wilkinson's bound for this is (2·order + 1)·ε_m, captured in
+    # poly_branch_rel_err_bound. The previous direct-sum form (each c_k·t^k
+    # computed independently and added) had a strictly looser O(order²)
+    # bound and could exceed (2·order+1)·ε_m on adversarial inputs.
+    poly = coeffs[n + order - 1]
+    for k in range(order - 2, -1, -1):
+        poly = poly * t + coeffs[n + k]
 
     if n == 0:
         closed = f
     else:
-        P = coeffs[0]
-        for k in range(1, n):
-            P = P + coeffs[k] * t**k
+        # Same Horner construction for the polynomial we subtract from f.
+        if n == 1:
+            P = coeffs[0]
+        else:
+            P = coeffs[n - 1]
+            for k in range(n - 2, -1, -1):
+                P = P * t + coeffs[k]
         closed = (f - P) / t**n
 
     if eps is None:
