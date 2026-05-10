@@ -351,11 +351,10 @@ def test_n1_cancellation_aware_eps_with_opaque_f_and_nonzero_c0():
     x = pt.dscalar("x")
     f = opaque_f(x)
 
-    # Pre-populate cache with the polynomial's known coefficients;
-    # otherwise auto_eps's truncation scan forces several slow grads
-    # through OpFromGraph (~1.5s for order=10).
-    cache = TaylorAtPoint(f, x, 0.0)
-    cache.populate_from_coefficients([1.0, 2.0, 3.0] + [0.0] * 13)
+    # Use the explicit-coefficients constructor mode: bypasses auto_eps's
+    # slow grad chain through OpFromGraph (~1.5s for order=10) since the
+    # polynomial's coefficients are known.
+    cache = TaylorAtPoint(f, x, 0.0, coefficients=[1.0, 2.0, 3.0] + [0.0] * 13)
     eps = auto_eps(cache, n=1, order=10)
     eps_machine = float(np.finfo(np.float64).eps)
     tol_rel = _tol_rel(10, np.float64)
