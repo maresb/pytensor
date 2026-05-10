@@ -437,6 +437,55 @@ def test_auto_eps_fallback_uses_k_lead_for_sparse_leading_coefficient():
     )
 
 
+def test_explicit_coefficients_finite_list_raises_on_overrun():
+    """A finite coefficient list should raise IndexError -- not silently
+    extrapolate -- when the cache asks for an index past the list end.
+    Counterpart: an infinite generator (e.g. itertools.repeat(0.0)) is
+    fine because next() never raises StopIteration."""
+    x = pt.dscalar("x")
+    f = pt.cos(x)  # symbolic f doesn't matter -- explicit mode ignores it for coeffs
+
+    cache = TaylorAtPoint(f, x, 0.0, coefficients=[1.0, 0.0, -0.5])  # only c_0..c_2
+
+    # Indices 0..2 are fine.
+    assert cache.numeric_value_at_a(0) == 1.0
+    assert cache.numeric_value_at_a(2) == math.factorial(2) * -0.5
+
+    # Index 3 should raise -- list exhausted.
+    with pytest.raises(IndexError, match="exhausted"):
+        cache.numeric_value_at_a(3)
+
+
+def test_explicit_coefficients_deriv_returns_polynomial_truncation():
+    """In explicit mode, deriv(m) returns the m-th derivative of the
+    polynomial truncation Σ c_k (x-a)^k -- a symbolic pytensor expression
+    that is exact at x=a and accurate near x=a."""
+    x = pt.dscalar("x")
+    # User's symbolic f is irrelevant for the cache's deriv in explicit mode.
+    f = pt.cos(x)
+    # Coefficients of, say, sin(x): c_1=1, c_3=-1/6, c_5=1/120, ...
+    coeffs = [0.0, 1.0, 0.0, -1.0 / 6, 0.0, 1.0 / 120]
+    cache = TaylorAtPoint(f, x, 0.0, coefficients=coeffs)
+
+    def at_zero(expr):
+        # deriv(m) for m near the polynomial degree may collapse to a
+        # constant after canonicalize, leaving x as an "unused input".
+        return float(pytensor.function([x], expr, on_unused_input="ignore")(0.0))
+
+    # deriv(0) at x=0 should give c_0 = 0
+    assert math.isclose(at_zero(cache.deriv(0)), 0.0)
+    # deriv(1) at x=0 should give 1!*c_1 = 1
+    assert math.isclose(at_zero(cache.deriv(1)), 1.0)
+    # deriv(3) at x=0 should give 3!*c_3 = -1
+    assert math.isclose(at_zero(cache.deriv(3)), -1.0)
+    # deriv(5) at x=0 should give 5!*c_5 = 1
+    assert math.isclose(at_zero(cache.deriv(5)), 1.0)
+
+    # And deriv(6) -- past the supplied coefficients -- raises
+    with pytest.raises(IndexError, match="exhausted"):
+        cache.deriv(6)
+
+
 if __name__ == "__main__":
     import sys
 
