@@ -351,7 +351,11 @@ def test_n1_cancellation_aware_eps_with_opaque_f_and_nonzero_c0():
     x = pt.dscalar("x")
     f = opaque_f(x)
 
+    # Pre-populate cache with the polynomial's known coefficients;
+    # otherwise auto_eps's truncation scan forces several slow grads
+    # through OpFromGraph (~1.5s for order=10).
     cache = TaylorAtPoint(f, x, 0.0)
+    cache.populate_from_coefficients([1.0, 2.0, 3.0] + [0.0] * 13)
     eps = auto_eps(cache, n=1, order=10)
     eps_machine = float(np.finfo(np.float64).eps)
     tol_rel = _tol_rel(10, np.float64)
@@ -360,7 +364,7 @@ def test_n1_cancellation_aware_eps_with_opaque_f_and_nonzero_c0():
         f"expected eps={expected}, got {eps}"
     )
 
-    y = taylor_remainder(f, x, 0.0, 1, order=10)
+    y = taylor_remainder(f, x, 0.0, 1, order=10, cache=cache)
     fn = pytensor.function([x], y)
     for v in [0.0, 1e-15, 1e-10, 1e-5, 1e-3, 0.5, 1.0]:
         ref = 2.0 + 3.0 * v
