@@ -193,13 +193,36 @@ class TaylorAtPoint:
         self._coeff_source = iter(coefficients) if coefficients is not None else None
 
     def deriv(self, m):
+        """The m-th derivative of f as a symbolic pytensor expression.
+
+        In auto mode, this is the exact symbolic derivative of the user's
+        f via repeated `pt.grad` (chain rule), canonicalized between steps.
+
+        In explicit-coefficients mode, the user has implicitly defined f
+        by its Taylor series coefficients [c_0, c_1, c_2, ...], so we
+        build the polynomial truncation
+            f_poly(x)  =  Σ_{k=0..N}  c_k · (x - a)^k
+        (where N is the highest index pulled from the iterable so far)
+        and take the m-th derivative of that.  The result is a symbolic
+        pytensor expression -- exact at x=a (matches m!·c_m), and
+        polynomial-accurate near x=a.  If the iterable is exhausted
+        before c_m is reached, raises IndexError (no silent zero-pad).
+        """
         if self._coeff_source is not None:
-            raise NotImplementedError(
-                "TaylorAtPoint.deriv() unavailable in explicit-coefficients "
-                "mode; the cache holds c_m values, not the symbolic grad chain. "
-                "Construct a separate TaylorAtPoint without `coefficients=` if "
-                "you need symbolic derivatives."
-            )
+            # Pull coefficients up to c_m (may raise IndexError).
+            self.value_at_a(m)
+            t = self.x - self._a_const
+            poly = pt.constant(0.0, dtype=self.x.dtype)
+            for k in range(len(self._values)):
+                c_k = self._numeric[k] / math.factorial(k)
+                if c_k == 0.0:
+                    continue
+                poly = poly + c_k * t**k
+            d = poly
+            for _ in range(m):
+                d = pt.grad(d, self.x)
+            return rewrite_graph(d, include=("canonicalize",))
+
         while len(self._derivs) <= m:
             try:
                 d = pt.grad(self._derivs[-1], self.x)
