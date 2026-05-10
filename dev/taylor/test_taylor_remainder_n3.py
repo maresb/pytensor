@@ -320,6 +320,31 @@ def test_n3_cos_Kxsq_parity4_via_mpmath(K):
 # ---- coefficient-magnitude scan: K0/K1/K2 layered onto K3·x³·cos(L·x) -----
 
 
+def _layered_x3cosx_coeffs(K0, K1, K2, n_coeffs=17):
+    """Closed-form Taylor coefficients of f = K0 + K1*x + K2*x^2 + x^3*cos(x).
+
+    Used to pre-populate the TaylorAtPoint cache so auto_eps's truncation
+    scan doesn't trigger a slow grad chain through the layered f.
+    The polynomial part contributes only at c_0, c_1, c_2; x^3*cos(x)
+    contributes c_{2k+3} = (-1)^k / (2k)! for k >= 0 (c_3=1, c_5=-1/2,
+    c_7=1/24, c_9=-1/720, ...).
+    """
+    coeffs = [0.0] * n_coeffs
+    coeffs[0] = K0
+    if n_coeffs > 1:
+        coeffs[1] = K1
+    if n_coeffs > 2:
+        coeffs[2] = K2
+    k = 0
+    while True:
+        deg = 2 * k + 3
+        if deg >= n_coeffs:
+            break
+        coeffs[deg] = (-1) ** k / math.factorial(2 * k)
+        k += 1
+    return coeffs
+
+
 @pytest.mark.parametrize("K0_log10", [0, 10])
 @pytest.mark.parametrize("K1_log10", [0, 10])
 @pytest.mark.parametrize("K2_log10", [0, 10])
@@ -344,7 +369,10 @@ def test_n3_layered_three_subtree_fold(K0_log10, K1_log10, K2_log10):
 
     x = pt.dscalar("x")
     f = K0 + K1 * x + K2 * x**2 + x**3 * pt.cos(x)
+    # Pre-populate the cache to skip auto_eps's slow truncation scan
+    # (~0.7s of grads through (K0+K1*x+K2*x^2+x^3*cos(x))'s long chain rule).
     cache = TaylorAtPoint(f, x, 0.0)
+    cache.populate_from_coefficients(_layered_x3cosx_coeffs(K0, K1, K2))
     eps = auto_eps(cache, n=3, order=10)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", TaylorRemainderClosedCancellationWarning)
@@ -507,6 +535,8 @@ def _x3_cos_x_pristine_fn():
     x = pt.dscalar("x")
     f = x**3 * pt.cos(x)
     cache = TaylorAtPoint(f, x, 0.0)
+    # Pre-populate to skip auto_eps's grad-chain scan.
+    cache.populate_from_coefficients(_layered_x3cosx_coeffs(0.0, 0.0, 0.0))
     eps = auto_eps(cache, n=3, order=10)
     fn = pytensor.function([x], taylor_remainder(f, x, 0.0, 3, order=10, cache=cache))
     return fn, cache, eps
@@ -531,6 +561,7 @@ def test_n3_layered_matches_pristine_x3_cos(
     x = pt.dscalar("x")
     f_layered = K0 + K1 * x + K2 * x**2 + x**3 * pt.cos(x)
     cache_l = TaylorAtPoint(f_layered, x, 0.0)
+    cache_l.populate_from_coefficients(_layered_x3cosx_coeffs(K0, K1, K2))
     eps_l = auto_eps(cache_l, n=3, order=10)
     fn_l = pytensor.function(
         [x], taylor_remainder(f_layered, x, 0.0, 3, order=10, cache=cache_l)
