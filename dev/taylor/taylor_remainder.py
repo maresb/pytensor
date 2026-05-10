@@ -28,10 +28,15 @@ Concretely, this means:
     repeated `sin`/`cos` factors (each grad roughly doubles the graph;
     by m=14 a single derivative substitution becomes minutes). For
     such f, compute the coefficients with `mpmath.taylor` or a
-    closed-form formula and feed them in via
-    `cache.populate_from_coefficients(coeffs)` -- the closed branch
-    still uses your `f` expression at runtime, only the polynomial-
-    branch coefficients come from outside.
+    closed-form formula and pass them via the explicit-coefficients
+    mode of TaylorAtPoint:
+        cache = TaylorAtPoint(f, x, a, coefficients=[c_0, c_1, c_2, ...])
+        # or with a lazy generator:
+        cache = TaylorAtPoint(f, x, a, coefficients=my_series_iter())
+        taylor_remainder(f, x, a, n, order=..., cache=cache)
+    The closed branch still uses your `f` expression at runtime; only
+    the polynomial-branch coefficient inventory consumed by `auto_eps`
+    and the polynomial branch comes from the iterable.
 
 Under this contract, ALL numerical error in the output of `taylor_remainder`
 is introduced by the operations WE add on top of f:
@@ -148,13 +153,36 @@ class TaylorRemainderClosedCancellationWarning(UserWarning):
 
 
 class TaylorAtPoint:
-    """Memoizes f, f', f'', ... and f^(m)(a) for m = 0, 1, 2, ...
+    """Source of Taylor coefficients c_m = f^(m)(a)/m! for m = 0, 1, 2, ...
 
-    Each value is built lazily on demand. Reuse across multiple taylor_remainder
-    calls with the same (f, x, a) avoids redundant grad+canonicalize work.
+    Two modes for how coefficients are obtained:
+
+      Auto (default, `coefficients=None`): each c_m is derived lazily from
+        `f` via `pt.grad` chains (canonicalized between steps) and
+        substitution of x = a. Suitable for most analytic f. Fails or
+        slows badly on deeply composed transcendentals like cos(K*x**2)
+        where the chain rule expands the graph exponentially -- by
+        m ~= 12 a single substitution can take minutes.
+
+      Explicit (`coefficients=<iterable of floats>`): each c_m is pulled
+        from the supplied iterable on demand and converted to f^(m)(a) =
+        m!*c_m for storage. The user's symbolic `f` is still used by
+        `taylor_remainder`'s closed branch for runtime evaluation; only
+        the coefficient inventory consumed by the polynomial branch and
+        `auto_eps` comes from the iterable.
+
+        Use this whenever you have a closed-form series (cos, exp, etc.)
+        or can compute coefficients with `mpmath.taylor` faster than
+        pt.grad. The iterable can be a list (eager) or a generator
+        (lazy, infinite-friendly); pulled with `next()` as the cache
+        needs new indices, and an `IndexError` is raised if it runs out.
+
+    Auto-mode coefficients are computed and memoized lazily, so reuse
+    across multiple `taylor_remainder` calls with the same (f, x, a)
+    avoids redundant grad+canonicalize work.
     """
 
-    def __init__(self, f, x, a):
+    def __init__(self, f, x, a, *, coefficients=None):
         self.f = f
         self.x = x
         self.a = a
@@ -162,8 +190,16 @@ class TaylorAtPoint:
         self._derivs = [f]
         self._values = []  # f^(m)(a) as symbolic constants
         self._numeric = {}  # m -> float(f^(m)(a))
+        self._coeff_source = iter(coefficients) if coefficients is not None else None
 
     def deriv(self, m):
+        if self._coeff_source is not None:
+            raise NotImplementedError(
+                "TaylorAtPoint.deriv() unavailable in explicit-coefficients "
+                "mode; the cache holds c_m values, not the symbolic grad chain. "
+                "Construct a separate TaylorAtPoint without `coefficients=` if "
+                "you need symbolic derivatives."
+            )
         while len(self._derivs) <= m:
             try:
                 d = pt.grad(self._derivs[-1], self.x)
@@ -177,10 +213,23 @@ class TaylorAtPoint:
 
     def value_at_a(self, m):
         while len(self._values) <= m:
-            d = self.deriv(len(self._values))
-            v = clone_replace(d, {self.x: self._a_const})
-            v = rewrite_graph(v, include=("canonicalize",))
-            self._values.append(v)
+            k = len(self._values)
+            if self._coeff_source is not None:
+                try:
+                    c_next = next(self._coeff_source)
+                except StopIteration as exc:
+                    raise IndexError(
+                        f"TaylorAtPoint: explicit coefficient iterable exhausted "
+                        f"at m={k}; need at least m={m + 1} coefficients"
+                    ) from exc
+                v_m = math.factorial(k) * float(c_next)
+                self._values.append(pt.constant(v_m, dtype=self.x.dtype))
+                self._numeric[k] = v_m
+            else:
+                d = self.deriv(k)
+                v = clone_replace(d, {self.x: self._a_const})
+                v = rewrite_graph(v, include=("canonicalize",))
+                self._values.append(v)
         return self._values[m]
 
     def numeric_value_at_a(self, m):
@@ -210,32 +259,6 @@ class TaylorAtPoint:
         c_l = (f^(j))^(l)(a) / l! = f^(j+l)(a) / l!
         """
         return [self.coeff(j + l) for l in range(K)]
-
-    def populate_from_coefficients(self, taylor_coefficients):
-        """Pre-fill the cache with externally-computed Taylor coefficients
-        [c_0, c_1, ..., c_N] of f at a, bypassing pytensor's grad chain.
-
-        Use this when f's symbolic differentiation through pytensor is
-        impractical -- e.g., deeply-composed transcendentals like
-        `cos(K*x**2)` whose grad chain expands exponentially in graph
-        size (each chain-rule application introduces new `sin/cos`
-        product terms that canonicalize cannot consolidate). For such
-        f, computing coefficients with mpmath.taylor (or a closed-form
-        formula) and feeding them in here keeps `taylor_remainder` fast
-        and accurate without changing its closed branch (which still
-        uses the user's `f` expression at runtime).
-
-        Coefficients are stored as f^(m)(a) = m!·c_m so that
-        `numeric_coeff(m)` and `value_at_a(m)` return consistent values.
-        Only indices not already populated are filled; existing entries
-        are left untouched.
-        """
-        for m, c_m in enumerate(taylor_coefficients):
-            if m < len(self._values):
-                continue
-            v_m = math.factorial(m) * float(c_m)
-            self._values.append(pt.constant(v_m, dtype=self.x.dtype))
-            self._numeric[m] = v_m
 
 
 def _first_nonvanishing(cache, start, count):
