@@ -100,7 +100,6 @@ def test_n3_sin_Kx_forward(K, order):
     y = taylor_remainder(f, x, 0.0, 3, order=order)
     fn = pytensor.function([x], y)
 
-    poly_tol = poly_branch_rel_err_bound(order=order)
     fracs = (1e-6, 0.1, 0.5, 0.9, 0.99, 1.0, 1.01, 1.1, 5.0)
     sweep = [0.0, *(eps * fr for fr in fracs if eps * fr <= 0.5)]
     for v in sweep:
@@ -112,7 +111,7 @@ def test_n3_sin_Kx_forward(K, order):
         # Tolerance: poly bound for v inside window, closed-branch
         # cancellation bound for v outside.  No magic constants.
         tol = (
-            poly_tol
+            poly_branch_rel_err_bound(order=order, cache=cache, n=3, v=v)
             if v < eps
             else closed_branch_rel_err_bound(cache, n=3, v=v, order=order)
         )
@@ -155,7 +154,6 @@ def test_n3_cos_Kx_forward(K):
         y = taylor_remainder(f, x, 0.0, 3, order=10)
     fn = pytensor.function([x], y)
 
-    poly_tol = poly_branch_rel_err_bound(order=10)
     fracs = (1e-6, 0.1, 0.5, 0.9, 0.99, 1.0, 1.001, 1.01, 1.1, 1.5, 2.0, 5.0)
     sweep = [0.0, *(eps * fr for fr in fracs if eps * fr <= 0.5)]
     for v in sweep:
@@ -169,7 +167,7 @@ def test_n3_cos_Kx_forward(K):
         # Tolerance: poly bound for v inside window, closed-branch
         # cancellation bound for v outside.  Switch is at v == eps.
         if v < eps:
-            tol = poly_tol
+            tol = poly_branch_rel_err_bound(order=10, cache=cache, n=3, v=v)
         else:
             tol = closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
         assert rel <= tol, (
@@ -219,7 +217,6 @@ def test_n3_polynomial_parity4_sparse(a, b, c, d):
         y = taylor_remainder(f, x, 0.0, 3, order=10)
     fn = pytensor.function([x], y)
 
-    poly_tol = poly_branch_rel_err_bound(order=10)
     sweep = [0.0, 1e-12, 1e-8, 1e-4, 1e-2, 0.1, 0.3, 0.5]
     for v in sweep:
         ref = _R_polynomial_parity4(a, b, c, d, v)
@@ -233,7 +230,7 @@ def test_n3_polynomial_parity4_sparse(a, b, c, d):
         # closed branch evaluates a clean polynomial residual with no
         # cancellation -- the bound holds with lots of slack.
         tol = (
-            poly_tol
+            poly_branch_rel_err_bound(order=10, cache=cache, n=3, v=v)
             if v < eps
             else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
         )
@@ -302,7 +299,6 @@ def test_n3_cos_Kxsq_parity4_via_mpmath(K):
             mv = mp.mpf(v)
             return float((mp.cos(K * mv**2) - 1) / mv**3)
 
-    poly_tol = poly_branch_rel_err_bound(order=10)
     sweep = [0.0, 1e-12, 1e-6, 1e-3, 0.01, 0.05, 0.1, 0.3]
     for v in sweep:
         ref = _R_cos_Kxsq_high_precision(K, v)
@@ -311,7 +307,7 @@ def test_n3_cos_Kxsq_parity4_via_mpmath(K):
         ref_safe = abs(ref) if abs(ref) > 1e-300 else max(1.0, abs(K) ** 2)
         rel = abs(out - ref) / ref_safe
         tol = (
-            poly_tol
+            poly_branch_rel_err_bound(order=10, cache=cache, n=3, v=v)
             if v < eps
             else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
         )
@@ -352,7 +348,6 @@ def test_n3_layered_three_subtree_fold(K0_log10, K1_log10, K2_log10):
         y = taylor_remainder(f, x, 0.0, 3, order=10, cache=cache)
     fn = pytensor.function([x], y)
 
-    poly_tol = poly_branch_rel_err_bound(order=10)
     # Span small (poly-branch dominant) to moderate (closed-branch dominant)
     sweep = [0.0, 1e-12, 1e-6, 1e-3, 0.01, 0.1, 0.3]
     for v in sweep:
@@ -362,7 +357,7 @@ def test_n3_layered_three_subtree_fold(K0_log10, K1_log10, K2_log10):
         ref_safe = abs(ref) if abs(ref) > 1e-300 else 1.0
         rel = abs(out - ref) / ref_safe
         tol = (
-            poly_tol
+            poly_branch_rel_err_bound(order=10, cache=cache, n=3, v=v)
             if v < eps
             else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
         )
@@ -394,7 +389,6 @@ def test_n3_K3_scale_invariant_sin(K3_log10):
     y = taylor_remainder(f, x, 0.0, 3, order=10)
     fn = pytensor.function([x], y)
 
-    poly_tol = poly_branch_rel_err_bound(order=10)
     for v in [0.0, 1e-10, 1e-5, 0.01, 0.1, 0.3]:
         ref = float(_R_sin_Kx(1.0, mp.mpf(v))) * K3
         out = float(fn(v))
@@ -402,7 +396,7 @@ def test_n3_K3_scale_invariant_sin(K3_log10):
         ref_safe = abs(ref) if abs(ref) > 1e-300 else max(K3, 1.0) / 6
         rel = abs(out - ref) / ref_safe
         tol = (
-            poly_tol
+            poly_branch_rel_err_bound(order=10, cache=cache, n=3, v=v)
             if v < eps
             else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
         )
@@ -481,7 +475,6 @@ def test_n3_switch_boundary_continuity_sin(K):
     y = taylor_remainder(f, x, 0.0, 3, order=10, eps=eps)
     fn = pytensor.function([x], y)
 
-    poly_tol = poly_branch_rel_err_bound(order=10)
     for frac in (0.999, 0.9999, 1.0001, 1.001):
         v = eps * frac
         ref = float(_R_sin_Kx(K, mp.mpf(v)))
@@ -489,7 +482,7 @@ def test_n3_switch_boundary_continuity_sin(K):
         ref_safe = abs(ref) if abs(ref) > 1e-300 else max(1.0, abs(K) ** 3 / 6)
         rel = abs(out - ref) / ref_safe
         tol = (
-            poly_tol
+            poly_branch_rel_err_bound(order=10, cache=cache, n=3, v=v)
             if v < eps
             else closed_branch_rel_err_bound(cache, n=3, v=v, order=10)
         )
@@ -528,7 +521,6 @@ def test_n3_layered_matches_pristine_x3_cos(K0_log10, K1_log10, K2_log10):
         [x], taylor_remainder(f_layered, x, 0.0, 3, order=10, cache=cache_l)
     )
 
-    poly_tol = poly_branch_rel_err_bound(order=10)
     for v in [0.0, 1e-12, 1e-6, 1e-3, 0.01, 0.1, 0.3]:
         out_p = float(fn_p(v))
         out_l = float(fn_l(v))
@@ -536,12 +528,12 @@ def test_n3_layered_matches_pristine_x3_cos(K0_log10, K1_log10, K2_log10):
         rel_p = abs(out_p - ref) / max(1.0, abs(ref))
         rel_l = abs(out_l - ref) / max(1.0, abs(ref))
         tol_p = (
-            poly_tol
+            poly_branch_rel_err_bound(order=10, cache=cache_p, n=3, v=v)
             if v < eps_p
             else closed_branch_rel_err_bound(cache_p, n=3, v=v, order=10)
         )
         tol_l = (
-            poly_tol
+            poly_branch_rel_err_bound(order=10, cache=cache_l, n=3, v=v)
             if v < eps_l
             else closed_branch_rel_err_bound(cache_l, n=3, v=v, order=10)
         )
