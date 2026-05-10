@@ -191,6 +191,11 @@ class TaylorAtPoint:
         self._values = []  # f^(m)(a) as symbolic constants
         self._numeric = {}  # m -> float(f^(m)(a))
         self._coeff_source = iter(coefficients) if coefficients is not None else None
+        # Running float factorial used by the explicit-coefficients path
+        # to convert c_k -> f^(k)(a) = k!*c_k. Stays in float arithmetic
+        # so order > 18 (where math.factorial exceeds 2^53 and loses
+        # precision under int->float conversion) stays correct.
+        self._running_factorial = 1.0
 
     def deriv(self, m):
         """The m-th derivative of f as a symbolic pytensor expression.
@@ -211,17 +216,31 @@ class TaylorAtPoint:
         if self._coeff_source is not None:
             # Pull coefficients up to c_m (may raise IndexError).
             self.value_at_a(m)
+            # The m-th derivative of f_poly(x) = Σ_{k=0..N} c_k · (x-a)^k
+            # has derivative coefficients
+            #     b_j = c_{j+m} · (j+m)! / j!  =  numeric[j+m] / j!
+            # for j ∈ [0, N-m]. Construct directly by Horner (same
+            # precision guarantees as the polynomial branch in
+            # taylor_remainder), no pt.grad chain needed.
+            N = len(self._values) - 1
+            D = N - m  # degree of the m-th derivative polynomial
             t = self.x - self._a_const
-            poly = pt.constant(0.0, dtype=self.x.dtype)
-            for k in range(len(self._values)):
-                c_k = self._numeric[k] / math.factorial(k)
-                if c_k == 0.0:
-                    continue
-                poly = poly + c_k * t**k
-            d = poly
-            for _ in range(m):
-                d = pt.grad(d, self.x)
-            return rewrite_graph(d, include=("canonicalize",))
+            # Use a running float product for j!, not math.factorial(j),
+            # to avoid (a) int -> float precision loss for j > 18 (where
+            # math.factorial exceeds 2^53) and (b) recomputing the
+            # factorial from scratch each Horner step.
+            fac = 1.0
+            for k in range(1, D + 1):
+                fac *= k  # fac = D!
+            # Highest term: b_D = numeric[N] / D!
+            poly = pt.constant(self._numeric[N] / fac, dtype=self.x.dtype)
+            # Horner down from j = D-1 to j = 0, updating fac incrementally
+            # from (j+1)! to j!.
+            for j in range(D - 1, -1, -1):
+                fac /= j + 1
+                b_j = self._numeric[j + m] / fac
+                poly = poly * t + b_j
+            return poly
 
         while len(self._derivs) <= m:
             try:
@@ -245,7 +264,9 @@ class TaylorAtPoint:
                         f"TaylorAtPoint: explicit coefficient iterable exhausted "
                         f"at m={k}; need at least m={m + 1} coefficients"
                     ) from exc
-                v_m = math.factorial(k) * float(c_next)
+                if k > 0:
+                    self._running_factorial *= k
+                v_m = self._running_factorial * float(c_next)
                 self._values.append(pt.constant(v_m, dtype=self.x.dtype))
                 self._numeric[k] = v_m
             else:
