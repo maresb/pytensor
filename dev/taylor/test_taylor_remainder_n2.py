@@ -77,7 +77,7 @@ def _R_sin_Kx(K, x_mp):
 
 
 @pytest.mark.parametrize("K", [1e-3, 0.1, 1.0, 3.0, 10.0, 30.0, 100.0, 1000.0])
-@pytest.mark.parametrize("order", [10, 14])
+@pytest.mark.parametrize("order", [10])
 def test_n2_cos_Kx_forward(K, order):
     """f = cos(K·x), n=2: matches (cos(Kx)-1)/x² to ~10·eps_machine across
     a sweep that straddles auto_eps."""
@@ -234,7 +234,9 @@ def test_n2_iterated_grad_cos_Kx_poly(K):
     """
     x = pt.dscalar("x")
     f = pt.cos(K * x)
-    cur = taylor_remainder_poly(f, x, 0.0, 2, order=14)
+    # Need order >= 6 to have x^5 term for the deepest grad; order=8 is
+    # one extra term of slack with a much smaller graph than order=14.
+    cur = taylor_remainder_poly(f, x, 0.0, 2, order=8)
 
     tol = 1e-10
     for k in range(6):

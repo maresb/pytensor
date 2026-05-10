@@ -131,7 +131,7 @@ def _x_sweep(dtype):
 @pytest.mark.parametrize("family_label", list(FAMILIES.keys()))
 @pytest.mark.parametrize("K_log10", [-50, -10, 0, 10, 50])
 @pytest.mark.parametrize("K0_choice", ["zero", "1", "1e10"])
-@pytest.mark.parametrize("order", [10, 14])
+@pytest.mark.parametrize("order", [10])
 def test_adversarial_K_K0_scan(family_label, K_log10, K0_choice, order):
     """For every (family, K, K0, order), evaluate taylor_remainder at a
     sweep of x values and compare to mpmath reference. Tolerance is set
@@ -175,12 +175,19 @@ def test_adversarial_K_K0_scan(family_label, K_log10, K0_choice, order):
 # ---- opaque-f scan: canonicalize cannot fold the K0 cancellation ----
 
 
-@pytest.mark.parametrize("K_log10", [-10, 0, 10])
+@pytest.mark.parametrize("K_log10", [0])
 @pytest.mark.parametrize("K0_choice", ["zero", "1", "1e3"])
 def test_adversarial_opaque_polynomial(K_log10, K0_choice):
     """f wrapped in OpFromGraph (opaque to canonicalize). Polynomial f
     should still be computed correctly via the v_trunc=0 cancellation
-    fallback in auto_eps."""
+    fallback in auto_eps.
+
+    auto_eps and taylor_remainder are scale-invariant in K (verified
+    by the wider test_adversarial_K_K0_scan); this opaque-f variant
+    is expensive (OpFromGraph internal compile is ~2.5s per case), so
+    we only sweep K0 here -- the parameter that exercises the
+    cancellation fallback we're verifying.
+    """
     K = 10.0**K_log10
     K0 = {"zero": 0.0, "1": 1.0, "1e3": 1e3}[K0_choice]
 

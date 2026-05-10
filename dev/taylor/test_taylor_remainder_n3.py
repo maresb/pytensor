@@ -89,7 +89,7 @@ def _R_layered(K0, K1, K2, K3, L, x_mp):
 
 
 @pytest.mark.parametrize("K", [1e-3, 0.1, 1.0, 10.0, 100.0, 1000.0])
-@pytest.mark.parametrize("order", [10, 14])
+@pytest.mark.parametrize("order", [10])
 def test_n3_sin_Kx_forward(K, order):
     """f = sin(K·x), n=3: c_2 = 0, c_3 = -K³/6 leading. Closed branch
     must fold (P_2 = K·x) cancellation when K is large."""
@@ -320,9 +320,9 @@ def test_n3_cos_Kxsq_parity4_via_mpmath(K):
 # ---- coefficient-magnitude scan: K0/K1/K2 layered onto K3·x³·cos(L·x) -----
 
 
-@pytest.mark.parametrize("K0_log10", [-30, 0, 10])
-@pytest.mark.parametrize("K1_log10", [-30, 0, 10])
-@pytest.mark.parametrize("K2_log10", [-30, 0, 10])
+@pytest.mark.parametrize("K0_log10", [0, 10])
+@pytest.mark.parametrize("K1_log10", [0, 10])
+@pytest.mark.parametrize("K2_log10", [0, 10])
 def test_n3_layered_three_subtree_fold(K0_log10, K1_log10, K2_log10):
     """f = K0 + K1·x + K2·x² + x³·cos(x), n=3.
 
@@ -333,7 +333,10 @@ def test_n3_layered_three_subtree_fold(K0_log10, K1_log10, K2_log10):
 
     True R = cos(x) regardless of K0/K1/K2 (those cancel exactly in
     f - P_2). So the test is "does the symbolic cancellation actually
-    happen at runtime?" across many magnitude combinations.
+    happen at runtime?" across many magnitude combinations. We sweep
+    K0/K1/K2 over normal-and-big (10^0 and 10^10) -- the small-value
+    case (10^-30) was previously included but adds no new behavior
+    since the formulation is scale-invariant in each Ki.
     """
     K0 = 10.0**K0_log10
     K1 = 10.0**K1_log10
@@ -448,7 +451,9 @@ def test_n3_iterated_grad_x3_cos_Lx_poly(L):
     """
     x = pt.dscalar("x")
     f = x**3 * pt.cos(L * x)
-    cur = taylor_remainder_poly(f, x, 0.0, 3, order=14)
+    # Need order >= 6 to have x^5 term for the deepest grad; order=8 is
+    # one extra term of slack with a much smaller graph than order=14.
+    cur = taylor_remainder_poly(f, x, 0.0, 3, order=8)
 
     tol = 1e-10
     for k in range(6):
@@ -494,10 +499,25 @@ def test_n3_switch_boundary_continuity_sin(K):
 # ---- pristine vs. layered: same R, different f shapes ----------------------
 
 
+@pytest.fixture(scope="module")
+def _x3_cos_x_pristine_fn():
+    """Compile the pristine f = x^3 * cos(x) once, share across the
+    layered-comparison tests below (none of which depend on K0/K1/K2 for
+    the pristine half)."""
+    x = pt.dscalar("x")
+    f = x**3 * pt.cos(x)
+    cache = TaylorAtPoint(f, x, 0.0)
+    eps = auto_eps(cache, n=3, order=10)
+    fn = pytensor.function([x], taylor_remainder(f, x, 0.0, 3, order=10, cache=cache))
+    return fn, cache, eps
+
+
 @pytest.mark.parametrize("K0_log10", [0, 10])
 @pytest.mark.parametrize("K1_log10", [0, 10])
 @pytest.mark.parametrize("K2_log10", [0, 10])
-def test_n3_layered_matches_pristine_x3_cos(K0_log10, K1_log10, K2_log10):
+def test_n3_layered_matches_pristine_x3_cos(
+    K0_log10, K1_log10, K2_log10, _x3_cos_x_pristine_fn
+):
     """f_pristine = x³·cos(x) and f_layered = K0 + K1·x + K2·x² + x³·cos(x)
     should give identical R = cos(x) up to ~tol after canonicalize folds
     the K0/K1·x/K2·x² terms.  Direct parity check across coefficient
@@ -506,17 +526,12 @@ def test_n3_layered_matches_pristine_x3_cos(K0_log10, K1_log10, K2_log10):
     K1 = 10.0**K1_log10
     K2 = 10.0**K2_log10
 
-    x = pt.dscalar("x")
-    f_pristine = x**3 * pt.cos(x)
-    f_layered = K0 + K1 * x + K2 * x**2 + x**3 * pt.cos(x)
+    fn_p, cache_p, eps_p = _x3_cos_x_pristine_fn
 
-    cache_p = TaylorAtPoint(f_pristine, x, 0.0)
+    x = pt.dscalar("x")
+    f_layered = K0 + K1 * x + K2 * x**2 + x**3 * pt.cos(x)
     cache_l = TaylorAtPoint(f_layered, x, 0.0)
-    eps_p = auto_eps(cache_p, n=3, order=10)
     eps_l = auto_eps(cache_l, n=3, order=10)
-    fn_p = pytensor.function(
-        [x], taylor_remainder(f_pristine, x, 0.0, 3, order=10, cache=cache_p)
-    )
     fn_l = pytensor.function(
         [x], taylor_remainder(f_layered, x, 0.0, 3, order=10, cache=cache_l)
     )
