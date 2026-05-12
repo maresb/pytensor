@@ -486,6 +486,34 @@ def test_explicit_coefficients_deriv_returns_polynomial_truncation():
         cache.deriv(6)
 
 
+def test_closed_branch_rel_err_bound_amplifies_with_cancellation_order():
+    """`cancellation_order=c` says the user's f evaluates with
+    rel_err ≤ ε_m·|v|^{-c}.  The closed-branch bound should amplify
+    the floor by |v|^{-c} for small v (and be unchanged for c=0)."""
+    from taylor_remainder import closed_branch_rel_err_bound
+
+    # Coefficients of sin(x): the P_{n=1}-subtraction sum is 0 (c_0 = 0),
+    # so for c=0 the bound is exactly the ε_m floor. For c>0 the floor
+    # amplifies by |v|^{-c}.
+    coeffs = [
+        (-1) ** ((k - 1) // 2) / math.factorial(k) if k % 2 == 1 else 0.0
+        for k in range(20)
+    ]
+    x = pt.dscalar("x")
+    cache = TaylorAtPoint(x, x, 0.0, coefficients=coeffs)
+
+    eps_machine = float(np.finfo(np.float64).eps)
+    for v in (0.5, 0.1, 0.01):
+        b0 = closed_branch_rel_err_bound(cache, n=1, v=v, order=8, cancellation_order=0)
+        b1 = closed_branch_rel_err_bound(cache, n=1, v=v, order=8, cancellation_order=1)
+        b2 = closed_branch_rel_err_bound(cache, n=1, v=v, order=8, cancellation_order=2)
+        # c=0 baseline: just the ε_m floor (sin's c_0 = 0 so no P-subtraction).
+        assert math.isclose(b0, eps_machine, rel_tol=1e-12)
+        # c>0 amplification: each unit of c multiplies the bound by 1/v.
+        assert math.isclose(b1, eps_machine / v, rel_tol=1e-12)
+        assert math.isclose(b2, eps_machine / v**2, rel_tol=1e-12)
+
+
 if __name__ == "__main__":
     import sys
 
