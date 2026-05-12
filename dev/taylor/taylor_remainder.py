@@ -559,25 +559,39 @@ def _subtracted_terms_combined_magnitude(cache, n, v):
     return total
 
 
-def closed_branch_rel_err_bound(cache, n, v, order, *, dtype=None):
+def closed_branch_rel_err_bound(
+    cache, n, v, order, *, dtype=None, cancellation_order=0
+):
     """Upper bound on the closed branch's relative error at |x-a| = v.
 
-    Derivation. Under the pristine-f contract (f's evaluation has
-    relative error ≤ ε_m), the closed branch's numerator absolute
-    error is bounded by
+    Derivation.  Under the contract that f's computed value has
+    relative error  ≤ ε_m · |v|^{-c}  (where c = `cancellation_order`,
+    default 0 = pristine evaluation), two contributions enter the
+    closed branch's relative error:
 
-        |abs_err_numerator| ≤ ε_m · Σ_{i ∈ [0, n)} |c_i · v^i|       (Wilkinson, leading term)
+      - The P_{n-1} subtraction (Wilkinson):  abs_err ≤ ε_m · combined
+        where  combined = Σ_{i ∈ [0,n)} |c_i · v^i|.  Translated to
+        the result's relative scale by dividing by  |c_{k_lead}|·v^{k_lead}:
+        rel contribution =  ε_m · combined / (|c_{k_lead}| · v^{k_lead}).
 
-    The numerator's true magnitude at |x-a|=v is |c_{k_lead}| · v^{k_lead}
-    where k_lead is the smallest k ≥ n with c_k ≠ 0. Dividing by v^n
-    preserves relative error (one extra rounding, absorbed into ε_m), so
+      - f's own evaluation plus the divide-by-v^n rounding:  baseline
+        ε_m for pristine f, amplified to  ε_m · |v|^{-c}  for c > 0.
 
-        rel_err_closed(v)  ≤  ε_m · Σ|c_i·v^i| / (|c_{k_lead}| · v^{k_lead}).
+    Total:
 
-    Two regimes:
+        rel_err_closed(v; c)
+            ≤  ε_m · combined / (|c_{k_lead}| · v^{k_lead})       # P-subtraction
+             + ε_m · max(1, |v|^{-c})                              # f's eval + division
+
+    For c = 0 (pristine), the second term collapses to ε_m and we
+    recover the existing pristine-f formula  ε_m · (cancellation + 1).
+    For c > 0 and |v| < 1, the |v|^{-c} factor amplifies the floor,
+    stretching `eps_lower` outward exactly as the user's evaluation
+    contract specifies.
+
+    Two regimes worth naming (independent of c):
       - k_lead == n (typical): the formula reduces to the single-term
-        cancellation model, with closed_branch_rel_err_bound bounded
-        below tol_rel at the auto_eps boundary by construction.
+        cancellation model.
       - k_lead > n (c_n vanishes -- e.g. cos(Kx) at n=3 has c_3=0,
         k_lead=4): the 1/v^{k_lead} divisor amplifies precision loss
         as v shrinks, giving a 1/v^{k_lead-n} factor on top of the
@@ -596,11 +610,9 @@ def closed_branch_rel_err_bound(cache, n, v, order, *, dtype=None):
         dtype = np.dtype(cache.x.dtype)
     eps_machine = float(np.finfo(np.dtype(dtype)).eps)
     combined = _subtracted_terms_combined_magnitude(cache, n, abs(v))
-    # Cancellation contribution: ε_m · Σ|c_i·v^i| / (|c_kl|·v^kl).
-    # Plus a 1·ε_m floor: even with zero cancellation, the final
-    # division (numerator / v^n) introduces one ULP of rounding error.
     cancellation = combined / (v_lead * abs(v) ** k_lead) if combined > 0 else 0.0
-    return eps_machine * (cancellation + 1.0)
+    floor = max(1.0, abs(v) ** (-cancellation_order)) if cancellation_order > 0 else 1.0
+    return eps_machine * (cancellation + floor)
 
 
 def poly_branch_rel_err_bound(order, *, dtype=None, cache=None, n=None, v=None):
