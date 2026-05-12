@@ -486,6 +486,35 @@ def test_explicit_coefficients_deriv_returns_polynomial_truncation():
         cache.deriv(6)
 
 
+def test_min_order_and_eps_finds_minimum_sufficient_order():
+    """`_min_order_and_eps` grows `order` lazily from `derivative_depth + 1`
+    until both poly truncation and closed-branch cancellation meet
+    `tol_rel`. For pristine, well-conditioned f the minimum is exactly
+    `derivative_depth + 1`. For cancelled f the order grows enough to
+    widen eps until the |v|^{-c} amplification fits within tol_rel."""
+    from taylor_remainder import _min_order_and_eps
+
+    x = pt.dscalar("x")
+
+    # sinc = R_1(sin), pristine: order tracks depth + 1 exactly.
+    cache = TaylorAtPoint(pt.sin(x), x, 0.0)
+    for depth in range(6):
+        order, eps = _min_order_and_eps(cache, n=1, derivative_depth=depth)
+        assert order == depth + 1, f"depth={depth}: got order={order}"
+        assert eps >= 0.0
+
+    # Same R_2 numerator with two different declared cancellation_orders --
+    # c=0 (wrong, just to check the parameter is honored) gives a small
+    # order; c=2 forces a much wider polynomial window.
+    cache = TaylorAtPoint(x * pt.cos(x) - pt.sin(x), x, 0.0)
+    order_c0, eps_c0 = _min_order_and_eps(cache, n=2, cancellation_order=0)
+    order_c2, eps_c2 = _min_order_and_eps(cache, n=2, cancellation_order=2)
+    assert order_c2 > order_c0, (
+        f"c=2 should grow order beyond c=0 case: got c0={order_c0}, c2={order_c2}"
+    )
+    assert eps_c2 > eps_c0, f"c=2 should yield wider eps: got c0={eps_c0}, c2={eps_c2}"
+
+
 def test_closed_branch_rel_err_bound_amplifies_with_cancellation_order():
     """`cancellation_order=c` says the user's f evaluates with
     rel_err ≤ ε_m·|v|^{-c}.  The closed-branch bound should amplify

@@ -470,6 +470,97 @@ def auto_eps(cache, n, order, *, dtype=None):
     return (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
 
 
+_MIN_ORDER_SAFETY = 64
+
+
+def _min_order_and_eps(
+    cache,
+    n,
+    *,
+    dtype=None,
+    cancellation_order=0,
+    derivative_depth=0,
+    safety_limit=_MIN_ORDER_SAFETY,
+):
+    """Find the minimum order such that both poly-branch truncation
+    and closed-branch cancellation (with the given cancellation_order)
+    meet tol_rel at the resulting eps, plus the corresponding eps.
+
+    Returns (order, eps).
+
+    The polynomial branch needs at least `derivative_depth + 1` terms
+    to survive `derivative_depth` applications of pt.grad (each grad
+    strips one term off the front). The loop grows `order` from that
+    minimum, pulling one new coefficient per iteration, and terminates
+    as soon as `closed_branch_rel_err_bound(eps; c)` falls to tol_rel.
+
+    Termination is guaranteed for analytic f within its radius of
+    convergence: as order grows, eps grows (more polynomial coverage),
+    and closed_branch_rel_err_bound at the new eps shrinks. For
+    pristine f (c = 0), convergence typically happens at order ~ 6-12
+    in float64. For high cancellation_order, the polynomial window
+    needs to be wide enough that closed-branch rel_err drops below
+    tol_rel even with the |v|^{-c} amplification.
+
+    Raises RuntimeError if the loop exceeds `safety_limit` without
+    converging -- shouldn't happen for any analytic f with reasonable
+    cancellation_order; if it does, the user likely needs to provide
+    a different numerator structure or a larger expansion-point shift.
+    Raises IndexError (propagated from the cache) if explicit-mode
+    coefficients are exhausted before convergence -- the user
+    under-provisioned for the derivative depth requested.
+    """
+    if dtype is None:
+        dtype = np.dtype(cache.x.dtype)
+    else:
+        dtype = np.dtype(dtype)
+    eps_machine = float(np.finfo(dtype).eps)
+
+    for order in range(derivative_depth + 1, safety_limit + 1):
+        tol_rel = _tol_rel(order, dtype)
+
+        # v_lead must lie within the polynomial; grow order if not.
+        v_lead, k_lead = _first_nonvanishing(cache, n, order)
+        if v_lead == 0.0:
+            continue  # all c_n..c_{n+order-1} are zero, extend polynomial
+
+        # v_trunc estimator (or zero, meaning all higher coefficients are zero).
+        v_trunc, k_trunc = _first_nonvanishing_past_polynomial(cache, n + order)
+
+        if v_trunc == 0.0:
+            # No truncation budget -- the polynomial covers everything
+            # the cache holds. Use the cancellation-aware fallback for eps.
+            if n == 0:
+                return order, 0.0
+            v_const, _ = _first_nonvanishing(cache, 0, n)
+            if v_const == 0.0:
+                # P_{n-1} ≡ 0, no subtraction in closed branch.
+                return order, 0.0
+            eps = (eps_machine * v_const / (tol_rel * v_lead)) ** (1.0 / k_lead)
+        else:
+            eps = (tol_rel * (v_lead / v_trunc)) ** (1.0 / (k_trunc - k_lead))
+
+        bound = closed_branch_rel_err_bound(
+            cache,
+            n,
+            eps,
+            order,
+            dtype=dtype,
+            cancellation_order=cancellation_order,
+        )
+        if bound <= tol_rel:
+            return order, eps
+        # Closed branch's cancellation at the chosen eps still exceeds
+        # tol_rel; grow polynomial window (larger eps) and retry.
+
+    raise RuntimeError(
+        f"_min_order_and_eps: order grew past safety_limit={safety_limit} "
+        f"without meeting tol_rel. cancellation_order={cancellation_order} "
+        f"may be too high relative to f's convergence radius at this expansion "
+        f"point. Try a shifted expansion point or a different numerator."
+    )
+
+
 def check_underflow_safety(cache, n, eps, *, dtype=None, safety=10.0):
     """Issue a warning if the closed branch may underflow within |x| < eps.
 
