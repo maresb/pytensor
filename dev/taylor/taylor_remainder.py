@@ -20,7 +20,8 @@ Concretely, this means:
     (e.g. `pt.cos(x) - 1` is acceptable as f -- our polynomial branch
     handles the cancellation -- but `pt.exp(x) * pt.exp(-x) - 1` is not).
   - f's Taylor coefficients c_m = f^(m)(a)/m! up to m = n + order +
-    max_extra are available to ~eps_machine relative accuracy. By
+    (a small safety margin) are available to ~eps_machine relative
+    accuracy. By
     default these are computed lazily by TaylorAtPoint via repeated
     `pt.grad`. That works for most analytic f, but the chain-rule
     expansion blows up exponentially in graph size for compositions
@@ -305,21 +306,53 @@ class TaylorAtPoint:
         return [self.coeff(j + l) for l in range(K)]
 
 
-def _first_nonvanishing(cache, start, count):
+# Cap on the "pull until nonzero" scan in `_first_nonvanishing`.  Plenty
+# of headroom for any realistic sparsity pattern (parity-N etc.), bounded
+# to prevent infinite loops on pathological cases like exp(-1/x^2) whose
+# Taylor coefficients at 0 are all zero despite the function being smooth.
+_FIRST_NONVANISHING_SAFETY = 64
+
+
+def _first_nonvanishing(cache, start, count=_FIRST_NONVANISHING_SAFETY):
     """Return (|c_k|, k) for the first k in [start, start+count) with c_k != 0.
 
     Compares against 0 exactly: pytensor's canonicalize folds mathematically
     zero expressions to literal zero, so any nonzero result -- however small --
     represents a genuine nonzero coefficient (e.g. 1e-50 from a scaled f).
+
+    `count` defaults to `_FIRST_NONVANISHING_SAFETY` -- pulls coefficients
+    one at a time until a nonzero is found, with a safety bound that
+    handles realistic sparsity. Callers pass a smaller `count` when they
+    have a specific bounded window in mind (e.g. "is c_lead nonzero
+    anywhere in the polynomial branch?", where the window is `order`).
+
+    Use this for v_lead-style scans where exhaustion of an explicit-
+    coefficient cache should raise (the user under-provisioned). For
+    v_trunc-style scans past the polynomial end, use
+    `_first_nonvanishing_past_polynomial`, which treats exhaustion as
+    "all remaining coefficients are zero".
     """
     for k in range(start, start + count):
-        try:
-            v = abs(cache.numeric_coeff(k))
-        except Exception:
-            v = 0.0
+        v = abs(cache.numeric_coeff(k))
         if v != 0.0:
             return v, k
     return 0.0, start + count
+
+
+def _first_nonvanishing_past_polynomial(cache, start, count=_FIRST_NONVANISHING_SAFETY):
+    """Variant of `_first_nonvanishing` for v_trunc-style scans.
+
+    Same semantics, except that exhaustion of an explicit-coefficient
+    cache returns (0.0, start) instead of raising IndexError. The
+    rationale: when the cache is finite (e.g. the user supplied
+    [c_0, ..., c_N] for a polynomial f), there genuinely are no
+    nonzero coefficients past the list, and the truncation budget is
+    "all remaining zero" -- valid input, not an error.
+    """
+    try:
+        return _first_nonvanishing(cache, start, count)
+    except IndexError:
+        return 0.0, start
 
 
 def _tol_rel(order, dtype):
@@ -342,12 +375,7 @@ def _tol_rel(order, dtype):
     return 2.0 * poly_branch_rel_err_bound(order, dtype=dtype)
 
 
-def auto_eps(cache, n, order, *, dtype=None, max_extra=4):
-    # TODO: `max_extra=4` is a heuristic for finding the next nonzero
-    # coefficient when c_{n+order} = 0. It works for series with regularly-
-    # placed zeros (e.g., even/odd parity) but could miss pathologically
-    # sparse series with longer runs of zero coefficients. Revisit if such
-    # cases come up.
+def auto_eps(cache, n, order, *, dtype=None):
     """Threshold for switching from polynomial branch to closed-form branch.
 
     The polynomial truncation relative error at |t|=eps is approximately
@@ -426,7 +454,7 @@ def auto_eps(cache, n, order, *, dtype=None, max_extra=4):
     #   (P_{n-1} symbolically zero), no subtraction is introduced and
     #   eps_lower = 0 (closed is fine for any x != a).
 
-    v_trunc, k_trunc = _first_nonvanishing(cache, n + order, max_extra + 1)
+    v_trunc, k_trunc = _first_nonvanishing_past_polynomial(cache, n + order)
     if v_trunc == 0.0:
         if n == 0:
             return 0.0
@@ -641,14 +669,14 @@ def poly_branch_rel_err_bound(order, *, dtype=None, cache=None, n=None, v=None):
     v_lead, k_lead = _first_nonvanishing(cache, n, order)
     if v_lead == 0.0:
         return rounding
-    v_trunc, k_trunc = _first_nonvanishing(cache, n + order, 5)
+    v_trunc, k_trunc = _first_nonvanishing_past_polynomial(cache, n + order)
     if v_trunc == 0.0:
         return rounding
     truncation = (v_trunc / v_lead) * abs(v) ** (k_trunc - k_lead)
     return rounding + truncation
 
 
-def check_closed_cancellation_safety(cache, n, eps, order, *, dtype=None, max_extra=4):
+def check_closed_cancellation_safety(cache, n, eps, order, *, dtype=None):
     """Issue a warning if multi-term cancellation makes the closed branch's
     boundary error exceed tol_rel.
 
@@ -696,7 +724,7 @@ def check_closed_cancellation_safety(cache, n, eps, order, *, dtype=None, max_ex
     )
 
 
-def closed_branch_needed(cache, n, order, t_max, *, dtype=None, max_extra=4):
+def closed_branch_needed(cache, n, order, t_max, *, dtype=None):
     """Return True if the polynomial branch alone is insufficient over |t| <= t_max.
 
     When False, you can drop the closed branch entirely -- polynomial achieves
@@ -712,7 +740,7 @@ def closed_branch_needed(cache, n, order, t_max, *, dtype=None, max_extra=4):
     v_lead, k_lead = _first_nonvanishing(cache, n, order)
     if v_lead == 0.0:
         return False
-    v_trunc, k_trunc = _first_nonvanishing(cache, n + order, max_extra + 1)
+    v_trunc, k_trunc = _first_nonvanishing_past_polynomial(cache, n + order)
     if v_trunc == 0.0:
         return False
     # relative truncation at t_max: |c_trunc / c_lead| · t_max^(k_trunc - k_lead)
