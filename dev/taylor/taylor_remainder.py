@@ -952,6 +952,82 @@ def taylor_remainder_poly(f, x, a, n, *, order=10, cache=None):
     return sum(coeffs[n + k] * t**k for k in range(order))
 
 
+def stable_smooth(
+    numerator,
+    x,
+    a,
+    *,
+    denominator_degree,
+    cancellation_order=0,
+    derivative_depth=0,
+    dtype=None,
+):
+    """User-facing wrapper around `taylor_remainder` with auto-chosen
+    `order` and `eps`.
+
+    Models `numerator / (x - a)^denominator_degree` as the
+    `denominator_degree`-th Taylor remainder of `numerator` at `a`. For
+    `numerator(a) != 0` the remainder is well-defined provided
+    `numerator`'s lower Taylor coefficients are also nonzero (otherwise
+    the value at `x = a` is a power-series limit -- still finite, just
+    not the bare quotient). General `f(x)/g(x)` cases compose by writing
+    both numerator and denominator as `stable_smooth` calls of equal
+    `denominator_degree` and dividing.
+
+    Parameters
+    ----------
+    numerator : Variable
+        Symbolic expression for the numerator `f(x)`. Must satisfy the
+        evaluation contract described by `cancellation_order`.
+    x : Variable
+        The input variable.
+    a : float
+        Expansion point.
+    denominator_degree : int
+        The `n` in `f / (x - a)^n`.
+    cancellation_order : int, default 0
+        The user's contract on `numerator`'s evaluation rel_err: the
+        computed value of `numerator(v)` is asserted accurate to within
+        `ε_m · |v|^{-c}` where `c = cancellation_order`. Default `c = 0`
+        means `numerator` is pristine (rel_err ≤ ε_m); declare `c > 0`
+        when the expression suffers obvious cancellation near `a` (e.g.
+        `x*cos(x) - sin(x)` at `a=0` should declare `c = 2`).
+    derivative_depth : int, default 0
+        Number of `pt.grad` applications you plan to take through the
+        result. Drives the polynomial-branch length: each grad strips
+        one Taylor term off the polynomial, so `order >= depth + 1` is
+        required for the polynomial branch to keep producing nonzero
+        derivatives. Auto-incremented by the grad chain (TODO).
+    dtype : dtype, optional
+        Override for the dtype used to size auto-chosen `eps`. Defaults
+        to `x.dtype`.
+
+    Returns
+    -------
+    Variable
+        A `switch`-based graph that evaluates `R_n(numerator)` stably
+        across `x = a`.
+    """
+    cache = TaylorAtPoint(numerator, x, a)
+    order, eps = _min_order_and_eps(
+        cache,
+        denominator_degree,
+        dtype=dtype,
+        cancellation_order=cancellation_order,
+        derivative_depth=derivative_depth,
+    )
+    return taylor_remainder(
+        numerator,
+        x,
+        a,
+        denominator_degree,
+        order=order,
+        eps=eps,
+        dtype=dtype,
+        cache=cache,
+    )
+
+
 def main():
     x = pt.dscalar("x")
 

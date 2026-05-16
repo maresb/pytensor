@@ -543,6 +543,33 @@ def test_closed_branch_rel_err_bound_amplifies_with_cancellation_order():
         assert math.isclose(b2, eps_machine / v**2, rel_tol=1e-12)
 
 
+def test_stable_smooth_sinc_forward():
+    """stable_smooth(sin, x, 0, denominator_degree=1) = sinc.  Forward eval
+    matches at x=0 (limit value 1) and away from zero (sin(x)/x)."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    sinc = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    fn = pytensor.function([x], sinc)
+    assert math.isclose(float(fn(0.0)), 1.0, abs_tol=1e-15)
+    assert math.isclose(float(fn(0.5)), math.sin(0.5) / 0.5, rel_tol=1e-14)
+    assert math.isclose(float(fn(1.0)), math.sin(1.0) / 1.0, rel_tol=1e-14)
+
+
+def test_stable_smooth_sinc_second_derivative_at_zero():
+    """For sinc, sinc''(0) = -1/3.  With derivative_depth=2 the auto-chosen
+    polynomial order = 3 leaves enough terms to survive two grads, and
+    pt.grad through the switch picks up the polynomial branch's derivative
+    at x=0."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    sinc = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1, derivative_depth=2)
+    sinc_dd = pt.grad(pt.grad(sinc, x), x)
+    fn = pytensor.function([x], sinc_dd)
+    assert math.isclose(float(fn(0.0)), -1.0 / 3.0, abs_tol=1e-13)
+
+
 if __name__ == "__main__":
     import sys
 
