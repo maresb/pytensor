@@ -60,8 +60,13 @@ x)` returns another `stable_smooth(...)` call. The framework tracks
 ## Two-branch identity for the grad chain
 
 ```
-R_n'(f)(x)  =  R_1[ f' − n·R_n(f) ](x)
+R_n'(f)(x)  =  R_1[ R_{n−1}(f') − n·R_n(f) ](x)
 ```
+
+(For `n = 1` the inner `R_{n−1}(f') = R_0(f') = f'`, so this collapses
+to the simpler `R_1'(f) = R_1[f' − R_1(f)]`. An earlier draft of this
+doc wrote `f'` in place of `R_{n−1}(f')` everywhere -- correct at
+`n = 1` only.)
 
 The bracketed quantity vanishes at `a` (both terms equal
 `f^(n)(a)/(n−1)!` there) so the L'Hôpital-style `R_1` limit is
@@ -71,6 +76,19 @@ more complex as the chain deepens. `cancellation_order` of the next-level
 expression follows from the precision contract of the new numerator,
 which is built from the previous level's `stable_smooth` plus elementary
 operations on `f`'s derivatives.
+
+### Implementation status
+
+- `n = 1` is implemented (the user-typical case for sinc-style
+  wrappers, and the only case the chain ever produces after the first
+  grad). General `n > 1` requires recursing into `R_{n−1}(f')` and is
+  unimplemented.
+- Grad chain works correctly through depth ~5 in float64. Beyond that,
+  the inner `pt.grad` across embedded `op(...)` apply nodes cascades:
+  every existing op in `inner_numerator` gets a fresh child constructed,
+  so compile time grows roughly 6× per level. A dedup pass that reuses
+  the already-constructed child instead of building a new one would
+  cap growth to linear. (Tracked as follow-up.)
 
 ## General `f / g` via composition
 

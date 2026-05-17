@@ -556,18 +556,41 @@ def test_stable_smooth_sinc_forward():
     assert math.isclose(float(fn(1.0)), math.sin(1.0) / 1.0, rel_tol=1e-14)
 
 
-def test_stable_smooth_sinc_second_derivative_at_zero():
-    """For sinc, sinc''(0) = -1/3.  With derivative_depth=2 the auto-chosen
-    polynomial order = 3 leaves enough terms to survive two grads, and
-    pt.grad through the switch picks up the polynomial branch's derivative
-    at x=0."""
+def test_stable_smooth_sinc_iterated_grad_at_zero():
+    """sinc^(k)(0) for k = 0, 1, 2, 3, 4.  Reference values come from the
+    closed form  sinc^(k)(0) = (-1)^(k/2) / (k+1) for even k, 0 for odd k.
+    The grad chain via pullback constructs another stable_smooth at each
+    grad. (Depth is capped here because each pullback's pt.grad through
+    the embedded op() calls cascades op construction, so compile time
+    grows ~6x per level beyond k=4.  Deduplicating the op cascade is
+    follow-up work.)"""
     from taylor_remainder import stable_smooth
 
     x = pt.dscalar("x")
-    sinc = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1, derivative_depth=2)
-    sinc_dd = pt.grad(pt.grad(sinc, x), x)
-    fn = pytensor.function([x], sinc_dd)
-    assert math.isclose(float(fn(0.0)), -1.0 / 3.0, abs_tol=1e-13)
+    cur = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    expected = [1.0, 0.0, -1.0 / 3.0, 0.0, 1.0 / 5.0]
+    for k, ref in enumerate(expected):
+        fn = pytensor.function([x], cur)
+        v = float(fn(0.0))
+        assert math.isclose(v, ref, abs_tol=1e-12), f"k={k}: got {v}, expected {ref}"
+        cur = pt.grad(cur, x)
+
+
+def test_stable_smooth_sinc_grad_at_nonzero_points():
+    """Away from x=0, pt.grad of stable_smooth(sin, n=1) must still give
+    correct sinc' values.  Closed-form: sinc'(t) = (t cos t - sin t) / t^2."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    sinc = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    sinc_p = pt.grad(sinc, x)
+    fn = pytensor.function([x], sinc_p)
+    for t in (0.1, 0.5, 1.0, 2.0):
+        expected = (t * math.cos(t) - math.sin(t)) / t**2
+        got = float(fn(t))
+        assert math.isclose(got, expected, rel_tol=1e-12), (
+            f"t={t}: got {got}, expected {expected}"
+        )
 
 
 if __name__ == "__main__":

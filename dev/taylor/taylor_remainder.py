@@ -130,6 +130,7 @@ import numpy as np
 
 import pytensor
 import pytensor.tensor as pt
+from pytensor.compile.builders import OpFromGraph
 from pytensor.graph.replace import clone_replace
 from pytensor.graph.rewriting.utils import rewrite_graph
 
@@ -959,11 +960,12 @@ def stable_smooth(
     *,
     denominator_degree,
     cancellation_order=0,
-    derivative_depth=0,
     dtype=None,
+    _coefficients=None,
+    _orphan_substitutions=None,
 ):
     """User-facing wrapper around `taylor_remainder` with auto-chosen
-    `order` and `eps`.
+    `order`, `eps`, and a `pt.grad`-closed grad chain.
 
     Models `numerator / (x - a)^denominator_degree` as the
     `denominator_degree`-th Taylor remainder of `numerator` at `a`. For
@@ -973,6 +975,20 @@ def stable_smooth(
     not the bare quotient). General `f(x)/g(x)` cases compose by writing
     both numerator and denominator as `stable_smooth` calls of equal
     `denominator_degree` and dividing.
+
+    The forward graph is wrapped in an `OpFromGraph` whose `pullback`
+    uses the identity
+
+        R_n'(f)(x)  =  R_1[ R_{n-1}(f') - n·R_n(f) ](x)        ... (*)
+
+    to express each grad as another `stable_smooth` call.  The bracketed
+    quantity vanishes at `a` (both terms equal `f^(n)(a)/(n-1)!` there),
+    so the outer `R_1` is well-defined; in particular `denominator_degree`
+    collapses to 1 after the first grad and stays at 1 for the rest of
+    the chain.  The bracket's Taylor coefficients have the closed form
+    `j · c_{j+n}^f`, so the child cache is built from the parent's via
+    the explicit-coefficients path -- no exponentially-recursive
+    `pt.grad` cost.
 
     Parameters
     ----------
@@ -992,40 +1008,118 @@ def stable_smooth(
         means `numerator` is pristine (rel_err ≤ ε_m); declare `c > 0`
         when the expression suffers obvious cancellation near `a` (e.g.
         `x*cos(x) - sin(x)` at `a=0` should declare `c = 2`).
-    derivative_depth : int, default 0
-        Number of `pt.grad` applications you plan to take through the
-        result. Drives the polynomial-branch length: each grad strips
-        one Taylor term off the polynomial, so `order >= depth + 1` is
-        required for the polynomial branch to keep producing nonzero
-        derivatives. Auto-incremented by the grad chain (TODO).
     dtype : dtype, optional
         Override for the dtype used to size auto-chosen `eps`. Defaults
         to `x.dtype`.
+    _coefficients : iterable, optional
+        Internal: used by the pullback to supply the child's coefficients
+        analytically from the parent's cache (see (*)), bypassing the
+        slow `pt.grad` cache path.  Users should not pass this.
+    _orphan_substitutions : dict, optional
+        Internal: used by the pullback to substitute orphan variables in
+        `numerator` (e.g. the parent OpFromGraph's output `R`) with their
+        equivalent expression in the parent's input variable, so the child
+        OpFromGraph's `construct_nominal_fgraph` doesn't see missing
+        inputs.  Users should not pass this.
 
     Returns
     -------
     Variable
-        A `switch`-based graph that evaluates `R_n(numerator)` stably
-        across `x = a`.
+        An `OpFromGraph` call that evaluates `R_n(numerator)` stably
+        across `x = a` and is closed under `pt.grad`.
     """
-    cache = TaylorAtPoint(numerator, x, a)
+    n = denominator_degree
+    # General-n grad chain requires R_{n-1}(f') recursion in pullback; not
+    # yet implemented.  n=1 (the user-typical case for sinc-like wrappers
+    # and after one grad of any level) collapses R_0(f') = f' and works.
+    if n != 1:
+        raise NotImplementedError(
+            f"stable_smooth currently supports denominator_degree=1 only; "
+            f"got {n}.  For general n, use taylor_remainder directly until "
+            f"the R_{{n-1}}(f') recursion lands."
+        )
+
+    # Fresh inner-graph input so we can wrap the forward in an OpFromGraph
+    # whose pullback returns another stable_smooth call (lazy grad chain).
+    # Apply orphan substitutions FIRST (they're rooted in x, not inner_x),
+    # then re-root x -> inner_x.
+    inner_x = x.type()
+    if _orphan_substitutions:
+        substituted = clone_replace(numerator, _orphan_substitutions)
+    else:
+        substituted = numerator
+    inner_numerator = clone_replace(substituted, {x: inner_x})
+
+    if _coefficients is not None:
+        cache = TaylorAtPoint(inner_numerator, inner_x, a, coefficients=_coefficients)
+    else:
+        cache = TaylorAtPoint(inner_numerator, inner_x, a)
+
     order, eps = _min_order_and_eps(
         cache,
-        denominator_degree,
+        n,
         dtype=dtype,
         cancellation_order=cancellation_order,
-        derivative_depth=derivative_depth,
     )
-    return taylor_remainder(
-        numerator,
-        x,
+    inner_remainder = taylor_remainder(
+        inner_numerator,
+        inner_x,
         a,
-        denominator_degree,
+        n,
         order=order,
         eps=eps,
         dtype=dtype,
         cache=cache,
     )
+
+    # Closure captures for pullback.
+    n_captured = n
+    c_captured = cancellation_order
+    a_captured = a
+    dtype_captured = dtype
+    parent_cache = cache
+
+    def pullback(inputs, outputs, cotangents):
+        (xi,) = inputs  # nominal inner input (orphan TensorVariable)
+        (R_orphan,) = outputs  # orphan copy of inner_remainder
+        (g,) = cotangents
+
+        # Re-root the numerator at xi for pt.grad to flow.
+        num_at_xi = clone_replace(inner_numerator, {inner_x: xi})
+        f_prime_at_xi = pt.grad(num_at_xi, xi)
+
+        # n_captured == 1: bracket = f'(xi) - R(xi), which vanishes at a.
+        # The bracket's j-th Taylor coefficient at a is j·c_{j+1}^f -- pass
+        # it analytically via _coefficients so the child's cache doesn't
+        # chase pt.grad through the (orphan) R or the (nested) op call.
+        bracket = f_prime_at_xi - R_orphan
+
+        def bracket_coeffs():
+            j = 0
+            while True:
+                yield j * parent_cache.numeric_coeff(j + n_captured)
+                j += 1
+
+        # R_orphan can't appear as a leaf inside the child's OpFromGraph
+        # (construct_nominal_fgraph would flag it as a missing input). Tell
+        # the child to substitute it with op(child_inner_x) at construction
+        # time: identical numerics, no graph blow-up across the grad chain.
+        deriv = stable_smooth(
+            bracket,
+            xi,
+            a_captured,
+            denominator_degree=1,
+            # f' - R vanishes to first order, costing one order of relative
+            # precision; new contract is parent's c + 1.
+            cancellation_order=c_captured + 1,
+            dtype=dtype_captured,
+            _coefficients=bracket_coeffs(),
+            _orphan_substitutions={R_orphan: op(xi)},
+        )
+        return [g * deriv]
+
+    op = OpFromGraph([inner_x], [inner_remainder], pullback=pullback)
+    return op(x)
 
 
 def main():
