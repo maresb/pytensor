@@ -603,6 +603,47 @@ def test_stable_smooth_n2_cosm1_grad_at_zero():
     assert math.isclose(float(fn(0.0)), 0.0, abs_tol=1e-14)
 
 
+def test_stable_smooth_float32_propagates_dtype():
+    """stable_smooth's auto-chosen eps must scale with x.dtype's eps_machine,
+    so a float32 input gives a wider polynomial window than float64."""
+    from taylor_remainder import stable_smooth
+
+    x32 = pt.scalar("x", dtype="float32")
+    sinc32 = stable_smooth(pt.sin(x32), x32, 0.0, denominator_degree=1)
+    fn = pytensor.function([x32], sinc32)
+    # Forward at small but nonzero x: polynomial branch handles it.
+    v = float(fn(np.float32(1e-6)))
+    # sin(1e-6)/1e-6 ~ 1 - (1e-6)^2/6 ~ 1 to float32 precision.
+    assert math.isclose(v, 1.0, abs_tol=1e-6)
+    # And at moderate x.
+    t = np.float32(0.5)
+    v = float(fn(t))
+    assert math.isclose(v, float(math.sin(0.5) / 0.5), rel_tol=1e-6)
+
+
+def test_stable_smooth_expansion_point_nonzero():
+    """stable_smooth at a != 0: expand (sin(x) - sin(a))/(x - a) around a.
+    This is f(x) := sin(x), n=1 expansion around `a`, giving a stable
+    forward eval of (sin(x) - sin(a))/(x - a)."""
+    from taylor_remainder import stable_smooth
+
+    a = 1.7
+    x = pt.dscalar("x")
+    # Numerator must vanish at x = a (i.e., have c_0 = 0 in the local
+    # expansion) for the n=1 remainder to be finite there.
+    g = stable_smooth(pt.sin(x) - math.sin(a), x, a, denominator_degree=1)
+    fn = pytensor.function([x], g)
+    # At x = a, the value is the derivative: cos(a).
+    assert math.isclose(float(fn(a)), math.cos(a), abs_tol=1e-14)
+    # And at x close to a, matches (sin(x) - sin(a))/(x - a).
+    for dx in (1e-7, 0.01, 0.5):
+        t = a + dx
+        expected = (math.sin(t) - math.sin(a)) / (t - a)
+        assert math.isclose(float(fn(t)), expected, rel_tol=1e-10), (
+            f"x={t}: got {float(fn(t))}, expected {expected}"
+        )
+
+
 def test_stable_smooth_n2_cancellation_order_2_matches_sinc_prime():
     """The user encodes sinc'(x) as `(x cos x - sin x) / x^2` with
     `cancellation_order=2` (the literal subtraction loses 2 orders of
