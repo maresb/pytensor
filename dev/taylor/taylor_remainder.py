@@ -1029,15 +1029,6 @@ def stable_smooth(
         across `x = a` and is closed under `pt.grad`.
     """
     n = denominator_degree
-    # General-n grad chain requires R_{n-1}(f') recursion in pullback; not
-    # yet implemented.  n=1 (the user-typical case for sinc-like wrappers
-    # and after one grad of any level) collapses R_0(f') = f' and works.
-    if n != 1:
-        raise NotImplementedError(
-            f"stable_smooth currently supports denominator_degree=1 only; "
-            f"got {n}.  For general n, use taylor_remainder directly until "
-            f"the R_{{n-1}}(f') recursion lands."
-        )
 
     # Fresh inner-graph input so we can wrap the forward in an OpFromGraph
     # whose pullback returns another stable_smooth call (lazy grad chain).
@@ -1088,11 +1079,36 @@ def stable_smooth(
         num_at_xi = clone_replace(inner_numerator, {inner_x: xi})
         f_prime_at_xi = pt.grad(num_at_xi, xi)
 
-        # n_captured == 1: bracket = f'(xi) - R(xi), which vanishes at a.
-        # The bracket's j-th Taylor coefficient at a is j·c_{j+1}^f -- pass
-        # it analytically via _coefficients so the child's cache doesn't
-        # chase pt.grad through the (orphan) R or the (nested) op call.
-        bracket = f_prime_at_xi - R_orphan
+        # Identity:  R_n'(f)(xi) = R_1[ R_{n-1}(f')(xi) - n·R_n(f)(xi) ].
+        # The bracket vanishes at a (both terms = f^(n)(a)/(n-1)!), and its
+        # j-th Taylor coefficient at a is j·c_{j+n}^f for ANY n (derivation
+        # in design notes) -- so the same bracket_coeffs generator works
+        # across n.
+        if n_captured == 1:
+            # R_0(f') = f', collapses to f'(xi) - R(xi).
+            bracket = f_prime_at_xi - R_orphan
+        else:
+            # Need R_{n-1}(f')(xi) as another stable_smooth.  f' inherits
+            # f's cancellation_order (pt.grad does not amplify precision
+            # error for pristine analytic graphs).  Supply f's analytic
+            # f'-coefficients (c_k^{f'} = (k+1)·c_{k+1}^f) so the child's
+            # cache doesn't pt.grad through op() or R_orphan.
+            def f_prime_coeffs():
+                j = 0
+                while True:
+                    yield (j + 1) * parent_cache.numeric_coeff(j + 1)
+                    j += 1
+
+            R_n_minus_1_f_prime = stable_smooth(
+                f_prime_at_xi,
+                xi,
+                a_captured,
+                denominator_degree=n_captured - 1,
+                cancellation_order=c_captured,
+                dtype=dtype_captured,
+                _coefficients=f_prime_coeffs(),
+            )
+            bracket = R_n_minus_1_f_prime - n_captured * R_orphan
 
         def bracket_coeffs():
             j = 0
@@ -1109,7 +1125,7 @@ def stable_smooth(
             xi,
             a_captured,
             denominator_degree=1,
-            # f' - R vanishes to first order, costing one order of relative
+            # bracket vanishes to first order, costing one order of relative
             # precision; new contract is parent's c + 1.
             cancellation_order=c_captured + 1,
             dtype=dtype_captured,

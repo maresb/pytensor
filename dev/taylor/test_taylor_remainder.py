@@ -576,6 +576,33 @@ def test_stable_smooth_sinc_iterated_grad_at_zero():
         cur = pt.grad(cur, x)
 
 
+def test_stable_smooth_n2_cosm1_forward():
+    """(cos(x) - 1)/x^2 = -1/2 + x^2/24 - x^4/720 + ...; at x=0 the limit
+    is -1/2.  Uses denominator_degree=2 with a pristine numerator (c=0)."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    f = stable_smooth(pt.cos(x) - 1, x, 0.0, denominator_degree=2)
+    fn = pytensor.function([x], f)
+    assert math.isclose(float(fn(0.0)), -0.5, abs_tol=1e-15)
+    for t in (0.1, 0.5, 1.0):
+        expected = (math.cos(t) - 1) / t**2
+        assert math.isclose(float(fn(t)), expected, rel_tol=1e-12)
+
+
+def test_stable_smooth_n2_cosm1_grad_at_zero():
+    """d/dx [(cos(x)-1)/x^2] at x=0.  By series, (cos(x)-1)/x^2 = -1/2
+    + x^2/24 - ..., so derivative at 0 is 0.  Exercises the n>1 pullback
+    (R_{n-1}(f') = R_1(-sin(x)) path)."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    f = stable_smooth(pt.cos(x) - 1, x, 0.0, denominator_degree=2)
+    fp = pt.grad(f, x)
+    fn = pytensor.function([x], fp)
+    assert math.isclose(float(fn(0.0)), 0.0, abs_tol=1e-14)
+
+
 def test_stable_smooth_sinc_grad_at_nonzero_points():
     """Away from x=0, pt.grad of stable_smooth(sin, n=1) must still give
     correct sinc' values.  Closed-form: sinc'(t) = (t cos t - sin t) / t^2."""
