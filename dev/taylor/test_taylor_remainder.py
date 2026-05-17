@@ -603,6 +603,44 @@ def test_stable_smooth_n2_cosm1_grad_at_zero():
     assert math.isclose(float(fn(0.0)), 0.0, abs_tol=1e-14)
 
 
+def test_stable_smooth_n2_cancellation_order_2_matches_sinc_prime():
+    """The user encodes sinc'(x) as `(x cos x - sin x) / x^2` with
+    `cancellation_order=2` (the literal subtraction loses 2 orders of
+    precision in the numerator at small x).  Result should match
+    `pt.grad(sinc(x), x)` -- both compute sinc'(x) -- and the closed
+    form `(t cos t - sin t)/t^2` away from zero."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    cancelled = stable_smooth(
+        x * pt.cos(x) - pt.sin(x),
+        x,
+        0.0,
+        denominator_degree=2,
+        cancellation_order=2,
+    )
+    sinc_prime = pt.grad(stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1), x)
+    fn_a = pytensor.function([x], cancelled)
+    fn_b = pytensor.function([x], sinc_prime)
+    # NB: don't compute the reference via float math.sin/math.cos --
+    # `(t*cos(t) - sin(t))/t^2` is exactly the cancellation `stable_smooth`
+    # is supposed to *avoid*, so float-level reference would compare two
+    # things both right (in different ways).  Use mpmath at 50 dps.
+    for t in (0.0, 1e-8, 0.01, 0.1, 0.5, 1.0):
+        t_mp = mp.mpf(float(t))
+        expected = (
+            0.0 if t == 0 else float((t_mp * mp.cos(t_mp) - mp.sin(t_mp)) / t_mp**2)
+        )
+        v_a = float(fn_a(t))
+        v_b = float(fn_b(t))
+        assert math.isclose(v_a, expected, abs_tol=1e-15, rel_tol=1e-10), (
+            f"cancelled@t={t}: got {v_a}, expected {expected}"
+        )
+        assert math.isclose(v_b, expected, abs_tol=1e-15, rel_tol=1e-12), (
+            f"grad(sinc)@t={t}: got {v_b}, expected {expected}"
+        )
+
+
 def test_stable_smooth_sinc_grad_at_nonzero_points():
     """Away from x=0, pt.grad of stable_smooth(sin, n=1) must still give
     correct sinc' values.  Closed-form: sinc'(t) = (t cos t - sin t) / t^2."""
