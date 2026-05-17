@@ -79,10 +79,10 @@ operations on `f`'s derivatives.
 
 ### Implementation status
 
-- `n = 1` is implemented (the user-typical case for sinc-style
-  wrappers, and the only case the chain ever produces after the first
-  grad). General `n > 1` requires recursing into `R_{n−1}(f')` and is
-  unimplemented.
+- General `n ≥ 1` works.  For `n > 1` the pullback recurses with
+  `stable_smooth(f', x, a, denominator_degree=n−1)` to express
+  `R_{n−1}(f')`; the bracket's `j·c_{j+n}^f` coefficient formula is
+  `n`-independent so it carries through unchanged.
 - Grad chain works correctly through depth ~5 in float64. Beyond that,
   the inner `pt.grad` across embedded `op(...)` apply nodes cascades:
   every existing op in `inner_numerator` gets a fresh child constructed,
