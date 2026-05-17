@@ -644,6 +644,61 @@ def test_stable_smooth_expansion_point_nonzero():
         )
 
 
+def test_stable_smooth_grad_correct_in_underflow_neighborhood():
+    """Design pitfall (1): `pt.switch(x==0, 1, sin(x)/x)` evaluates fine
+    almost everywhere, but pt.grad chains through the `sin(x)/x` branch,
+    whose quotient-rule derivative `(x*cos(x) - sin(x))/x^2` cancels in
+    a float64 neighborhood of zero.  Whether pytensor's canonicalize
+    rewrites the naive grad into a stable form is version-dependent, so
+    we test stable_smooth's correctness directly across the
+    cancellation-prone region rather than comparing to naive."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    safe = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    fn = pytensor.function([x], pt.grad(safe, x))
+    # mpmath ref across the polynomial-branch window for sinc.
+    for t in (1e-12, 1e-9, 1e-7, 1e-4, 0.1):
+        t_mp = mp.mpf(t)
+        expected = float((t_mp * mp.cos(t_mp) - mp.sin(t_mp)) / t_mp**2)
+        v = float(fn(t))
+        assert math.isclose(v, expected, rel_tol=1e-10, abs_tol=1e-15), (
+            f"t={t}: stable_smooth grad got {v}, expected {expected}"
+        )
+
+
+def test_stable_smooth_solves_constant_branch_zero_grad_pitfall():
+    """Design pitfall (2): `pt.switch(x==0, 1.0, expm1(x)/x)` has the
+    correct forward value (the literal switch returns 1 at x=0 and
+    expm1(x)/x elsewhere, both equal to the true limit).  But pt.grad
+    at x=0 propagates through the *constant* branch, returning 0 -- the
+    correct answer is 1/2.
+
+    stable_smooth's polynomial branch retains the correct local
+    Taylor structure, so its gradient at x=0 is 1/2 as expected."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    naive = pt.switch(pt.eq(x, 0), 1.0, pt.expm1(x) / x)
+    safe = stable_smooth(pt.expm1(x), x, 0.0, denominator_degree=1)
+
+    fn_naive_grad = pytensor.function([x], pt.grad(naive, x))
+    fn_safe_grad = pytensor.function([x], pt.grad(safe, x))
+
+    # d/dx [expm1(x)/x] at x=0 = 1/2  (from expm1(x)/x = 1 + x/2 + x^2/6 + ...).
+    v_naive = float(fn_naive_grad(0.0))
+    v_safe = float(fn_safe_grad(0.0))
+
+    # naive: constant branch's grad is 0 -- wrong.
+    assert v_naive == 0.0, (
+        f"expected naive grad at 0 to be 0 (the pitfall), got {v_naive}"
+    )
+    # safe: correct value 1/2.
+    assert math.isclose(v_safe, 0.5, abs_tol=1e-13), (
+        f"stable_smooth grad at 0: got {v_safe}, expected 0.5"
+    )
+
+
 def test_stable_smooth_n2_cancellation_order_2_matches_sinc_prime():
     """The user encodes sinc'(x) as `(x cos x - sin x) / x^2` with
     `cancellation_order=2` (the literal subtraction loses 2 orders of
