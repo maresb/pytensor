@@ -169,15 +169,42 @@ immediately available for depth `k + 1`. No quadratic recompute.
    existing `taylor_remainder` machinery, with `lop_overrides` that
    builds the next-level expression via `R_n' = R_1[f' − n · R_n]`.
 
-## Tests planned
+## Tests (status)
 
-- `sinc(x)` and iterated grads to depth ≥ 12. True
-  `sinc^(k)(0)` values are tabulated (we've cross-checked these against
-  the closed form `(−1)^(k/2) / (k+1)` for even `k`; `0` for odd `k`).
-- `(cos(x) − 1) / x²` at `n=2` — multi-term cancellation case.
-- `(x·cos(x) − sin(x)) / x²` with `cancellation_order = 2`. Should give
-  the same numerical result as `pt.grad(sinc(x), x)` — both compute
-  `sinc'(x)`.
+Implemented in `test_taylor_remainder.py`:
+
+- `sinc(x)` iterated grads at `x = 0`. Currently asserted to depth 4
+  (`sinc^(k)(0)` matches `(−1)^(k/2)/(k+1)` for k = 0..4). Beyond 4 the
+  test would still pass arithmetically but compile time grows ~6× per
+  level (see "Performance" below), so we cap the assertion at 4.
+- `(cos(x) − 1)/x²` at `n=2`, forward + first grad.
+- `(x·cos(x) − sin(x))/x²` with `cancellation_order = 2` matches
+  `pt.grad(sinc(x), x)` and mpmath at 50 dps across the
+  cancellation-prone neighborhood `t ∈ [1e−8, 1.0]`.
+- Pitfall (1): `stable_smooth`'s grad is correct vs mpmath across
+  `t ∈ [1e−12, 0.1]` where the naive quotient-rule grad of `sin(x)/x`
+  underflows.
+- Pitfall (2): for `expm1(x)/x`, `stable_smooth`'s grad at `x = 0`
+  gives `1/2`; the naive `switch(x==0, 1, expm1(x)/x)` returns `0` via
+  the constant branch (the design's pitfall).
+- `float32` dtype propagation: auto-eps scales with `x.dtype`.
+- `a ≠ 0` expansion: `(sin(x) − sin(a))/(x − a)` at `a = 1.7`.
+- `f/g` composition: `sin(x)/tan(x) = cos(x)` via two `stable_smooth`
+  calls of equal `denominator_degree=1`, divided.
+
+## Performance
+
+Each derivative level in the grad chain creates a fresh OpFromGraph
+(the child of the parent's pullback). Pytensor's graph rewriting then
+clones these instances; each clone has an empty `_fn` cache and gets
+compiled separately. At depth 4 we have ~400 unique compiled
+inner-functions. Compile time grows roughly 6× per level past depth ~4.
+
+This is a pytensor-level issue (the rewriter doesn't dedup `_fn`
+across structurally equivalent clones). Fix lives in pytensor, not in
+`stable_smooth`. For depth > ~5 in the meantime, use
+`taylor_remainder_poly` if the input range stays bounded -- pure
+polynomial chain rule scales linearly.
 
 ## Consistency checks (cosmetic, not enforced)
 
