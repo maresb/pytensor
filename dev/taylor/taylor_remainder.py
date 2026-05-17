@@ -1027,6 +1027,15 @@ def stable_smooth(
     Variable
         An `OpFromGraph` call that evaluates `R_n(numerator)` stably
         across `x = a` and is closed under `pt.grad`.
+
+    Performance note
+    ----------------
+    Compile time of the grad chain grows roughly 6x per derivative
+    level beyond depth ~4 (e.g. depth 5 ~30s on a typical machine,
+    depth 6 hundreds of seconds).  Once compiled, evaluation is fast.
+    For depths ≥ ~6, prefer `taylor_remainder_poly` if `(x-a)` stays
+    bounded -- pure polynomial chain rule scales linearly.  Profiling
+    the cascade is tracked as follow-up.
     """
     n = denominator_degree
 
