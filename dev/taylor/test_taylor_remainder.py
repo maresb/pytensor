@@ -699,6 +699,29 @@ def test_stable_smooth_solves_constant_branch_zero_grad_pitfall():
     )
 
 
+def test_stable_smooth_f_over_g_composition():
+    """Design composition pattern: when f(a) = g(a) = 0 to the same order
+    k, the ratio f(x)/g(x) is stable at x=a via
+
+        stable_smooth(f, x, a, denominator_degree=k) /
+        stable_smooth(g, x, a, denominator_degree=k).
+
+    Test case: sin(x)/tan(x) = cos(x). Both vanish at 0 to order 1.
+    """
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    R_sin = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    R_tan = stable_smooth(pt.tan(x), x, 0.0, denominator_degree=1)
+    ratio = R_sin / R_tan
+    fn = pytensor.function([x], ratio)
+    for t in (0.0, 1e-9, 0.01, 0.5, 1.0):
+        expected = math.cos(t)
+        assert math.isclose(float(fn(t)), expected, rel_tol=1e-12, abs_tol=1e-14), (
+            f"sin/tan@t={t}: got {float(fn(t))}, expected {expected}"
+        )
+
+
 def test_stable_smooth_n2_cancellation_order_2_matches_sinc_prime():
     """The user encodes sinc'(x) as `(x cos x - sin x) / x^2` with
     `cancellation_order=2` (the literal subtraction loses 2 orders of
