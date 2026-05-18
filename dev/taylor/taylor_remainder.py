@@ -1039,6 +1039,18 @@ def stable_smooth(
     """
     n = denominator_degree
 
+    # TaylorAtPoint's pt.grad-based derivation assumes scalar f(x), and
+    # value_at_a substitutes x -> scalar a -- vector x would fail the
+    # type check downstream with an opaque "Cannot convert Scalar into
+    # Vector" message.  Raise an actionable one upfront.
+    if x.ndim != 0:
+        raise NotImplementedError(
+            "stable_smooth currently supports scalar `x` only "
+            f"(got ndim={x.ndim}). Vector/elementwise support requires "
+            "restructuring TaylorAtPoint to compute scalar coefficients "
+            "from a scalar surrogate of x."
+        )
+
     # Fresh inner-graph input so we can wrap the forward in an OpFromGraph
     # whose pullback returns another stable_smooth call (lazy grad chain).
     # Apply orphan substitutions FIRST (they're rooted in x, not inner_x),
