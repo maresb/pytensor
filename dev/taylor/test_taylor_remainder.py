@@ -667,6 +667,80 @@ def test_stable_smooth_sinc_second_grad_at_nonzero_points():
         )
 
 
+def test_stable_smooth_grad_chain_at_nonzero_expansion_point():
+    """Grad chain at a=1.7: d/dx (sin(x)-sin(a))/(x-a) at x=a should
+    equal cos(a)'/2 = -sin(a)/2 (the second-derivative limit of the
+    Newton-quotient at a)."""
+    from taylor_remainder import stable_smooth
+
+    a = 1.7
+    x = pt.dscalar("x")
+    f = stable_smooth(pt.sin(x) - math.sin(a), x, a, denominator_degree=1)
+    fp = pt.grad(f, x)
+    fn = pytensor.function([x], fp)
+    # At x=a, the value of d/dx[(sin(x)-sin(a))/(x-a)] = sin''(a)/2 = -sin(a)/2
+    # (limit of the Newton quotient's derivative).
+    expected_at_a = -math.sin(a) / 2.0
+    assert math.isclose(float(fn(a)), expected_at_a, abs_tol=1e-13)
+    # At x close to a, matches mpmath ref.
+    for dx in (1e-6, 0.05, 0.5):
+        t = a + dx
+        ref = float(
+            mp.diff(
+                lambda u: (mp.sin(u) - mp.sin(mp.mpf(a))) / (u - mp.mpf(a)),
+                mp.mpf(t),
+                1,
+            )
+        )
+        assert math.isclose(float(fn(t)), ref, rel_tol=1e-10, abs_tol=1e-14), (
+            f"grad at x={t}: got {float(fn(t))}, expected {ref}"
+        )
+
+
+def test_stable_smooth_grad_chain_in_float32():
+    """float32: forward + first grad should give correct values within
+    float32 precision."""
+    from taylor_remainder import stable_smooth
+
+    x32 = pt.scalar("x", dtype="float32")
+    sinc32 = stable_smooth(pt.sin(x32), x32, 0.0, denominator_degree=1)
+    grad32 = pt.grad(sinc32, x32)
+    fn = pytensor.function([x32], grad32)
+    # sinc'(0) = 0, sinc'(0.5) = (0.5*cos(0.5) - sin(0.5))/0.25.
+    assert math.isclose(float(fn(np.float32(0.0))), 0.0, abs_tol=1e-6)
+    expected = (0.5 * math.cos(0.5) - math.sin(0.5)) / 0.25
+    assert math.isclose(float(fn(np.float32(0.5))), expected, rel_tol=1e-5)
+
+
+def test_stable_smooth_grad_through_cancellation_order_2_numerator():
+    """When a cancelled numerator (cancellation_order > 0) gets
+    differentiated, the chain's bracket inherits c+1, which compounds
+    through subsequent grads.  Smoke test: pt.grad of
+    stable_smooth(x*cos-sin, x, 0, n=2, c=2) (which equals sinc'(x))
+    should give sinc''(x) accurately."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    sinc_prime_cancelled = stable_smooth(
+        x * pt.cos(x) - pt.sin(x),
+        x,
+        0.0,
+        denominator_degree=2,
+        cancellation_order=2,
+    )
+    sinc_dprime = pt.grad(sinc_prime_cancelled, x)
+    fn = pytensor.function([x], sinc_dprime)
+    for t in (0.0, 1e-6, 0.1, 0.5, 1.0):
+        if t == 0.0:
+            expected = -1.0 / 3.0
+        else:
+            expected = float(mp.diff(lambda u: mp.sin(u) / u, mp.mpf(t), 2))
+        got = float(fn(t))
+        assert math.isclose(got, expected, rel_tol=1e-9, abs_tol=1e-13), (
+            f"sinc''({t}) via cancelled-numerator grad chain: got {got}, expected {expected}"
+        )
+
+
 def test_stable_smooth_grad_correct_in_underflow_neighborhood():
     """Design pitfall (1): `pt.switch(x==0, 1, sin(x)/x)` evaluates fine
     almost everywhere, but pt.grad chains through the `sin(x)/x` branch,
