@@ -644,6 +644,29 @@ def test_stable_smooth_expansion_point_nonzero():
         )
 
 
+def test_stable_smooth_sinc_second_grad_at_nonzero_points():
+    """Confirm the grad chain stays accurate not just at x=0 (where the
+    polynomial branch handles everything) but also at moderate x where
+    the closed branch is in play through both levels of the chain.
+
+    Reference: sinc''(t) = -2/t^3 * sin(t) + (2*cos(t))/t^2 - sin(t)/t.
+    Compared to mpmath at 50 dps.
+    """
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    sinc = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    sinc_dd = pt.grad(pt.grad(sinc, x), x)
+    fn = pytensor.function([x], sinc_dd)
+    for t in (1e-6, 0.01, 0.1, 0.5, 1.0, 2.0):
+        # mpmath's numerical 2nd derivative of sinc at t.
+        expected = float(mp.diff(lambda u: mp.sin(u) / u, mp.mpf(t), 2))
+        got = float(fn(t))
+        assert math.isclose(got, expected, rel_tol=1e-10, abs_tol=1e-14), (
+            f"sinc''({t}): got {got}, expected {expected}"
+        )
+
+
 def test_stable_smooth_grad_correct_in_underflow_neighborhood():
     """Design pitfall (1): `pt.switch(x==0, 1, sin(x)/x)` evaluates fine
     almost everywhere, but pt.grad chains through the `sin(x)/x` branch,
