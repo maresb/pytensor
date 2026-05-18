@@ -889,6 +889,19 @@ def test_stable_smooth_n2_cancellation_order_2_matches_sinc_prime():
         )
 
 
+def test_stable_smooth_vector_input_raises_helpful_error():
+    """Vector inputs aren't supported: TaylorAtPoint's deriv() uses
+    pt.grad(f, x) which assumes scalar f, and value_at_a substitutes
+    x -> scalar a which fails the type check.  Document this with a
+    test that asserts the failure mode -- if/when vector support lands,
+    this test flips to assert correctness."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dvector("x")
+    with pytest.raises(NotImplementedError, match="scalar `x` only"):
+        stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+
+
 def test_stable_smooth_sinc_grad_at_nonzero_points():
     """Away from x=0, pt.grad of stable_smooth(sin, n=1) must still give
     correct sinc' values.  Closed-form: sinc'(t) = (t cos t - sin t) / t^2."""

@@ -192,6 +192,16 @@ Implemented in `test_taylor_remainder.py`:
 - `f/g` composition: `sin(x)/tan(x) = cos(x)` via two `stable_smooth`
   calls of equal `denominator_degree=1`, divided.
 
+## Scalar only
+
+`stable_smooth` currently raises `NotImplementedError` for non-scalar
+`x`. The cache (`TaylorAtPoint`) computes coefficients via
+`pt.grad(f, x)` (assumes scalar `f`) and `clone_replace(d, {x:
+scalar_a})` (assumes scalar substitution). A vector-friendly version
+would replace the cache with one that derives over a *scalar surrogate*
+`x_s`, then broadcasts the resulting numeric coefficients across the
+actual vector `x` at evaluation time. Out of scope for now.
+
 ## Performance
 
 Each derivative level in the grad chain creates a fresh OpFromGraph
