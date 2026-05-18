@@ -576,6 +576,38 @@ def test_stable_smooth_sinc_iterated_grad_at_zero():
         cur = pt.grad(cur, x)
 
 
+def test_stable_smooth_n3_sin_minus_x_forward():
+    """(sin(x) - x) / x^3 = -1/6 + x^2/120 - ...  At x=0 limit is -1/6.
+    Exercises denominator_degree=3 (3-term subtraction in P_{n-1})."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    f = stable_smooth(pt.sin(x) - x, x, 0.0, denominator_degree=3)
+    fn = pytensor.function([x], f)
+    assert math.isclose(float(fn(0.0)), -1.0 / 6.0, abs_tol=1e-15)
+    for t in (0.1, 0.5, 1.0):
+        expected = (math.sin(t) - t) / t**3
+        assert math.isclose(float(fn(t)), expected, rel_tol=1e-12)
+
+
+def test_stable_smooth_n3_sin_minus_x_first_grad():
+    """d/dx [(sin(x) - x) / x^3] at x=0: by Taylor, the series is
+    -1/6 + x^2/120 - x^4/5040 + ..., so derivative at 0 is 0.
+    Exercises the n=3 pullback path, which recurses with stable_smooth
+    of denominator_degree=2."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    f = stable_smooth(pt.sin(x) - x, x, 0.0, denominator_degree=3)
+    fp = pt.grad(f, x)
+    fn = pytensor.function([x], fp)
+    assert math.isclose(float(fn(0.0)), 0.0, abs_tol=1e-13)
+    # And at moderate x: mpmath ref.
+    for t in (0.1, 0.5, 1.0):
+        ref = float(mp.diff(lambda u: (mp.sin(u) - u) / u**3, mp.mpf(t), 1))
+        assert math.isclose(float(fn(t)), ref, rel_tol=1e-10)
+
+
 def test_stable_smooth_n2_cosm1_forward():
     """(cos(x) - 1)/x^2 = -1/2 + x^2/24 - x^4/720 + ...; at x=0 the limit
     is -1/2.  Uses denominator_degree=2 with a pristine numerator (c=0)."""
