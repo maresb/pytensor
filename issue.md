@@ -8,8 +8,8 @@ generator's insertion logic
 `sorted_subgraphs` - the `unfuseable_ancestors_bitset` check. There is
 no symmetric check against the *downstream* `unfuseable_clients_bitset`
 that the exploration already computes a few lines above. When a
-later-discovered subgraph N happens to *produce* a variable consumed
-by an earlier-listed subgraph M, the planner can place N before M.
+later-discovered subgraph N happens to *produce* a variable consumed by
+an earlier-listed subgraph M, the planner can place N before M.
 `replace_all_validate` for N then orphans M's
 `inputs`-as-blockers. When M is yielded, the
 `toposort(outputs, blockers=inputs)` in
@@ -28,24 +28,24 @@ KeyError: joined_inputs
 failure callback logs the traceback at `ERROR` level then continues.
 So the half-completed fusion is abandoned, compilation finishes, and
 the produced function is numerically correct (verified to ~12 decimal
-places on the reproducer below). The visible effect for a user is a
-3-line `ERROR` log emitted from `pytensor.graph.rewriting.basic`
-during `pm.sample`, looking like a fatal traceback even though it
-isn't.
+places). The visible effect is a 3-line `ERROR` log emitted from
+`pytensor.graph.rewriting.basic` during `pytensor.function`, looking
+like a fatal traceback even though it isn't.
 
 This is a regression from
 #1615, which shipped the
 bitset-based planner in 3.0.2. The variable name `joined_inputs` in
-the traceback is incidental - it's the name pymc gives the joined NUTS
-parameter vector. Any pytensor input that happens to be the first
-unblocked leaf reached by the detoured toposort would produce the same
-crash with that variable's name.
+the traceback is just the name of the reproducer's input - any
+pytensor input that happens to be the first unblocked leaf reached by
+the detoured `toposort` would surface there.
 
 ## Reproducible code example
 
+Pure pytensor - no pymc / nutpie / scan / anything else needed:
+
 ```python
 import logging
-import pymc as pm
+import pytensor
 import pytensor.tensor as pt
 
 records = []
@@ -54,16 +54,37 @@ class _Capture(logging.Handler):
         records.append((record.levelname, record.getMessage()))
 logging.getLogger("pytensor.graph.rewriting.basic").addHandler(_Capture())
 
-with pm.Model() as model:
-    a = pm.Flat("a")
-    b = pm.Flat("b")
-    floor = pt.logsumexp(a + pt.as_tensor([0.0, 1.0]))
-    pm.Potential("p", -pt.softplus((floor - b) / 2))
-    pm.Normal("obs", mu=floor + 2 * pt.softplus((b - floor) / 2), observed=[0.0, 1.0])
+x = pt.vector("joined_inputs", shape=(2,))
+a, b = x[0:1], x[1:2]
+T = pt.as_tensor([0.0, 1.0])
 
-with model:
-    pm.sample(draws=2, tune=2, chains=1, cores=1,
-              progressbar=False, random_seed=0, nuts_sampler="pymc")
+
+def _stable_logsumexp_vec1(z):
+    """log(sum(exp(z))) via Max-subtraction; returns shape (1,)."""
+    mv = pt.expand_dims(pt.max(z), 0)
+    sw = pt.switch(pt.isinf(mv), pt.exp(mv), pt.exp(z - mv))
+    return mv + pt.log(pt.expand_dims(pt.sum(sw), 0))
+
+
+def _stable_logsumexp_scalar(z):
+    """Same numerical recipe, but returning a scalar."""
+    m = pt.max(z)
+    mv = pt.expand_dims(m, 0)
+    sw = pt.switch(pt.isinf(mv), pt.exp(mv), pt.exp(z - mv))
+    return m + pt.log(pt.sum(sw))
+
+
+# Compute the same log-sum-exp twice in independent Python expressions -
+# the two structurally-distinct return shapes prevent MergeOptimizer
+# from folding them into a single computation.
+floor_v = _stable_logsumexp_vec1(a + T)
+floor_s = _stable_logsumexp_scalar(a + T)
+
+mu = floor_v + 2 * pt.softplus((b - floor_v) / 2)
+total = (-0.5 * pt.pow(T - mu, 2)).sum() - pt.softplus((floor_s - b.squeeze()) / 2)
+grad = pytensor.grad(total, x)
+
+pytensor.function([x], [total, grad])
 
 for lvl, msg in records:
     print(f"[{lvl}] {msg.splitlines()[0]}")
@@ -71,24 +92,21 @@ for lvl, msg in records:
 
 Each of the following changes alone suppresses the bug:
 
-- drop one of the priors (need at least two so `joined_inputs` is size > 1);
-- drop the `Potential`;
-- drop the observed `Normal`;
-- change the scaling factor `2` to `1` (then `k * softplus(x/k) == softplus(x)` collapses);
-- replace the `[0.0, 1.0]` constant with a vector whose entries are equal (constant folding short-circuits the `Max` stable form);
-- replace the observed `[0.0, 1.0]` with `[0.0, 0.0]` (same reason).
-
-I was not able to reduce this to a pure-pytensor reproducer (no pymc
-at runtime). Hand-built graphs that mimic pymc's logp structure
-node-by-node and use pymc's own `compile()` / `rewrite_pregrad` /
-`CheckParameterValue` /
-`join_nonshared_inputs` machinery do not trigger the planner ordering
-mistake, so some specific feature of the graph pymc passes to
-`pytensor.function` is required and I couldn't narrow it further than
-the model above. Captured pickles of pymc's pre-rewrite graph reproduce
-deterministically when re-compiled with bare `pytensor.function`, so
-the bug is squarely in pytensor's fusion planner - pymc just happens
-to construct a graph that exercises the path.
+- replace `x[0:1]` / `x[1:2]` with `x[0]` / `x[1]` (canonicalises to
+  `Subtensor{i}` instead of `Subtensor{start:stop}`, and the planner
+  takes a different path);
+- drop the `pt.switch(pt.isinf(mv), pt.exp(mv), pt.exp(z - mv))`
+  branch (use naive `pt.log(pt.sum(pt.exp(z)))` or the Max-subtraction
+  form without the `Switch`);
+- compute `floor` once and reuse - either with both calls returning
+  the same shape, or with `floor_s = floor_v.squeeze()`;
+- replace `T = [0.0, 1.0]` with a vector whose entries are equal -
+  constant folding short-circuits the Max stable form;
+- drop the `softplus(... / 2)` on either side (the `2`/`1/2` pair is
+  algebraically inert when k=1, so the bug disappears at k=1);
+- drop `pytensor.grad` and compile just `[total]` (the gradient is
+  what makes the fused subgraphs dense enough for the planner to
+  reorder them incorrectly).
 
 ## Error message
 
@@ -112,7 +130,6 @@ KeyError: joined_inputs
 
 ```
 pytensor 3.0.2
-pymc     6.0.0+2.g169e90128  (pymc-devs/pymc main as of bisect)
 python   3.12
 platform Linux x86_64
 ```
@@ -131,9 +148,9 @@ Two viable directions for a fix:
    has `fgraph.clients[inp]`. If any input is dead, `continue` - its
    role as a toposort blocker has been invalidated by an earlier
    fusion in this same `apply` invocation. The next call will re-plan
-   against the updated graph. One-line patch; I verified on the
+   against the updated graph. One-line patch; verified on the
    reproducer that it turns 3 `ERROR` records into 0 with no change in
-   posterior means or stds.
+   the computed function:
 
    ```python
    _fg_clients = fgraph.clients

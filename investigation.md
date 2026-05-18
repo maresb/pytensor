@@ -176,44 +176,49 @@ already-applied yields, and compilation continues. With the bug
 suppressed (see verification below) the posterior means and std
 deviations match the buggy run to ~12 decimal places.
 
-## Why I couldn't shrink the reproducer further
+## Shrinking the reproducer to pure pytensor
 
-The reproducer in `min_repro.py` is the smallest one I found, and it
-still requires pymc at runtime. I spent significant effort trying to
-build a pure-pytensor reproducer that exercises the same planner path
-and could not. Approaches tried:
+The reproducer in `min_repro.py` is pure pytensor - no pymc, no
+nutpie, no scan. Getting there took two key observations:
 
-1. Building the joined-input + logp + grad graph by hand with
-   pytensor primitives (slice, reshape, expand_dims, logsumexp,
-   softplus, normal-logp components, IncSubtensor or Join for the
-   gradient).
-2. Using pymc's own `rewrite_pregrad`, `CheckParameterValue`,
-   `join_nonshared_inputs`, and `pymc.pytensorf.compile` (which
-   applies `local_check_parameter_to_ninf_switch`) on a hand-built
-   graph.
-3. Capturing the exact pre-rewrite graph that pymc passes to
-   `pytensor.function` (pickled it) and reproducing structural details
-   - the `Subtensor{start:stop} → Reshape{0} → ExpandDims{axis=0}`
-   scalar/vector roundtrip, the
-   `Add(ExpandDims(Max), Log(ExpandDims(Sum(Switch(Isinf, Exp(MaxV),
-   Exp(Sub(_, MaxV)))))))` form of `floor`, the
-   `Add(-0.91893853, Mul(-0.5, Pow(Sub(obs, xi), 2)))` form of the
-   Normal logp, the `Mul(-0.5, Sub(b, floor))` vs `Mul(0.5, Sub(floor, b))`
-   inside the softplus argument of the Potential.
+1. **Hand-built equivalents kept getting merged away.** When I tried
+   to reconstruct pymc's logp + grad graph from scratch with pytensor
+   primitives, pytensor's `MergeOptimizer` consistently folded the
+   duplicate sub-expressions that pymc happens to leave separate, and
+   the planner mistake disappeared. The fix was to keep the two
+   `log(sum(exp(...)))` chains *structurally distinct* by returning
+   different shapes (one as a `(1,)`-vector, one as a scalar) so
+   `MergeOptimizer` cannot fold them.
 
-None of these reproductions triggered the planner mistake, even when
-the pre-rewrite graphs looked structurally indistinguishable. The
-*captured* pickle from `pm.sample` triggers deterministically when
-fed straight to bare `pytensor.function` (no pymc imported), so the
-bug is squarely in pytensor's fusion planner - pymc just happens to
-construct a graph that exercises it. I gave up after ~30 minimization
-attempts; given more time I would (a) instrument
-`find_fuseable_subgraphs` to dump the per-call planner state in both
-the triggering and non-triggering graphs and diff them to find the
-exact structural feature, and (b) try shrinking the captured pickle
-itself by removing nodes incrementally. Direction (b) is mechanical
-but tedious enough that I judged the cleaned-up pymc reproducer
-sufficient to file the issue.
+2. **Subtensor canonicalisation matters.** Scalar extraction via
+   `x[i]` (which canonicalises to `Subtensor{i}`) does not trigger
+   the bug; `x[i:i+1].reshape(())` / `x[i:i+1].squeeze()` /
+   `x[i:i+1].sum()` (anything that goes through
+   `Subtensor{start:stop}` + a shape op) does. The hand-built form
+   most users would reach for is `x[i]`, which is exactly why I
+   couldn't reproduce this from pymc-style hand-builds even when the
+   logp shapes matched.
+
+What ended up being required, in addition to the two ingredients
+above, mirrors what `pm.sample` happens to construct for a
+two-parameter model with a `Potential` and an observed `Normal`:
+
+- The stable form of `log(sum(exp(...)))` *with* its
+  `Switch(Isinf, Exp(max), Exp(z - max))` branch. The naive
+  `log(sum(exp(z)))` doesn't trigger, and neither does the
+  Max-subtraction form without the `Switch`.
+- A vector constant with at least two distinct entries inside the
+  `log(sum(exp(...)))` argument (duplicates let constant folding
+  short-circuit the `Max` stable form).
+- A `softplus((b - floor) / k)` term on one side and a
+  `softplus((floor - b) / k)` on the other, with `k != 1` (with
+  `k = 1` the `k * softplus(x / k)` shape collapses algebraically and
+  the planner sees only one softplus instead of two).
+- `pytensor.grad` of the combined scalar. The gradient is what makes
+  the fused subgraphs dense enough for the planner to reorder them;
+  compiling just `[total]` does not trigger.
+
+The full minimal trigger lives in `min_repro.py`.
 
 ## Suggested fix
 
