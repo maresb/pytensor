@@ -1,40 +1,43 @@
 """Minimal reproducer for pytensor FusionOptimizer KeyError.
 
-Run in a Python 3.12 venv with:
+Run with::
+
+    uv venv --python 3.12
     uv pip install "pymc @ git+https://github.com/pymc-devs/pymc.git@main"
 
-Resolves to pymc 6.0.0+2.g169e90128 / pytensor 3.0.2.
+which resolves to pymc 6.0.0+2.g169e90128 / pytensor 3.0.2.
 
-Expected behaviour:
-- 3 ``ERROR`` records are captured from ``pytensor.graph.rewriting.basic``.
-- The third record's traceback ends with::
+Expected output: 3 ``ERROR`` records from ``pytensor.graph.rewriting.basic``
+whose traceback ends in::
 
     File ".../pytensor/tensor/rewriting/elemwise.py", line 538, in elemwise_to_scalar
       scalar_inputs = [replacement[inp] for inp in node.inputs]
                        ~~~~~~~~~~~^^^^^
     KeyError: joined_inputs
 
-- ``pm.sample`` still completes; the failure is logged but swallowed by
-  ``SequentialGraphRewriter`` and the rewrite is simply skipped, so
-  posteriors are correct. The log is misleading, not fatal.
+``pm.sample`` completes normally; the rewrite is caught by
+``SequentialGraphRewriter`` and skipped, so posteriors are still correct.
+The error is purely a noisy log.
 
-Variations that DO NOT reproduce (each suppresses the bug):
-- Drop the ``pm.Potential`` -> no error.
-- Drop the observed ``pm.Normal`` -> no error.
-- Drop the second prior (``xi_u``) -> no error.
-- Replace ``0.005`` with ``1.0`` (so ``k * softplus(x/k) == softplus(x)``
-  trivially canonicalises away) -> no error.
-- Make ``T`` length 1 (or replace it with a scalar) -> no error.
+Necessary ingredients (each removable change suppresses the bug):
+    - Two parameters (``pm.Flat`` works; no log-prob needed)
+    - A shared ``floor`` expression formed via ``logsumexp`` over a vector
+    - Both a ``Potential`` and an observed ``Normal`` that consume ``floor``
+    - Scaling factor != 1 in ``floor + k * softplus((b - floor) / k)``
+      (k=1 collapses algebraically and the bug doesn't appear)
+    - Distinct values in the vector constant added inside ``logsumexp``
+      (duplicates let constant folding short-circuit the Max stable form)
+    - Distinct values in the observed array (same reason)
 
-All three structural elements (two scalar priors, the ``Potential``, the
-observed ``Normal``) plus a non-trivial ``k != 1`` scaling are required to
-construct a graph in which ``FusionOptimizer.find_fuseable_subgraphs``
-pre-plans two subgraphs in the wrong dependency order.
+I could not reproduce this with pure pytensor (no pymc at runtime) despite
+matching pymc's graph structurally - some specific feature of the graph
+pymc passes to ``pytensor.function`` is required and I was unable to
+narrow it further than the model below. The graph differences I found are
+captured in ``investigation.md``.
 """
 
 import logging
 
-import numpy as np
 import pymc as pm
 import pytensor.tensor as pt
 
@@ -48,15 +51,12 @@ class _Capture(logging.Handler):
 
 logging.getLogger("pytensor.graph.rewriting.basic").addHandler(_Capture())
 
-T = pt.as_tensor([-1.0, 1.0])
-
 with pm.Model() as model:
-    b0 = pm.Normal("b0")
-    xi_u = pm.Normal("xi_u")
-    floor = pt.log(pt.sum(pt.exp(b0 + T)))
-    xi = floor + 0.005 * pt.softplus((xi_u - floor) / 0.005)
-    pm.Potential("p", -pt.softplus((floor - xi_u) / 0.005))
-    pm.Normal("obs", mu=xi, observed=[1.0, 2.0])
+    a = pm.Flat("a")
+    b = pm.Flat("b")
+    floor = pt.logsumexp(a + pt.as_tensor([0.0, 1.0]))
+    pm.Potential("p", -pt.softplus((floor - b) / 2))
+    pm.Normal("obs", mu=floor + 2 * pt.softplus((b - floor) / 2), observed=[0.0, 1.0])
 
 with model:
     pm.sample(
