@@ -1,3 +1,7 @@
+> *Disclaimer: this issue was drafted by an LLM. A human reviewed
+> the reproducer and findings before filing, but the prose is
+> machine-generated.*
+
 ## Describe the issue
 
 `FusionOptimizer.apply` plans a batch of loop-fusion rewrites up front
@@ -166,6 +170,3 @@ Two viable directions for a fix:
    exploration but is currently discarded once the subgraph is closed.
    This addresses the root cause; (1) is a localised backstop that
    would still be reasonable as belt-and-braces.
-
-Happy to send a PR for (1) or to prepare (2) with the corresponding
-test from the reproducer.
