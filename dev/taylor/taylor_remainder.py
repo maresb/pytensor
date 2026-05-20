@@ -1038,6 +1038,14 @@ def stable_smooth(
     the cascade is tracked as follow-up.
     """
     n = denominator_degree
+    if n < 0:
+        raise ValueError(f"denominator_degree must be non-negative; got {n}")
+    if n == 0:
+        # R_0(f) = f -- the wrapper is identity, no division-by-zero risk.
+        # Return numerator directly; pt.grad propagates via pytensor's
+        # default chain rule.  Avoids building an OpFromGraph and the
+        # grad chain's `n - 1 = -1` recursion.
+        return numerator
 
     # TaylorAtPoint's pt.grad-based derivation assumes scalar f(x), and
     # value_at_a substitutes x -> scalar a -- vector x would fail the
