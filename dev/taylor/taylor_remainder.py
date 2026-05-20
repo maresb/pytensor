@@ -954,6 +954,45 @@ def taylor_remainder_poly(f, x, a, n, *, order=10, cache=None):
     return sum(coeffs[n + k] * t**k for k in range(order))
 
 
+def _scalarize_elementwise(output, replace):
+    """Walk-and-rebuild that allows substituting variables of *lower rank*
+    than their counterparts in `output`.  Used to produce a scalar
+    surrogate of an elementwise graph (e.g., to replace a vector `x` with
+    a scalar `x_s` inside `pt.sin(x) + pt.cos(x)*2`).
+
+    `clone_replace` can't do this -- its type filter rejects feeding a
+    scalar where the apply node was originally typed for a vector --
+    so each Apply node is rebuilt here via `op.make_node(*new_inputs)`,
+    which re-derives the output's type from the substituted inputs.
+    Works iff every op in the graph is rank-polymorphic (Elemwise,
+    DimShuffle, scalar arithmetic, broadcast ops); a fixed-rank op
+    (e.g. matrix-product) in the graph would raise from inside
+    `make_node`.
+
+    Constant subgraphs that already had a higher rank (e.g. an `ExpandDims`
+    that broadcast a 0-d constant against the vector `x`) survive the
+    rebuild with the same rank.  The caller is expected to `pt.squeeze`
+    the result to recover a scalar -- safe because squeeze is a no-op on
+    truly scalar outputs and just drops the vestigial size-1 axis when
+    present.
+    """
+    memo = dict(replace)
+
+    def visit(v):
+        if v in memo:
+            return memo[v]
+        if v.owner is None:
+            memo[v] = v
+            return v
+        new_inputs = [visit(inp) for inp in v.owner.inputs]
+        new_node = v.owner.op.make_node(*new_inputs)
+        idx = v.owner.outputs.index(v)
+        memo[v] = new_node.outputs[idx]
+        return memo[v]
+
+    return visit(output)
+
+
 def _validate_user_cache(cache, numerator, x, a):
     """Reject a `stable_smooth(..., cache=...)` whose cache wasn't built
     over the same `(numerator, x, a)`.
@@ -1031,10 +1070,20 @@ def stable_smooth(
     Parameters
     ----------
     numerator : Variable
-        Symbolic expression for the numerator `f(x)`. Must satisfy the
-        evaluation contract described by `cancellation_order`.
+        Symbolic expression for the numerator `f(x)`.  Must satisfy the
+        evaluation contract described by `cancellation_order`.  When `x`
+        is non-scalar, `numerator` must be **elementwise** in `x`: each
+        entry of `numerator` depends only on the corresponding entry of
+        `x`.  This is the normal case for expressions built from
+        `pt.sin`, `pt.cos`, `pt.exp`, arithmetic, and other elementwise
+        primitives.  Non-elementwise expressions (e.g.
+        `pt.sum(pt.sin(x)) * pt.ones_like(x)`) silently produce wrong
+        gradients because the pullback uses `pt.grad(f.sum(), x)` to
+        recover the elementwise derivative -- that identity only holds
+        when the Jacobian is diagonal.
     x : Variable
-        The input variable.
+        The input variable.  Scalar or vector/tensor of any rank
+        (elementwise; see `numerator` note above).
     a : float
         Expansion point.
     denominator_degree : int
@@ -1128,19 +1177,17 @@ def stable_smooth(
             "(the latter is internal-only)."
         )
     if cache is not None:
+        if x.ndim != 0:
+            # Cross-call cache sharing for vector x would need a scalar
+            # surrogate keyed to the user's vector x, which the user
+            # can't easily produce.  Out of scope for the initial vector
+            # support; future work can plumb the internal surrogate
+            # back through the cache interface.
+            raise NotImplementedError(
+                "stable_smooth: cache= currently requires scalar x "
+                f"(got ndim={x.ndim}). Omit cache for vector inputs."
+            )
         _validate_user_cache(cache, numerator, x, a)
-
-    # TaylorAtPoint's pt.grad-based derivation assumes scalar f(x), and
-    # value_at_a substitutes x -> scalar a -- vector x would fail the
-    # type check downstream with an opaque "Cannot convert Scalar into
-    # Vector" message.  Raise an actionable one upfront.
-    if x.ndim != 0:
-        raise NotImplementedError(
-            "stable_smooth currently supports scalar `x` only "
-            f"(got ndim={x.ndim}). Vector/elementwise support requires "
-            "restructuring TaylorAtPoint to compute scalar coefficients "
-            "from a scalar surrogate of x."
-        )
 
     # Fresh inner-graph input so we can wrap the forward in an OpFromGraph
     # whose pullback returns another stable_smooth call (lazy grad chain).
@@ -1160,18 +1207,37 @@ def stable_smooth(
     #     surfaces numerics (`numeric_coeff`) and `pt.constant`s (via
     #     `coeffs_of_deriv`), both of which carry no symbolic dependency
     #     on `cache.x` into the OpFromGraph's inner graph.
-    #   - Explicit coefficients: pullback's analytic pipeline; build over
-    #     `inner_numerator`/`inner_x` (decorative; the cache's `x` is
-    #     only consulted for its dtype in this mode).
-    #   - Otherwise: fresh auto-mode cache over `inner_numerator`/`inner_x`.
+    #   - Explicit coefficients (pullback's analytic pipeline): cache.x
+    #     is decorative -- only its dtype is consulted -- so we can use
+    #     `inner_x` directly, even when it's a vector.
+    #   - Otherwise (auto-grad mode): for scalar x, the cache lives on
+    #     `inner_numerator`/`inner_x`.  For vector x, that path would
+    #     blow up (pt.grad on vector-valued f, x -> scalar-a substitution
+    #     fails type check), so we build a scalar surrogate of x and the
+    #     numerator over which the auto-derivation chain stays scalar.
+    #     The cache's emitted constants (`pt.constant`s, scalar 0-d)
+    #     broadcast cleanly against the vector `t = inner_x - a` inside
+    #     `taylor_remainder`.
     if cache is not None:
         active_cache = cache
     elif _coefficients is not None:
         active_cache = TaylorAtPoint(
             inner_numerator, inner_x, a, coefficients=_coefficients
         )
-    else:
+    elif x.ndim == 0:
         active_cache = TaylorAtPoint(inner_numerator, inner_x, a)
+    else:
+        # Vector x.  Build a scalar surrogate of the numerator (rank-aware
+        # walk + rebuild; `clone_replace` would reject the lower-rank
+        # substitution) and run the auto-grad cache against that.
+        # `pt.squeeze` strips the size-1 axis that survives when the
+        # user's graph broadcast 0-d constants against vector x (e.g.
+        # `pt.sin(x) + 1` -> shape (1,) after substitution).
+        x_surrogate = pt.scalar("_x_s", dtype=x.dtype)
+        numerator_surrogate = pt.squeeze(
+            _scalarize_elementwise(numerator, {x: x_surrogate})
+        )
+        active_cache = TaylorAtPoint(numerator_surrogate, x_surrogate, a)
 
     order, eps = _min_order_and_eps(
         active_cache,
@@ -1205,7 +1271,14 @@ def stable_smooth(
 
         # Re-root the numerator at xi for pt.grad to flow.
         num_at_xi = clone_replace(inner_numerator, {inner_x: xi})
-        f_prime_at_xi = pt.grad(num_at_xi, xi)
+        # pt.grad requires a scalar cost.  For elementwise numerator and
+        # vector xi, the Jacobian is diagonal, so `pt.grad(f.sum(), x)`
+        # recovers `f'(x)` entry-wise.  For scalar xi the `.sum()` is a
+        # no-op (sum of a 0-d tensor is the tensor itself).
+        if xi.ndim == 0:
+            f_prime_at_xi = pt.grad(num_at_xi, xi)
+        else:
+            f_prime_at_xi = pt.grad(num_at_xi.sum(), xi)
 
         # Identity:  R_n'(f)(xi) = R_1[ R_{n-1}(f')(xi) - n·R_n(f)(xi) ].
         # The bracket vanishes at a (both terms = f^(n)(a)/(n-1)!), and its

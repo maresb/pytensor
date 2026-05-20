@@ -933,17 +933,184 @@ def test_stable_smooth_negative_n_raises():
         stable_smooth(pt.sin(x), x, 0.0, denominator_degree=-1)
 
 
-def test_stable_smooth_vector_input_raises_helpful_error():
-    """Vector inputs aren't supported: TaylorAtPoint's deriv() uses
-    pt.grad(f, x) which assumes scalar f, and value_at_a substitutes
-    x -> scalar a which fails the type check.  Document this with a
-    test that asserts the failure mode -- if/when vector support lands,
-    this test flips to assert correctness."""
+def test_stable_smooth_vector_input_sinc_forward():
+    """Sinc evaluated entrywise on a vector input -- the entry-at-zero
+    test in particular goes through the polynomial branch where naive
+    sin(x)/x would NaN.  Tolerance is tight (rel_tol=1e-12) since the
+    polynomial branch is essentially exact for sinc."""
     from taylor_remainder import stable_smooth
 
     x = pt.dvector("x")
-    with pytest.raises(NotImplementedError, match="scalar `x` only"):
-        stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    sinc = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    fn = pytensor.function([x], sinc)
+    out = fn(np.array([0.0, 1e-10, 1e-4, 0.5, 1.0, -0.3]))
+    expected = np.array(
+        [
+            1.0,
+            1.0,
+            1.0 - 1e-8 / 6,
+            math.sin(0.5) / 0.5,
+            math.sin(1.0),
+            math.sin(-0.3) / -0.3,
+        ]
+    )
+    np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-15)
+
+
+def test_stable_smooth_vector_input_sinc_grad_matches_mpmath():
+    """Elementwise gradient: pt.grad(sinc.sum(), x) recovers sinc'
+    entrywise.  Uses mpmath at 50 dps to ground-truth the cancellation-
+    prone near-zero entries."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dvector("x")
+    sinc = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    sinc_p = pt.grad(sinc.sum(), x)
+    fn = pytensor.function([x], sinc_p)
+    ts = np.array([0.0, 1e-12, 1e-8, 1e-4, 0.5, 1.0, -0.3])
+    out = fn(ts)
+
+    def sinc_prime(t):
+        if t == 0:
+            return 0.0
+        return float((mp.mpf(t) * mp.cos(t) - mp.sin(t)) / mp.mpf(t) ** 2)
+
+    expected = np.array([sinc_prime(t) for t in ts])
+    np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-15)
+
+
+def test_stable_smooth_vector_input_n2_cosm1():
+    """(cos x - 1)/x^2 entrywise on a vector input, including x=0 where
+    the limit is -1/2."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dvector("x")
+    f = stable_smooth(pt.cos(x) - 1, x, 0.0, denominator_degree=2)
+    fn = pytensor.function([x], f)
+    ts = np.array([0.0, 1e-8, 1e-4, 0.5, 1.0])
+    out = fn(ts)
+    expected = np.array(
+        [
+            -0.5,
+            (math.cos(1e-8) - 1) / 1e-16 if False else -0.5,
+            (math.cos(1e-4) - 1) / 1e-8,
+            (math.cos(0.5) - 1) / 0.25,
+            (math.cos(1.0) - 1) / 1.0,
+        ]
+    )
+    # Near-zero entries are reference-limited by float cancellation in
+    # the expected formula too; use mpmath for those.
+    expected[1] = float((mp.cos(mp.mpf(1e-8)) - 1) / mp.mpf(1e-8) ** 2)
+    np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-15)
+
+
+def test_stable_smooth_vector_input_nonzero_expansion_point():
+    """a != 0 with vector x: stable_smooth(sin(x) - sin(1.7), x, 1.7,
+    denominator_degree=1) reproduces cos(1.7) at t = a and the closed
+    form (sin t - sin a)/(t - a) elsewhere.  Tolerance and reference
+    pattern mirrors the scalar test_stable_smooth_expansion_point_nonzero
+    -- including using `math.sin` (not mpmath) for the reference, since
+    the closed branch evaluates the same lossy subtraction and matches
+    that to ~1e-10."""
+    from taylor_remainder import stable_smooth
+
+    a = 1.7
+    x = pt.dvector("x")
+    f = stable_smooth(pt.sin(x) - math.sin(a), x, a, denominator_degree=1)
+    fn = pytensor.function([x], f)
+    ts = np.array([a, a + 1e-7, a + 0.01, a + 0.5])
+    out = fn(ts)
+
+    assert math.isclose(out[0], math.cos(a), abs_tol=1e-14)
+    for got, t in zip(out[1:], ts[1:]):
+        expected = (math.sin(t) - math.sin(a)) / (t - a)
+        assert math.isclose(got, expected, rel_tol=1e-10), (
+            f"t={t}: got {got}, expected {expected}"
+        )
+
+
+def test_stable_smooth_vector_input_float32():
+    """Vector + float32 dtype: the scalar surrogate carries x.dtype, and
+    the auto-eps formula sizes itself to float32 epsilon."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.fvector("x")
+    sinc = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    fn = pytensor.function([x], sinc)
+    out = fn(np.array([0.0, 1e-4, 0.5, 1.0], dtype="float32"))
+    assert out.dtype == np.float32
+    expected = np.array(
+        [1.0, math.sin(1e-4) / 1e-4, math.sin(0.5) / 0.5, math.sin(1.0)],
+        dtype="float32",
+    )
+    np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-7)
+
+
+def test_stable_smooth_vector_input_grad_chain_depth2():
+    """Second derivative through the vector grad path.  d^2 sinc/dx^2
+    at x = 0 equals -1/3; closed form sinc''(t) elsewhere via mpmath."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dvector("x")
+    sinc = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    sinc_p = pt.grad(sinc.sum(), x)
+    sinc_pp = pt.grad(sinc_p.sum(), x)
+    fn = pytensor.function([x], sinc_pp)
+    ts = np.array([0.0, 1e-6, 0.3, 1.0])
+    out = fn(ts)
+
+    def sinc_pp_ref(t):
+        if t == 0:
+            return -1.0 / 3.0
+        t_mp = mp.mpf(t)
+        sin_t, cos_t = mp.sin(t_mp), mp.cos(t_mp)
+        # sinc''(t) = ((2 - t^2) sin t - 2 t cos t) / t^3
+        return float(((2 - t_mp**2) * sin_t - 2 * t_mp * cos_t) / t_mp**3)
+
+    expected = np.array([sinc_pp_ref(t) for t in ts])
+    np.testing.assert_allclose(out, expected, rtol=1e-10, atol=1e-14)
+
+
+def test_stable_smooth_vector_input_cache_raises():
+    """Cross-call cache sharing isn't implemented for vector inputs (the
+    cache's scalar surrogate would need a different keying scheme).
+    Reject loudly rather than silently miscompute."""
+    from taylor_remainder import TaylorAtPoint, stable_smooth
+
+    x = pt.dscalar("x")
+    cache = TaylorAtPoint(pt.sin(x), x, 0.0)
+    x_v = pt.dvector("x")
+    with pytest.raises(NotImplementedError, match="cache= currently requires scalar x"):
+        stable_smooth(pt.sin(x_v), x_v, 0.0, denominator_degree=1, cache=cache)
+
+
+def test_stable_smooth_vector_non_elementwise_numerator_produces_wrong_grad():
+    """Documented limitation: pullback recovers the elementwise derivative
+    via pt.grad(num.sum(), x), which is only the per-entry derivative when
+    the numerator is elementwise in x.  For a non-elementwise numerator
+    the forward pass is still well-defined (the scalar-surrogate cache
+    samples the numerator at a single point), but the grad is wrong.
+    This test pins the behavior so a future fix flips it."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dvector("x")
+    # pt.sum(pt.sin(x)) is a scalar; ones_like(x) broadcasts it to vector.
+    # This numerator is NOT elementwise in x: each output entry depends
+    # on every input entry.
+    non_elem = pt.sum(pt.sin(x)) * pt.ones_like(x)
+    f = stable_smooth(non_elem, x, 0.0, denominator_degree=1)
+    f_grad = pt.grad(f.sum(), x)
+    fn = pytensor.function([x], f_grad)
+    out = fn(np.array([0.5, 1.0, 1.5]))
+    # If we believed the elementwise contract, every entry of f_grad
+    # would equal sinc'(x_i) entrywise -- but it doesn't, by design of
+    # the non-elementwise numerator.  We don't pin a numeric value
+    # (depends on graph-rewrite details that aren't stable contract);
+    # we just sanity-check the result is finite and non-NaN.
+    assert np.all(np.isfinite(out)), (
+        "non-elementwise numerator should still produce finite output "
+        "(even if mathematically wrong); got NaN/Inf in {out}"
+    )
 
 
 def test_stable_smooth_sinc_grad_at_nonzero_points():

@@ -192,15 +192,29 @@ Implemented in `test_taylor_remainder.py`:
 - `f/g` composition: `sin(x)/tan(x) = cos(x)` via two `stable_smooth`
   calls of equal `denominator_degree=1`, divided.
 
-## Scalar only
+## Scalar and elementwise vector
 
-`stable_smooth` currently raises `NotImplementedError` for non-scalar
-`x`. The cache (`TaylorAtPoint`) computes coefficients via
-`pt.grad(f, x)` (assumes scalar `f`) and `clone_replace(d, {x:
-scalar_a})` (assumes scalar substitution). A vector-friendly version
-would replace the cache with one that derives over a *scalar surrogate*
-`x_s`, then broadcasts the resulting numeric coefficients across the
-actual vector `x` at evaluation time. Out of scope for now.
+`stable_smooth` supports both scalar `x` and elementwise vector `x`.
+For vector `x`, the user's `numerator` must be elementwise in `x`
+(each output entry depends only on the corresponding input entry):
+the cache is built from a *scalar surrogate* of the numerator
+produced by a rank-aware graph walk (`_scalarize_elementwise` --
+needed because `clone_replace` rejects substituting a scalar where
+the apply node was originally typed as vector).  The resulting cache
+emits scalar `pt.constant`s that broadcast cleanly against the
+vector `t = x - a` in the polynomial branch.  The pullback uses
+`pt.grad(f.sum(), x)` to recover the per-entry derivative, which is
+correct iff `numerator` is elementwise in `x` (diagonal Jacobian).
+
+Non-elementwise numerators (e.g. `pt.sum(pt.sin(x)) * pt.ones_like(x)`)
+are explicitly unsupported -- the forward eval is well-defined (the
+scalar surrogate samples the numerator at a single point), but the
+pullback's `.sum()` trick silently gives the wrong gradient.  The
+docstring documents this assumption.
+
+The `cache=` cross-call sharing parameter currently requires scalar
+`x` (the user can't easily produce a scalar surrogate keyed to their
+vector `x`); cross-call memoization with vector inputs is future work.
 
 ## Performance
 
