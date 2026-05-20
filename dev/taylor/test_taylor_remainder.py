@@ -1235,6 +1235,161 @@ def test_stable_smooth_cache_numerator_mismatch_raises():
     stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1, cache=sin_cache)
 
 
+# ------------ derived-expression composition (GEV link example) ------------
+
+
+def _gev_link_pt(xi, z):
+    """Pytensor expression for (1 + xi*z)^(-1/xi) via the design's
+    derived-expression composition pattern.  Used by several tests below
+    -- factored out so the worked example matches the docstring in
+    `stable_smooth_design.md` line-for-line."""
+    from pytensor.graph.replace import clone_replace
+    from taylor_remainder import stable_smooth
+
+    u = pt.scalar(dtype=xi.dtype) if xi.ndim == 0 else pt.vector(dtype=xi.dtype)
+    h_of_u = stable_smooth(pt.log1p(u), u, 0.0, denominator_degree=1)
+    h_of_xz = clone_replace(h_of_u, {u: xi * z})
+    return pt.exp(-z * h_of_xz)
+
+
+def _gev_link_mp(xi, z):
+    """Reference value for (1 + xi*z)^(-1/xi) at 50 dps; takes the
+    Gumbel limit at xi = 0."""
+    xi_m, z_m = mp.mpf(xi), mp.mpf(z)
+    if xi_m == 0:
+        return float(mp.exp(-z_m))
+    return float((1 + xi_m * z_m) ** (-1 / xi_m))
+
+
+def test_gev_link_forward_across_xi_zero():
+    """(1 + xi*z)^(-1/xi) is well-defined for all real xi on its domain.
+    At xi=0 the value is exp(-z) (Gumbel).  Naive evaluation gives
+    0/0-form NaN in the exponent or `1**inf` indeterminate; the
+    composition pattern using stable_smooth(log1p/u) recovers the
+    correct limit and remains accurate for tiny xi where the naive
+    formula loses digits to cancellation."""
+    xi = pt.dscalar("xi")
+    z = pt.dscalar("z")
+    f = _gev_link_pt(xi, z)
+    fn = pytensor.function([xi, z], f)
+
+    for xi_v, z_v in [
+        (0.0, 0.5),
+        (0.0, 1.0),
+        (0.0, -0.3),
+        (1e-15, 0.5),
+        (1e-8, 0.5),
+        (-1e-8, 0.5),
+        (0.1, 0.5),
+        (0.5, 0.5),
+        (-0.3, 0.5),
+        (1.0, 0.1),
+        (-0.5, 0.5),
+    ]:
+        got = float(fn(xi_v, z_v))
+        ref = _gev_link_mp(xi_v, z_v)
+        assert math.isclose(got, ref, rel_tol=1e-12, abs_tol=1e-15), (
+            f"xi={xi_v}, z={z_v}: got {got}, expected {ref}"
+        )
+
+
+def test_gev_link_d_dxi_correct_through_xi_zero():
+    """pt.grad w.r.t. xi flows through the OFG pullback plus pytensor's
+    outer chain rule (d(xi*z)/dxi = z).  Reference: by Taylor expansion
+    of log f at xi=0,
+        df/dxi |_{xi=0}  =  (z^2 / 2) * exp(-z).
+    Away from zero, compare to mpmath central differences at h=1e-4."""
+    xi = pt.dscalar("xi")
+    z = pt.dscalar("z")
+    f = _gev_link_pt(xi, z)
+    df_dxi = pt.grad(f, xi)
+    fn = pytensor.function([xi, z], df_dxi)
+
+    for z_v in (0.3, 0.5, 1.0, -0.4):
+        got = float(fn(0.0, z_v))
+        expected = 0.5 * z_v**2 * math.exp(-z_v)
+        assert math.isclose(got, expected, rel_tol=1e-12), (
+            f"xi=0, z={z_v}: got {got}, expected {expected}"
+        )
+
+    def mp_d_dxi(xi_v, z_v):
+        h = mp.mpf("1e-12")
+        xi_m, z_m = mp.mpf(xi_v), mp.mpf(z_v)
+        plus = (1 + (xi_m + h) * z_m) ** (-1 / (xi_m + h))
+        minus = (1 + (xi_m - h) * z_m) ** (-1 / (xi_m - h))
+        return float((plus - minus) / (2 * h))
+
+    # Compare at moderate xi where mpmath central diff is stable.
+    for xi_v, z_v in [(0.1, 0.5), (0.3, 0.5), (-0.3, 0.5), (0.5, 0.5)]:
+        got = float(fn(xi_v, z_v))
+        ref = mp_d_dxi(xi_v, z_v)
+        assert math.isclose(got, ref, rel_tol=1e-8), (
+            f"xi={xi_v}, z={z_v}: got {got}, expected {ref}"
+        )
+
+
+def test_gev_link_d_dz_correct_through_xi_zero():
+    """pt.grad w.r.t. z: outer chain rule gives d(xi*z)/dz = xi, and the
+    closed-form derivative is
+        df/dz  =  -(1 + xi*z)^(-1/xi - 1).
+    At xi=0 the limit is -exp(-z)."""
+    xi = pt.dscalar("xi")
+    z = pt.dscalar("z")
+    f = _gev_link_pt(xi, z)
+    df_dz = pt.grad(f, z)
+    fn = pytensor.function([xi, z], df_dz)
+
+    for z_v in (0.3, 0.5, 1.0):
+        got = float(fn(0.0, z_v))
+        expected = -math.exp(-z_v)
+        assert math.isclose(got, expected, rel_tol=1e-12), (
+            f"xi=0, z={z_v}: got {got}, expected {expected}"
+        )
+
+    for xi_v, z_v in [(0.1, 0.5), (-0.3, 0.5), (0.5, 0.5)]:
+        got = float(fn(xi_v, z_v))
+        ref = -float((1 + mp.mpf(xi_v) * mp.mpf(z_v)) ** (-1 / mp.mpf(xi_v) - 1))
+        assert math.isclose(got, ref, rel_tol=1e-12), (
+            f"xi={xi_v}, z={z_v}: got {got}, expected {ref}"
+        )
+
+
+def test_gev_link_vector_xi_forward_and_grad():
+    """Vector xi via a vector surrogate u: the composition pattern works
+    identically, with elementwise broadcast against scalar z."""
+    xi = pt.dvector("xi")
+    z = pt.dscalar("z")
+    f = _gev_link_pt(xi, z)
+    fn = pytensor.function([xi, z], f)
+    xi_vals = np.array([0.0, 1e-12, 0.1, 0.5, -0.3])
+    z_v = 0.5
+    out = fn(xi_vals, z_v)
+    expected = np.array([_gev_link_mp(float(v), z_v) for v in xi_vals])
+    np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-15)
+
+    # Gradient w.r.t. xi (elementwise).
+    df_dxi = pt.grad(f.sum(), xi)
+    fn_g = pytensor.function([xi, z], df_dxi)
+    out_g = fn_g(xi_vals, z_v)
+    # At xi=0 and xi=1e-12: limit is z^2/2 * exp(-z).
+    limit = 0.5 * z_v**2 * math.exp(-z_v)
+    assert math.isclose(out_g[0], limit, rel_tol=1e-12)
+    assert math.isclose(out_g[1], limit, rel_tol=1e-9)
+    # Away from zero, gradient is finite and non-NaN.
+    assert np.all(np.isfinite(out_g))
+
+
+def test_gev_link_zero_z_returns_one():
+    """At z=0 the function is identically 1 regardless of xi (including
+    xi=0, where the limit calculation is non-trivial)."""
+    xi = pt.dscalar("xi")
+    z = pt.dscalar("z")
+    f = _gev_link_pt(xi, z)
+    fn = pytensor.function([xi, z], f)
+    for xi_v in (0.0, 1e-10, 0.1, -0.3, 0.5):
+        assert math.isclose(float(fn(xi_v, 0.0)), 1.0, abs_tol=1e-15)
+
+
 if __name__ == "__main__":
     import sys
 

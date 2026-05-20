@@ -101,6 +101,114 @@ stable_smooth(f, x, a, denominator_degree=k, ...) \
 
 No dedicated ratio primitive needed.
 
+## Multivariate singularities via derived-expression composition
+
+`stable_smooth` builds a Taylor expansion in a single scalar/vector
+variable.  Higher-arity functions with a singularity in one direction
+can often be reduced to that univariate form by *factoring*: identify
+a univariate `h(u)` carrying the singularity, build it with a fresh
+leaf, then `clone_replace` the leaf with the user's derived expression
+at the call site.
+
+### Worked example: `(1 + ξ·z)^(−1/ξ)`
+
+This is the GEV-style link from extreme value theory.  Domain is
+`1 + ξ·z > 0` for all real `ξ`.  At `ξ = 0` the value is
+`exp(−z)` (Gumbel limit) — `1^∞` indeterminate if evaluated directly.
+
+Decomposition:
+
+```
+f(ξ, z)  =  exp( −log(1 + ξ·z) / ξ )
+         =  exp( −z · log1p(ξ·z) / (ξ·z) )
+         =  exp( −z · h(ξ·z) ),    where  h(u) = log1p(u) / u.
+```
+
+`h(u)` is a univariate smooth-but-singular function (the familiar
+`log1p/x` case from this design's user story).  `stable_smooth` gives
+a stable `h` directly:
+
+```python
+import pytensor.tensor as pt
+from pytensor.graph.replace import clone_replace
+from taylor_remainder import stable_smooth
+
+xi = pt.dscalar("xi")
+z  = pt.dscalar("z")
+
+# Build h(u) = log1p(u)/u once over a leaf u.
+u = pt.dscalar("u")
+h_at_u = stable_smooth(pt.log1p(u), u, 0.0, denominator_degree=1)
+
+# Substitute u → ξ·z.  clone_replace just retargets the OpFromGraph's
+# call site; the OFG itself (and its pullback) is unchanged.
+h_at_xz = clone_replace(h_at_u, {u: xi * z})
+
+f = pt.exp(-z * h_at_xz)
+```
+
+Why this is enough.  `pt.grad(f, ξ)` and `pt.grad(f, z)` both go
+through `h_at_u`'s OpFromGraph pullback.  The pullback returns the
+derivative w.r.t. `h`'s inner input only; pytensor's outer chain rule
+multiplies by `d(ξ·z)/dξ = z` (or `d(ξ·z)/dz = ξ`) to recover the
+gradient w.r.t. ξ or z.  No specialized bivariate machinery needed.
+The pullback at `ξ = 0` is correct because the inner gradient of
+`h(u)` is itself a `stable_smooth` (closed under `pt.grad`), so the
+limit at `u = 0` is computed via the polynomial branch -- not by
+attempting `log1p/u` directly.
+
+Vectorized variant: build `h` over a vector leaf and the substitution
+broadcasts the same way.  For `ξ` a vector and `z` a scalar:
+
+```python
+xi_v = pt.dvector("xi")
+z    = pt.dscalar("z")
+u_v  = pt.dvector("u")
+h_v  = stable_smooth(pt.log1p(u_v), u_v, 0.0, denominator_degree=1)
+f_v  = pt.exp(-z * clone_replace(h_v, {u_v: xi_v * z}))
+```
+
+### When the pattern applies (and doesn't)
+
+The composition reduces `g(ξ, z, ...)` to `g(u, z, ...) = ... h(u) ...`
+with `u = derived_expression(ξ, z, ...)`.  Two requirements:
+
+1. **`g` factors through `u`.**  All the "tricky" `ξ` (or `z`)
+   dependence must enter `g` through `u`.  The "outer" arithmetic
+   wrapping `h(u)` -- e.g. the `exp(−z · ...)` in the GEV case -- is
+   free to depend on the other variables; it stays in the outer graph
+   and inherits stability from `h(u)`'s polynomial branch.
+
+   Counterexample: `h(ξ·z) + ξ²` doesn't factor through `u = ξ·z`
+   alone -- the `ξ²` term keeps an independent `ξ` dependence that
+   breaks the substitution trick.  For such hybrids, you'd build the
+   stable part as above and add the residual outside.
+
+2. **The constant term vanishes at `u = a`** (the usual
+   `denominator_degree` precondition).  In the GEV case `log1p(u)`
+   vanishes at `u = 0` so `denominator_degree=1` is well-posed for any
+   `(ξ, z)`.  An expression like `h(ξ·z) = (ξ·z + ξ²) / (ξ·z)` would
+   need a different decomposition -- the numerator only vanishes at
+   `u = 0` when `ξ = 0`, not for arbitrary `(ξ, z)`.
+
+### Why we don't extend `stable_smooth` to accept derived `x`
+
+A tempting alternative is:
+
+```python
+stable_smooth(pt.log1p(xi * z), xi * z, 0.0, denominator_degree=1)
+```
+
+That would require `stable_smooth` to (a) detect that `xi * z` is
+derived, (b) build an internal leaf surrogate, (c) substitute the
+derived subgraph into the result.  Step (b) duplicates work that
+`clone_replace` already does cleanly, and step (a) makes the API
+fragile: the user would have to remember which subgraph they
+considered "the expansion variable" when the numerator references it
+multiple times.  The explicit-leaf pattern documented above makes the
+factoring visible at the call site, which is also the place a future
+reader has to understand to maintain the code.
+
 ## Order growth: minimum sufficient, lazy
 
 **Anti-pattern (was tempted):** eager + generous, e.g.
