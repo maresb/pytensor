@@ -89,6 +89,36 @@ criteria → where in the code to start → testing strategy.
 Order them however makes sense given your investigation; the dependency
 graph is essentially flat (none of the three blocks the others).
 
+### Status
+
+- **Task A (perf cliff):** open.  The real fix lives in
+  `pytensor/compile/builders.py` (out of scope per "Cross-cutting > Out
+  of scope" below); the doc's "non-pytensor fallback" wouldn't actually
+  fix the cliff -- just bound it -- so nothing landed.  Reproducer in
+  /tmp/probe_depth5.py at depth 5 timed out at >180 s, consistent with
+  the symptom.
+- **Task B (vector input):** done.
+  `stable_smooth` now accepts elementwise vector `x`.  The earlier
+  scalar-only `NotImplementedError` test
+  (`test_stable_smooth_vector_input_raises_helpful_error`) was flipped
+  into a positive forward test, and seven more vector tests cover the
+  grad chain, n=2, nonzero-`a`, float32, depth-2 grads, and documented
+  non-elementwise misuse.  The plan's `clone_replace(numerator, {x:
+  x_s})` step doesn't actually work in pytensor (the type filter
+  rejects vector→scalar substitution), so the implementation uses a
+  custom `_scalarize_elementwise` graph walker + `pt.squeeze` to
+  produce the scalar surrogate.  `cache=` cross-call sharing is still
+  scalar-only -- locked in by `test_stable_smooth_vector_input_cache_raises`
+  -- because a vector user can't easily produce a scalar-surrogate
+  cache that the validator would accept.
+- **Task C (cross-call cache):** done.
+  `stable_smooth(..., cache=TaylorAtPoint(...))` shares a single
+  coefficient chain across `denominator_degree`s.  Validator rejects
+  `(x, a, numerator)` mismatches: identity check on `x`, value check
+  on `a`, structural equality (`equal_computations`) on the numerator
+  so users can naturally rebuild the same expression without threading
+  the same TensorVariable through every call.
+
 ---
 
 ## Task A.  Fix the depth-5 first-eval cliff (dedup op cascade)
