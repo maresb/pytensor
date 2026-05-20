@@ -963,6 +963,111 @@ def test_stable_smooth_sinc_grad_at_nonzero_points():
         )
 
 
+# ------------ stable_smooth shared cache (Task C) ------------------------
+
+
+def test_stable_smooth_shared_cache_matches_independent_results():
+    """Numeric forward output is identical whether stable_smooth builds its
+    own TaylorAtPoint cache or the user supplies one."""
+    from taylor_remainder import TaylorAtPoint, stable_smooth
+
+    x = pt.dscalar("x")
+    sin_x = pt.sin(x)
+    cache = TaylorAtPoint(sin_x, x, 0.0)
+
+    sinc_shared = stable_smooth(sin_x, x, 0.0, denominator_degree=1, cache=cache)
+    sinc_indep = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    fn_shared = pytensor.function([x], sinc_shared)
+    fn_indep = pytensor.function([x], sinc_indep)
+    for t in (0.0, 1e-12, 1e-8, 0.5, 1.7, -0.3):
+        assert float(fn_shared(t)) == float(fn_indep(t))
+
+    # And the cache works across different denominator_degrees too.
+    sin_minus_x = pt.sin(x) - x
+    cache2 = TaylorAtPoint(sin_minus_x, x, 0.0)
+    r3 = stable_smooth(sin_minus_x, x, 0.0, denominator_degree=3, cache=cache2)
+    fn3 = pytensor.function([x], r3)
+    # (sin t - t)/t^3 = -1/6 + t^2/120 - ...; at t=0 the limit is -1/6.
+    assert math.isclose(float(fn3(0.0)), -1.0 / 6.0, abs_tol=1e-15)
+
+
+def test_stable_smooth_shared_cache_reduces_grad_calls():
+    """The whole point of the shared-cache path: when two stable_smooth
+    calls share a cache, the pt.grad-driven coefficient chain runs once
+    instead of twice. Verify by counting calls to taylor_remainder.pt.grad
+    (which TaylorAtPoint.deriv goes through) during construction."""
+    from taylor_remainder import TaylorAtPoint, stable_smooth
+    import taylor_remainder as _tr
+
+    counter = [0]
+    orig_grad = _tr.pt.grad
+
+    def counting_grad(*args, **kwargs):
+        counter[0] += 1
+        return orig_grad(*args, **kwargs)
+
+    _tr.pt.grad = counting_grad
+    try:
+        x = pt.dscalar("x")
+        sin_x = pt.sin(x)
+        counter[0] = 0
+        stable_smooth(sin_x, x, 0.0, denominator_degree=1)
+        stable_smooth(sin_x, x, 0.0, denominator_degree=2)
+        independent_count = counter[0]
+
+        x = pt.dscalar("x")
+        sin_x = pt.sin(x)
+        counter[0] = 0
+        cache = TaylorAtPoint(sin_x, x, 0.0)
+        stable_smooth(sin_x, x, 0.0, denominator_degree=1, cache=cache)
+        stable_smooth(sin_x, x, 0.0, denominator_degree=2, cache=cache)
+        shared_count = counter[0]
+    finally:
+        _tr.pt.grad = orig_grad
+
+    assert shared_count < independent_count, (
+        f"shared cache did not reduce pt.grad work: "
+        f"shared={shared_count}, independent={independent_count}"
+    )
+
+
+def test_stable_smooth_cache_x_mismatch_raises():
+    """Supplying a cache built over a different `x` variable is a silent
+    correctness hazard, so we reject it loudly."""
+    from taylor_remainder import TaylorAtPoint, stable_smooth
+
+    x = pt.dscalar("x")
+    y = pt.dscalar("y")
+    cache = TaylorAtPoint(pt.sin(x), x, 0.0)
+    with pytest.raises(ValueError, match="cache.x is not the same variable"):
+        stable_smooth(pt.sin(x), y, 0.0, denominator_degree=1, cache=cache)
+
+
+def test_stable_smooth_cache_a_mismatch_raises():
+    """Supplying a cache built at a different expansion point is rejected."""
+    from taylor_remainder import TaylorAtPoint, stable_smooth
+
+    x = pt.dscalar("x")
+    cache = TaylorAtPoint(pt.sin(x), x, 0.0)
+    with pytest.raises(ValueError, match="cache.a"):
+        stable_smooth(pt.sin(x), x, 1.0, denominator_degree=1, cache=cache)
+
+
+def test_stable_smooth_cache_numerator_mismatch_raises():
+    """Supplying a cache built over a structurally-different numerator is
+    rejected. Two pt.sin(x) calls produce distinct objects but structurally
+    match -- only a genuinely different graph should error."""
+    from taylor_remainder import TaylorAtPoint, stable_smooth
+
+    x = pt.dscalar("x")
+    sin_cache = TaylorAtPoint(pt.sin(x), x, 0.0)
+    # cos vs sin: real structural mismatch.
+    with pytest.raises(ValueError, match="not structurally equal"):
+        stable_smooth(pt.cos(x), x, 0.0, denominator_degree=1, cache=sin_cache)
+    # Same expression rebuilt: equal_computations should accept it.
+    stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1, cache=sin_cache)
+
+
 if __name__ == "__main__":
     import sys
 

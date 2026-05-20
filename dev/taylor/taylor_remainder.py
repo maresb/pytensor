@@ -131,6 +131,7 @@ import numpy as np
 import pytensor
 import pytensor.tensor as pt
 from pytensor.compile.builders import OpFromGraph
+from pytensor.graph.basic import equal_computations
 from pytensor.graph.replace import clone_replace
 from pytensor.graph.rewriting.utils import rewrite_graph
 
@@ -953,6 +954,41 @@ def taylor_remainder_poly(f, x, a, n, *, order=10, cache=None):
     return sum(coeffs[n + k] * t**k for k in range(order))
 
 
+def _validate_user_cache(cache, numerator, x, a):
+    """Reject a `stable_smooth(..., cache=...)` whose cache wasn't built
+    over the same `(numerator, x, a)`.
+
+    Three guards, in order of specificity:
+      - `cache.x is x`: identity check.  Looser equality (same dtype/shape)
+        isn't enough -- the cache memoizes `pt.grad(f, x)` chains keyed on
+        the actual `x` object, so a different variable would silently mean
+        a different computation.
+      - `cache.a == a`: numeric check.  `a` is a Python float, so `==`
+        does what you'd expect.
+      - `equal_computations([cache.f], [numerator])`: structural check on
+        the numerator graph.  Users will naturally rebuild the same
+        expression (e.g. two `pt.sin(x)` calls produce two distinct
+        TensorVariables); identity would reject that, so we compare
+        structures instead.
+    """
+    if cache.x is not x:
+        raise ValueError(
+            "stable_smooth: cache.x is not the same variable as x "
+            f"(cache.x={cache.x!r}, x={x!r}).  Build the cache with "
+            "TaylorAtPoint(numerator, x, a) using the exact `x` you pass "
+            "to stable_smooth."
+        )
+    if cache.a != a:
+        raise ValueError(
+            f"stable_smooth: cache.a={cache.a!r} differs from a={a!r}."
+        )
+    if not equal_computations([cache.f], [numerator]):
+        raise ValueError(
+            "stable_smooth: cache.f and numerator are not structurally "
+            "equal graphs.  The cache was built for a different function."
+        )
+
+
 def stable_smooth(
     numerator,
     x,
@@ -962,6 +998,7 @@ def stable_smooth(
     cancellation_order=0,
     dtype=None,
     inline=False,
+    cache=None,
     _coefficients=None,
     _orphan_substitutions=None,
 ):
@@ -1021,6 +1058,24 @@ def stable_smooth(
         compile but zero per-call overhead. Prefer `True` if you'll
         evaluate the resulting graph many times (training loops); the
         default `False` is right for one-shot or test usage.
+    cache : TaylorAtPoint, optional
+        Pre-built coefficient cache, shared across multiple `stable_smooth`
+        calls with the same `(numerator, x, a)`. When passed, the
+        `pt.grad`-driven coefficient chain runs once instead of once per
+        call. Useful when constructing several smooth functions from the
+        same numerator at different `denominator_degree`:
+
+        ```python
+        sin_x = pt.sin(x)
+        cache = TaylorAtPoint(sin_x, x, 0.0)
+        s1 = stable_smooth(sin_x, x, 0.0, denominator_degree=1, cache=cache)
+        s2 = stable_smooth(sin_x, x, 0.0, denominator_degree=2, cache=cache)
+        ```
+
+        The cache must have been built over the same `x` (identity), the
+        same `a` (value), and a structurally-equal `numerator` graph.
+        Mismatches raise `ValueError` so silent reuse of a stale cache
+        across mathematically-different functions is impossible.
     _coefficients : iterable, optional
         Internal: used by the pullback to supply the child's coefficients
         analytically from the parent's cache (see (*)), bypassing the
@@ -1063,6 +1118,18 @@ def stable_smooth(
         # grad chain's `n - 1 = -1` recursion.
         return numerator
 
+    if cache is not None and _coefficients is not None:
+        # `_coefficients` is the pullback's analytic-cache pipeline and
+        # `cache` is the user's pre-built memoization handle. They're
+        # mutually exclusive: either we use the user's `(f, x, a)` cache,
+        # or we manufacture a child cache from supplied numerics.
+        raise ValueError(
+            "stable_smooth: cache= and _coefficients= cannot both be set "
+            "(the latter is internal-only)."
+        )
+    if cache is not None:
+        _validate_user_cache(cache, numerator, x, a)
+
     # TaylorAtPoint's pt.grad-based derivation assumes scalar f(x), and
     # value_at_a substitutes x -> scalar a -- vector x would fail the
     # type check downstream with an opaque "Cannot convert Scalar into
@@ -1086,13 +1153,28 @@ def stable_smooth(
         substituted = numerator
     inner_numerator = clone_replace(substituted, {x: inner_x})
 
-    if _coefficients is not None:
-        cache = TaylorAtPoint(inner_numerator, inner_x, a, coefficients=_coefficients)
+    # Pick the active cache:
+    #   - User-supplied: reuse for cross-call memoization (Task C in the
+    #     follow-up doc).  Its `f`/`x` reference the user's variables, not
+    #     `inner_numerator`/`inner_x`; that's fine because the cache only
+    #     surfaces numerics (`numeric_coeff`) and `pt.constant`s (via
+    #     `coeffs_of_deriv`), both of which carry no symbolic dependency
+    #     on `cache.x` into the OpFromGraph's inner graph.
+    #   - Explicit coefficients: pullback's analytic pipeline; build over
+    #     `inner_numerator`/`inner_x` (decorative; the cache's `x` is
+    #     only consulted for its dtype in this mode).
+    #   - Otherwise: fresh auto-mode cache over `inner_numerator`/`inner_x`.
+    if cache is not None:
+        active_cache = cache
+    elif _coefficients is not None:
+        active_cache = TaylorAtPoint(
+            inner_numerator, inner_x, a, coefficients=_coefficients
+        )
     else:
-        cache = TaylorAtPoint(inner_numerator, inner_x, a)
+        active_cache = TaylorAtPoint(inner_numerator, inner_x, a)
 
     order, eps = _min_order_and_eps(
-        cache,
+        active_cache,
         n,
         dtype=dtype,
         cancellation_order=cancellation_order,
@@ -1105,7 +1187,7 @@ def stable_smooth(
         order=order,
         eps=eps,
         dtype=dtype,
-        cache=cache,
+        cache=active_cache,
     )
 
     # Closure captures for pullback.
@@ -1114,7 +1196,7 @@ def stable_smooth(
     a_captured = a
     dtype_captured = dtype
     inline_captured = inline
-    parent_cache = cache
+    parent_cache = active_cache
 
     def pullback(inputs, outputs, cotangents):
         (xi,) = inputs  # nominal inner input (orphan TensorVariable)
