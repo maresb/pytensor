@@ -889,6 +889,27 @@ def test_stable_smooth_n2_cancellation_order_2_matches_sinc_prime():
         )
 
 
+def test_stable_smooth_n0_is_passthrough():
+    """denominator_degree=0 returns the numerator directly (no
+    OpFromGraph wrap). R_0(f) = f, so there's nothing to stabilize."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    f = pt.sin(x)
+    result = stable_smooth(f, x, 0.0, denominator_degree=0)
+    # Pass-through: same object back.
+    assert result is f
+
+
+def test_stable_smooth_negative_n_raises():
+    """Negative denominator_degree is invalid."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    with pytest.raises(ValueError, match="non-negative"):
+        stable_smooth(pt.sin(x), x, 0.0, denominator_degree=-1)
+
+
 def test_stable_smooth_vector_input_raises_helpful_error():
     """Vector inputs aren't supported: TaylorAtPoint's deriv() uses
     pt.grad(f, x) which assumes scalar f, and value_at_a substitutes
