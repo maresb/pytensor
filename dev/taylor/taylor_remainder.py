@@ -961,6 +961,7 @@ def stable_smooth(
     denominator_degree,
     cancellation_order=0,
     dtype=None,
+    inline=False,
     _coefficients=None,
     _orphan_substitutions=None,
 ):
@@ -1011,6 +1012,15 @@ def stable_smooth(
     dtype : dtype, optional
         Override for the dtype used to size auto-chosen `eps`. Defaults
         to `x.dtype`.
+    inline : bool, default False
+        Whether the OpFromGraph's inner graph is inlined at
+        `pytensor.function` compile time. `False` keeps each level a
+        separately-compiled inner function -- faster `pytensor.function`
+        build but slower first eval (each level's `_fn` compiles lazily
+        on first call). `True` inlines everything upfront -- slower
+        compile but zero per-call overhead. Prefer `True` if you'll
+        evaluate the resulting graph many times (training loops); the
+        default `False` is right for one-shot or test usage.
     _coefficients : iterable, optional
         Internal: used by the pullback to supply the child's coefficients
         analytically from the parent's cache (see (*)), bypassing the
@@ -1030,12 +1040,18 @@ def stable_smooth(
 
     Performance note
     ----------------
-    Compile time of the grad chain grows roughly 6x per derivative
-    level beyond depth ~4 (e.g. depth 5 ~30s on a typical machine,
-    depth 6 hundreds of seconds).  Once compiled, evaluation is fast.
+    With the default ``inline=False``, each level's inner function
+    compiles lazily on first eval. At depth 5, that lazy compile takes
+    ~30s (subsequent evals are then sub-second). Building
+    `pytensor.function` itself is fast (~1s) regardless of depth.
+
+    Passing ``inline=True`` shifts cost: `pytensor.function` takes
+    ~50s at depth 5, but evaluation is essentially free. Use
+    ``inline=True`` when you'll call the function many times after
+    compile.
+
     For depths ≥ ~6, prefer `taylor_remainder_poly` if `(x-a)` stays
-    bounded -- pure polynomial chain rule scales linearly.  Profiling
-    the cascade is tracked as follow-up.
+    bounded -- pure polynomial chain rule scales linearly.
     """
     n = denominator_degree
     if n < 0:
@@ -1097,6 +1113,7 @@ def stable_smooth(
     c_captured = cancellation_order
     a_captured = a
     dtype_captured = dtype
+    inline_captured = inline
     parent_cache = cache
 
     def pullback(inputs, outputs, cotangents):
@@ -1135,6 +1152,7 @@ def stable_smooth(
                 denominator_degree=n_captured - 1,
                 cancellation_order=c_captured,
                 dtype=dtype_captured,
+                inline=inline_captured,
                 _coefficients=f_prime_coeffs(),
             )
             bracket = R_n_minus_1_f_prime - n_captured * R_orphan
@@ -1158,12 +1176,13 @@ def stable_smooth(
             # precision; new contract is parent's c + 1.
             cancellation_order=c_captured + 1,
             dtype=dtype_captured,
+            inline=inline_captured,
             _coefficients=bracket_coeffs(),
             _orphan_substitutions={R_orphan: op(xi)},
         )
         return [g * deriv]
 
-    op = OpFromGraph([inner_x], [inner_remainder], pullback=pullback)
+    op = OpFromGraph([inner_x], [inner_remainder], pullback=pullback, inline=inline)
     return op(x)
 
 

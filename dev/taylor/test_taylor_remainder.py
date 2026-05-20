@@ -889,6 +889,29 @@ def test_stable_smooth_n2_cancellation_order_2_matches_sinc_prime():
         )
 
 
+def test_stable_smooth_inline_true_gives_same_result():
+    """inline=True moves compile cost from first-eval to pytensor.function
+    but should produce the same numerical result as inline=False."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    sinc_default = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    sinc_inline = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1, inline=True)
+    fn_d = pytensor.function([x], sinc_default)
+    fn_i = pytensor.function([x], sinc_inline)
+    for t in (0.0, 0.1, 0.5, 1.0):
+        v_d, v_i = float(fn_d(t)), float(fn_i(t))
+        assert math.isclose(v_d, v_i, rel_tol=1e-14, abs_tol=1e-15), (
+            f"t={t}: default={v_d}, inline={v_i}"
+        )
+    # Same with one grad: inline propagates through pullback's recursive call.
+    fn_grad_d = pytensor.function([x], pt.grad(sinc_default, x))
+    fn_grad_i = pytensor.function([x], pt.grad(sinc_inline, x))
+    for t in (0.0, 0.1, 0.5):
+        v_d, v_i = float(fn_grad_d(t)), float(fn_grad_i(t))
+        assert math.isclose(v_d, v_i, rel_tol=1e-14, abs_tol=1e-15)
+
+
 def test_stable_smooth_n0_is_passthrough():
     """denominator_degree=0 returns the numerator directly (no
     OpFromGraph wrap). R_0(f) = f, so there's nothing to stabilize."""

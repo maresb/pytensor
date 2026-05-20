@@ -204,17 +204,26 @@ actual vector `x` at evaluation time. Out of scope for now.
 
 ## Performance
 
-Each derivative level in the grad chain creates a fresh OpFromGraph
-(the child of the parent's pullback). Pytensor's graph rewriting then
-clones these instances; each clone has an empty `_fn` cache and gets
-compiled separately. At depth 4 we have ~400 unique compiled
-inner-functions. Compile time grows roughly 6× per level past depth ~4.
+Each grad in the chain creates O(level) new OpFromGraph instances.
+Construction itself is fast (~21 instances at depth 5; 12s at depth 4
+during initial profile; 1.5s at depth 5 via `pytensor.function`).
 
-This is a pytensor-level issue (the rewriter doesn't dedup `_fn`
-across structurally equivalent clones). Fix lives in pytensor, not in
-`stable_smooth`. For depth > ~5 in the meantime, use
-`taylor_remainder_poly` if the input range stays bounded -- pure
-polynomial chain rule scales linearly.
+The slow part is what happens on the first `fn(...)` call.  With the
+default `inline=False`, each OpFromGraph's `_fn` (inner-function) is
+compiled lazily on first call.  At depth 5 those lazy compiles
+collectively cost ~30s.  Subsequent evals are ~0.1s.
+
+Passing `inline=True` shifts the cost: the inner graphs are inlined
+into the outer function during `pytensor.function` build (~50s at
+depth 5), so first-eval and steady-state are essentially free.
+Pytensor's graph rewriter does clone inner ops during the inline pass
+(21 ops at construct time → 1077 unique ops after canonicalize at
+depth 5), but the cost is paid once.
+
+Pick `inline=True` for training loops or anything that calls the
+compiled function many times.  Pick the default `inline=False` for
+one-shot use or tests.  For depth ≥ ~6, `taylor_remainder_poly` is
+still the simpler escape hatch when the input range stays bounded.
 
 ## Consistency checks (cosmetic, not enforced)
 
