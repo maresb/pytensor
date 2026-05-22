@@ -560,10 +560,9 @@ def test_stable_smooth_sinc_iterated_grad_at_zero():
     """sinc^(k)(0) for k = 0, 1, 2, 3, 4.  Reference values come from the
     closed form  sinc^(k)(0) = (-1)^(k/2) / (k+1) for even k, 0 for odd k.
     The grad chain via pullback constructs another stable_smooth at each
-    grad. (Depth is capped here because each pullback's pt.grad through
-    the embedded op() calls cascades op construction, so compile time
-    grows ~6x per level beyond k=4.  Deduplicating the op cascade is
-    follow-up work.)"""
+    grad; correctness across the chain is the point here.  Pure perf at
+    higher depths is covered separately by
+    test_stable_smooth_depth5_under_wallclock_budget."""
     from taylor_remainder import stable_smooth
 
     x = pt.dscalar("x")

@@ -83,12 +83,15 @@ operations on `f`'s derivatives.
   `stable_smooth(f', x, a, denominator_degree=n−1)` to express
   `R_{n−1}(f')`; the bracket's `j·c_{j+n}^f` coefficient formula is
   `n`-independent so it carries through unchanged.
-- Grad chain works correctly through depth ~5 in float64. Beyond that,
-  the inner `pt.grad` across embedded `op(...)` apply nodes cascades:
-  every existing op in `inner_numerator` gets a fresh child constructed,
-  so compile time grows roughly 6× per level. A dedup pass that reuses
-  the already-constructed child instead of building a new one would
-  cap growth to linear. (Tracked as follow-up.)
+- Grad chain works correctly through at least depth 5 in float64 and
+  stays under a ~30 s wall-clock budget (locked in by
+  `test_stable_smooth_depth5_under_wallclock_budget`).  The earlier
+  "compile time grows ~6× per level beyond k=4" symptom was the
+  inline=False lazy-compile cascade; flipping the default to
+  inline=True (after the upstream OFG-cloning fixes) made the cost
+  effectively per-graph rather than per-clone, so deeper depths are
+  bounded by the inliner's work rather than the per-OFG `_fn` rebuild.
+  See `Performance` below for the measured numbers.
 
 ## General `f / g` via composition
 
