@@ -136,9 +136,6 @@ from pytensor.graph.replace import clone_replace
 from pytensor.graph.rewriting.utils import rewrite_graph
 
 
-pytensor.config.on_opt_error = "ignore"
-
-
 class TaylorRemainderUnderflowWarning(UserWarning):
     """The leading Taylor coefficient is small enough that the closed branch
     of taylor_remainder may underflow within the polynomial-branch window."""
