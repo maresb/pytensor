@@ -327,25 +327,39 @@ vector `x`); cross-call memoization with vector inputs is future work.
 ## Performance
 
 Each grad in the chain creates O(level) new OpFromGraph instances.
-Construction itself is fast (~21 instances at depth 5; 12s at depth 4
-during initial profile; 1.5s at depth 5 via `pytensor.function`).
+Construction is fast (~21 instances at depth 5).  The interesting
+question is what happens between `pytensor.function([x], cur)` and
+the first `fn(...)` call.
 
-The slow part is what happens on the first `fn(...)` call.  With the
-default `inline=False`, each OpFromGraph's `_fn` (inner-function) is
-compiled lazily on first call.  At depth 5 those lazy compiles
-collectively cost ~30s.  Subsequent evals are ~0.1s.
+The `inline` knob picks between two compile paths:
 
-Passing `inline=True` shifts the cost: the inner graphs are inlined
-into the outer function during `pytensor.function` build (~50s at
-depth 5), so first-eval and steady-state are essentially free.
-Pytensor's graph rewriter does clone inner ops during the inline pass
-(21 ops at construct time → 1077 unique ops after canonicalize at
-depth 5), but the cost is paid once.
+- **`inline=True` (default).**  Every level's inner graph is inlined
+  into the outer function during compile.  No OFGs survive into the
+  compiled callable, so first-eval and steady-state evals are both
+  essentially free.
+- **`inline=False`.**  Each level is kept as a `OpFromGraph` whose
+  `_fn` is compiled lazily on its first call.  In a deep chain that
+  means O(N) lazy `pytensor.function` invocations on the first
+  `fn(...)` — historically the "depth-5 first-eval cliff."
 
-Pick `inline=True` for training loops or anything that calls the
-compiled function many times.  Pick the default `inline=False` for
-one-shot use or tests.  For depth ≥ ~6, `taylor_remainder_poly` is
-still the simpler escape hatch when the input range stays bounded.
+Measured for sinc at the indicated depth on the current pytensor:
+
+| depth | inline | build | `pytensor.function` | first eval | total |
+|------:|:-----:|------:|--------------------:|-----------:|------:|
+| 3     | True  | 0.2 s | 0.3 s               | ~0 s       | 0.6 s |
+| 3     | False | 0.6 s | 0.1 s               | 1.5 s      | 2.1 s |
+| 5     | True  | 1.2 s | 6.4 s               | ~0 s       | 7.7 s |
+| 5     | False | 1.5 s | 5.8 s               | 108 s      | 115 s |
+
+`inline=True` was historically the slower choice because the
+inliner cloned both inner and outer inputs repeatedly through
+`canonicalize`; the upstream cluster of OFG-cloning fixes
+(`6458acc`, `b39fced`, `a11a9b1`, `a821179`, `7821c7e`) landed
+shortly after rel-3.0.0 and made it the strictly faster path.  The
+default flipped accordingly.
+
+For depth ≥ ~6, `taylor_remainder_poly` is still the simpler escape
+hatch when the input range stays bounded.
 
 ## Consistency checks (cosmetic, not enforced)
 

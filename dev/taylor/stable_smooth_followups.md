@@ -91,14 +91,18 @@ graph is essentially flat (none of the three blocks the others).
 
 ### Status
 
-- **Task A (perf cliff):** open.  The real fix lives in
-  `pytensor/compile/builders.py` (out of scope per "Cross-cutting > Out
-  of scope" below); the doc's "non-pytensor fallback" wouldn't actually
-  fix the cliff -- just bound it -- so nothing landed.  Reproducer in
-  /tmp/probe_depth5.py at depth 5 timed out at >180 s, consistent with
-  the symptom.
+- **Task A (perf cliff):** done, via an upstream pytensor fix +
+  default-flip on our side.  The cluster of OFG-cloning commits
+  (`6458acc`, `b39fced`, `a11a9b1`, `a821179`, `7821c7e`) that landed
+  shortly after `rel-3.0.0` reduced inline-time cloning to the point
+  where `inline=True` is the strictly faster path at every depth
+  measured.  The `stable_smooth` default flipped from `inline=False`
+  to `inline=True`; depth-5 sinc now goes from build to second eval in
+  ~10 s total (was >2 min on the same configuration before the
+  upstream fixes).  Locked in by
+  `test_stable_smooth_depth5_under_wallclock_budget` with a 30 s budget.
 - **Task B (vector input):** done.
-  `stable_smooth` now accepts elementwise vector `x`.  The earlier
+  `stable_smooth` accepts elementwise vector `x`.  The earlier
   scalar-only `NotImplementedError` test
   (`test_stable_smooth_vector_input_raises_helpful_error`) was flipped
   into a positive forward test, and seven more vector tests cover the
@@ -118,6 +122,10 @@ graph is essentially flat (none of the three blocks the others).
   on `a`, structural equality (`equal_computations`) on the numerator
   so users can naturally rebuild the same expression without threading
   the same TensorVariable through every call.
+
+The Task A, B, and C sections below are kept for historical context --
+they're the briefing that the prior agent ran against and capture the
+reasoning that landed each fix.
 
 ---
 

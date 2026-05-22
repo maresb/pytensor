@@ -889,27 +889,61 @@ def test_stable_smooth_n2_cancellation_order_2_matches_sinc_prime():
         )
 
 
-def test_stable_smooth_inline_true_gives_same_result():
-    """inline=True moves compile cost from first-eval to pytensor.function
-    but should produce the same numerical result as inline=False."""
+def test_stable_smooth_inline_paths_agree_numerically():
+    """inline=True (the default) and inline=False compile via different
+    paths -- inlined-at-build-time vs lazy-per-OFG -- and the perf
+    profile is very different, but the numerical output must be
+    identical."""
     from taylor_remainder import stable_smooth
 
     x = pt.dscalar("x")
-    sinc_default = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
     sinc_inline = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1, inline=True)
-    fn_d = pytensor.function([x], sinc_default)
+    sinc_lazy = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1, inline=False)
     fn_i = pytensor.function([x], sinc_inline)
+    fn_l = pytensor.function([x], sinc_lazy)
     for t in (0.0, 0.1, 0.5, 1.0):
-        v_d, v_i = float(fn_d(t)), float(fn_i(t))
-        assert math.isclose(v_d, v_i, rel_tol=1e-14, abs_tol=1e-15), (
-            f"t={t}: default={v_d}, inline={v_i}"
+        v_i, v_l = float(fn_i(t)), float(fn_l(t))
+        assert math.isclose(v_i, v_l, rel_tol=1e-14, abs_tol=1e-15), (
+            f"t={t}: inline={v_i}, lazy={v_l}"
         )
     # Same with one grad: inline propagates through pullback's recursive call.
-    fn_grad_d = pytensor.function([x], pt.grad(sinc_default, x))
-    fn_grad_i = pytensor.function([x], pt.grad(sinc_inline, x))
+    fn_gi = pytensor.function([x], pt.grad(sinc_inline, x))
+    fn_gl = pytensor.function([x], pt.grad(sinc_lazy, x))
     for t in (0.0, 0.1, 0.5):
-        v_d, v_i = float(fn_grad_d(t)), float(fn_grad_i(t))
-        assert math.isclose(v_d, v_i, rel_tol=1e-14, abs_tol=1e-15)
+        v_i, v_l = float(fn_gi(t)), float(fn_gl(t))
+        assert math.isclose(v_i, v_l, rel_tol=1e-14, abs_tol=1e-15)
+
+
+def test_stable_smooth_depth5_under_wallclock_budget():
+    """Regression test for the depth-5 first-eval cliff (Task A in the
+    follow-ups doc).  With the default inline=True and the upstream
+    OFG-cloning fixes in place, build + function() + first eval +
+    second eval for sinc grad-chain depth 5 should stay well under
+    30 wall-clock seconds on any reasonable CI host.  Pre-fix this
+    same configuration was >2 minutes.
+
+    The budget is intentionally generous (3x typical local runtime,
+    ~4x CI runtime) so the test catches a clear regression rather
+    than flapping on minor perf jitter."""
+    import time
+
+    from taylor_remainder import stable_smooth
+
+    t0 = time.perf_counter()
+    x = pt.dscalar("x")
+    cur = stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
+    for _ in range(5):
+        cur = pt.grad(cur, x)
+    fn = pytensor.function([x], cur)
+    fn(0.0)
+    fn(0.0)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 30.0, (
+        f"depth-5 first-eval budget exceeded: {elapsed:.1f}s > 30.0s. "
+        f"This is the cliff Task A in dev/taylor/stable_smooth_followups.md "
+        f"was meant to prevent regressing -- check whether OFG cloning "
+        f"behavior in pytensor.compile.builders changed."
+    )
 
 
 def test_stable_smooth_n0_is_passthrough():

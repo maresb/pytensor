@@ -1033,7 +1033,7 @@ def stable_smooth(
     denominator_degree,
     cancellation_order=0,
     dtype=None,
-    inline=False,
+    inline=True,
     cache=None,
     _coefficients=None,
     _orphan_substitutions=None,
@@ -1095,15 +1095,15 @@ def stable_smooth(
     dtype : dtype, optional
         Override for the dtype used to size auto-chosen `eps`. Defaults
         to `x.dtype`.
-    inline : bool, default False
+    inline : bool, default True
         Whether the OpFromGraph's inner graph is inlined at
-        `pytensor.function` compile time. `False` keeps each level a
-        separately-compiled inner function -- faster `pytensor.function`
-        build but slower first eval (each level's `_fn` compiles lazily
-        on first call). `True` inlines everything upfront -- slower
-        compile but zero per-call overhead. Prefer `True` if you'll
-        evaluate the resulting graph many times (training loops); the
-        default `False` is right for one-shot or test usage.
+        `pytensor.function` compile time.  `True` (the default) merges
+        every level's inner graph into the outer function during compile,
+        so `fn(...)` calls have no per-OFG dispatch overhead.  `False`
+        keeps each level a separately-compiled inner function that
+        compiles lazily on first call -- historically the cheaper-build
+        path, but on current pytensor it loses by a wide margin once the
+        grad chain is more than 2-3 deep (see "Performance note" below).
     cache : TaylorAtPoint, optional
         Pre-built coefficient cache, shared across multiple `stable_smooth`
         calls with the same `(numerator, x, a)`. When passed, the
@@ -1141,15 +1141,23 @@ def stable_smooth(
 
     Performance note
     ----------------
-    With the default ``inline=False``, each level's inner function
-    compiles lazily on first eval. At depth 5, that lazy compile takes
-    ~30s (subsequent evals are then sub-second). Building
-    `pytensor.function` itself is fast (~1s) regardless of depth.
+    Wall-clock numbers below are for sinc at the indicated grad-chain
+    depth on the current pytensor (`inline=False` had a much worse
+    profile here on the pre-OFG-refactor codebase; the upstream
+    cloning fixes flipped the ranking, which is why ``inline=True`` is
+    now the default):
 
-    Passing ``inline=True`` shifts cost: `pytensor.function` takes
-    ~50s at depth 5, but evaluation is essentially free. Use
-    ``inline=True`` when you'll call the function many times after
-    compile.
+        depth=3  inline=True :  build ~0.2s  fn ~0.3s  first eval ~0s
+        depth=3  inline=False:  build ~0.6s  fn ~0.1s  first eval ~1.5s
+        depth=5  inline=True :  build ~1.2s  fn ~6.4s  first eval ~0s
+        depth=5  inline=False:  build ~1.5s  fn ~5.8s  first eval ~108s
+
+    At depth 5 ``inline=False`` lazy-compiles the inner function of
+    every OFG clone the rewriter produces, on the first ``fn(...)``
+    call -- this was the symptom the prior "depth-5 first-eval cliff"
+    follow-up tracked.  ``inline=True`` avoids it because the inliner
+    runs once at function-build time and the resulting graph holds no
+    OFGs to lazy-compile.
 
     For depths ≥ ~6, prefer `taylor_remainder_poly` if `(x-a)` stays
     bounded -- pure polynomial chain rule scales linearly.
