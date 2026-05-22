@@ -131,9 +131,10 @@ import numpy as np
 import pytensor
 import pytensor.tensor as pt
 from pytensor.compile.builders import OpFromGraph
-from pytensor.graph.basic import equal_computations
+from pytensor.graph.basic import Constant, equal_computations
 from pytensor.graph.replace import clone_replace
 from pytensor.graph.rewriting.utils import rewrite_graph
+from pytensor.graph.traversal import ancestors, graph_inputs
 
 
 class TaylorRemainderUnderflowWarning(UserWarning):
@@ -277,9 +278,52 @@ class TaylorAtPoint:
         return self._values[m]
 
     def numeric_value_at_a(self, m):
-        """f^(m)(a) as a Python float.  Cached -- only compiled once per m."""
+        """f^(m)(a) as a Python float.  Cached -- only compiled once per m.
+
+        Auto-eps and `_min_order_and_eps` decide `order` and `eps` from
+        these floats at graph-build time, so a coefficient that's only
+        well-defined at runtime (because the user's numerator depends
+        on a shared variable, another free symbolic input, etc.) would
+        produce a *baked* threshold tied to the value at construction.
+        That's silently wrong: the symbolic polynomial branch updates
+        as the shared input changes, but `eps` and `order` don't, so
+        the switch threshold can drift out of the regime the analytic
+        formula sized it for.
+
+        We reject the case loudly here: `value_at_a(m)` must reduce to
+        a graph whose only free leaves are `Constant`s (literals from
+        the user's expression), so `.eval()` is deterministic and the
+        threshold genuinely characterizes the function.  The actionable
+        alternatives surfaced in the error are:
+          - pass precomputed numerics via `coefficients=...` on
+            `TaylorAtPoint`, or
+          - build `stable_smooth` over a single leaf and substitute the
+            multivariate expression at the OpFromGraph call site (the
+            'Multivariate singularities via derived-expression
+            composition' pattern in `stable_smooth_design.md`).
+        """
         if m not in self._numeric:
-            self._numeric[m] = float(self.value_at_a(m).eval())
+            v = self.value_at_a(m)
+            non_const_leaves = [
+                inp for inp in graph_inputs([v]) if not isinstance(inp, Constant)
+            ]
+            if non_const_leaves:
+                names = [repr(getattr(inp, "name", None) or inp) for inp in non_const_leaves]
+                raise ValueError(
+                    f"TaylorAtPoint.numeric_value_at_a({m}): f^({m})(a) graph "
+                    f"still depends on non-constant leaf(s) {names}; can't "
+                    f"reduce to a single Python float, so any threshold "
+                    f"derived from it would silently bake the current value "
+                    f"of those leaves into the graph.  Either:\n"
+                    f"  - pass precomputed numerics via "
+                    f"`TaylorAtPoint(..., coefficients=[c_0, c_1, ...])`, or\n"
+                    f"  - build stable_smooth over a single leaf surrogate "
+                    f"and substitute the multivariate expression at the "
+                    f"OpFromGraph call site (see 'Multivariate singularities "
+                    f"via derived-expression composition' in "
+                    f"stable_smooth_design.md)."
+                )
+            self._numeric[m] = float(v.eval())
         return self._numeric[m]
 
     def coeff(self, m):
@@ -990,6 +1034,71 @@ def _scalarize_elementwise(output, replace):
     return visit(output)
 
 
+def _check_elementwise_in_x(numerator, x):
+    """For non-scalar `x`, verify that `numerator` is elementwise in `x`.
+
+    The pullback recovers the per-entry derivative by `pt.grad(f.sum(), x)`,
+    which is correct iff the Jacobian is diagonal -- i.e., entry `i` of
+    `numerator` depends only on entry `i` of `x`.  If the user wires up
+    a numerator that mixes entries (`pt.sum`, `pt.dot`, fancy indexing,
+    ...), the forward pass might still produce finite output (the
+    scalar surrogate samples the function at one point) but the
+    gradient is silently wrong.
+
+    The check is a whitelist on op classes that *preserve* the
+    elementwise correspondence: `Elemwise` (rank-polymorphic scalar
+    ops), `DimShuffle` (broadcast/reorder axes), and the shape-only
+    helpers (`Alloc`, `Shape`, `Shape_i`, `SpecifyShape`) -- the
+    shape helpers carry x's *shape* into the output but not x's
+    *values*, so an op like `pt.ones_like(x)` is fine.
+
+    For any other op encountered while walking from `numerator` back
+    toward `x`, we verify `x` isn't reachable through that op's
+    inputs.  If it is, the op is mixing entries and we raise with a
+    pointer to the recommended composition pattern.
+
+    Returns silently on success; raises `NotImplementedError` on
+    structural rejection.
+    """
+    from pytensor.tensor.basic import Alloc
+    from pytensor.tensor.elemwise import DimShuffle, Elemwise
+    from pytensor.tensor.shape import Shape, Shape_i, SpecifyShape
+
+    safe = (Elemwise, DimShuffle, Alloc, Shape, Shape_i, SpecifyShape)
+    visited: set[int] = set()
+    stack = [numerator]
+    while stack:
+        v = stack.pop()
+        if id(v) in visited:
+            continue
+        visited.add(id(v))
+        if v is x or v.owner is None:
+            continue
+        op = v.owner.op
+        if isinstance(op, safe):
+            stack.extend(v.owner.inputs)
+            continue
+        # Non-elementwise op: bail only if x is actually upstream of it.
+        # `pt.ones_like(x)` will hit Shape(x) inside Alloc, but Shape is in
+        # the safe list above; a Sum upstream of x has no such excuse.
+        for inp in v.owner.inputs:
+            if inp is x or x in ancestors([inp]):
+                raise NotImplementedError(
+                    f"stable_smooth: numerator is not elementwise in x. "
+                    f"Found a non-elementwise op ({type(op).__name__}) "
+                    f"between x and numerator; the pullback's "
+                    f"`pt.grad(f.sum(), x)` trick recovers the per-entry "
+                    f"derivative only when the Jacobian is diagonal, "
+                    f"and that op mixes entries.  Either restructure the "
+                    f"numerator to be elementwise in x, or build "
+                    f"stable_smooth over a single scalar/vector leaf "
+                    f"surrogate and substitute the multivariate expression "
+                    f"at the OpFromGraph call site (see 'Multivariate "
+                    f"singularities via derived-expression composition' in "
+                    f"stable_smooth_design.md)."
+                )
+
+
 def _validate_user_cache(cache, numerator, x, a):
     """Reject a `stable_smooth(..., cache=...)` whose cache wasn't built
     over the same `(numerator, x, a)`.
@@ -1073,11 +1182,14 @@ def stable_smooth(
         entry of `numerator` depends only on the corresponding entry of
         `x`.  This is the normal case for expressions built from
         `pt.sin`, `pt.cos`, `pt.exp`, arithmetic, and other elementwise
-        primitives.  Non-elementwise expressions (e.g.
-        `pt.sum(pt.sin(x)) * pt.ones_like(x)`) silently produce wrong
-        gradients because the pullback uses `pt.grad(f.sum(), x)` to
-        recover the elementwise derivative -- that identity only holds
-        when the Jacobian is diagonal.
+        primitives (plus shape-only helpers like `pt.ones_like(x)`).
+        The pullback uses `pt.grad(f.sum(), x)` to recover the per-entry
+        derivative, which is only correct when the Jacobian is
+        diagonal; a structural check (`_check_elementwise_in_x`) walks
+        the graph at construction and raises `NotImplementedError` with
+        a pointer to the recommended composition pattern if it finds a
+        mixing op (`CAReduce`, `Dot`, fancy indexing, ...) on a path
+        from `x` to `numerator`.
     x : Variable
         The input variable.  Scalar or vector/tensor of any rank
         (elementwise; see `numerator` note above).
@@ -1193,6 +1305,18 @@ def stable_smooth(
                 f"(got ndim={x.ndim}). Omit cache for vector inputs."
             )
         _validate_user_cache(cache, numerator, x, a)
+
+    # Elementwise structural check: only at user entry (recursive pullback
+    # calls set _coefficients/_orphan_substitutions and feed us their own
+    # bracket-with-OpFromGraph graphs, which won't survive a whitelist
+    # check by design).  Catches the silent-wrong-gradient footgun the
+    # docstring warns about.
+    if (
+        x.ndim > 0
+        and _coefficients is None
+        and _orphan_substitutions is None
+    ):
+        _check_elementwise_in_x(numerator, x)
 
     # Fresh inner-graph input so we can wrap the forward in an OpFromGraph
     # whose pullback returns another stable_smooth call (lazy grad chain).

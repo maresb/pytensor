@@ -1117,33 +1117,75 @@ def test_stable_smooth_vector_input_cache_raises():
         stable_smooth(pt.sin(x_v), x_v, 0.0, denominator_degree=1, cache=cache)
 
 
-def test_stable_smooth_vector_non_elementwise_numerator_produces_wrong_grad():
-    """Documented limitation: pullback recovers the elementwise derivative
-    via pt.grad(num.sum(), x), which is only the per-entry derivative when
-    the numerator is elementwise in x.  For a non-elementwise numerator
-    the forward pass is still well-defined (the scalar-surrogate cache
-    samples the numerator at a single point), but the grad is wrong.
-    This test pins the behavior so a future fix flips it."""
+def test_numeric_value_at_a_rejects_free_symbolic_inputs():
+    """Auto-eps and _min_order_and_eps need a Python float per Taylor
+    coefficient; if the numerator depends on a free symbolic input besides
+    x, that float doesn't exist (`.eval()` has no value to plug in).
+    Reject loudly rather than letting pt.grad fail downstream with a
+    less obvious message."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    z = pt.dscalar("z")
+    # `log1p(x*z)`'s first derivative at x=0 is z, a free leaf -- not a
+    # number we can bake into eps/order.
+    with pytest.raises(ValueError, match="non-constant leaf"):
+        stable_smooth(pt.log1p(x * z), x, 0.0, denominator_degree=1)
+
+
+def test_numeric_value_at_a_rejects_shared_inputs():
+    """A shared variable in the numerator is the more insidious case: at
+    construction time it has *some* value, so `.eval()` would silently
+    return a float and we'd bake eps/order from it.  Later mutations to
+    the shared input would update the symbolic polynomial branch but
+    not the thresholds, which is a soundness bug.  Reject at
+    construction."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dscalar("x")
+    z = pytensor.shared(np.float64(2.0))
+    with pytest.raises(ValueError, match="non-constant leaf"):
+        stable_smooth(pt.log1p(x * z), x, 0.0, denominator_degree=1)
+
+
+def test_stable_smooth_vector_non_elementwise_numerator_raises():
+    """The pullback recovers the per-entry derivative via
+    `pt.grad(num.sum(), x)`, which is correct only when the Jacobian is
+    diagonal -- i.e., the numerator is elementwise in x.  Hand it a
+    numerator that mixes entries (pt.sum, pt.dot, fancy indexing, ...)
+    and the gradient is silently wrong; the structural check rejects
+    these at construction so the user sees a clear error rather than
+    bad numbers."""
     from taylor_remainder import stable_smooth
 
     x = pt.dvector("x")
     # pt.sum(pt.sin(x)) is a scalar; ones_like(x) broadcasts it to vector.
-    # This numerator is NOT elementwise in x: each output entry depends
-    # on every input entry.
+    # Each output entry depends on every input entry -- non-diagonal Jacobian.
     non_elem = pt.sum(pt.sin(x)) * pt.ones_like(x)
-    f = stable_smooth(non_elem, x, 0.0, denominator_degree=1)
-    f_grad = pt.grad(f.sum(), x)
-    fn = pytensor.function([x], f_grad)
-    out = fn(np.array([0.5, 1.0, 1.5]))
-    # If we believed the elementwise contract, every entry of f_grad
-    # would equal sinc'(x_i) entrywise -- but it doesn't, by design of
-    # the non-elementwise numerator.  We don't pin a numeric value
-    # (depends on graph-rewrite details that aren't stable contract);
-    # we just sanity-check the result is finite and non-NaN.
-    assert np.all(np.isfinite(out)), (
-        "non-elementwise numerator should still produce finite output "
-        "(even if mathematically wrong); got NaN/Inf in {out}"
-    )
+    with pytest.raises(NotImplementedError, match="not elementwise"):
+        stable_smooth(non_elem, x, 0.0, denominator_degree=1)
+
+
+def test_stable_smooth_vector_ones_like_allowed():
+    """`pt.ones_like(x)` uses Alloc + Shape internally -- non-Elemwise --
+    but is morally elementwise (each entry independent of x's values, just
+    its shape).  The whitelist allows shape-only ops, so a numerator like
+    `pt.sin(x) + pt.ones_like(x)` should construct cleanly."""
+    from taylor_remainder import stable_smooth
+
+    x = pt.dvector("x")
+    # Adding ones_like(x) shifts every entry by 1; sin(x) is elementwise.
+    # Net effect: elementwise (sin(x)+1)/x with limit 1+1=... wait
+    # sin(x)/x -> 1 at 0, plus ones_like(x)/x -> infinite.  Skip the
+    # divide here; this test is purely about the structural check passing.
+    f = pt.sin(x) + pt.ones_like(x) - 1  # subtract back to keep c_0 = 0
+    g = stable_smooth(f, x, 0.0, denominator_degree=1)
+    fn = pytensor.function([x], g)
+    out = fn(np.array([0.0, 0.5, 1.0]))
+    # f(x)/x = (sin x + 1 - 1)/x = sinc(x); same numerics as the plain
+    # sinc test (the ones_like contributes nothing after the -1).
+    expected = np.array([1.0, math.sin(0.5) / 0.5, math.sin(1.0)])
+    np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-15)
 
 
 def test_stable_smooth_sinc_grad_at_nonzero_points():
