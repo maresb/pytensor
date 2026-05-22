@@ -1104,6 +1104,50 @@ def test_stable_smooth_rejects_ndim_above_one():
         stable_smooth(pt.sin(x), x, 0.0, denominator_degree=1)
 
 
+def test_stable_smooth_elementwise_via_vectorize_graph():
+    """Tensors of any rank get elementwise stable_smooth via pytensor's
+    `vectorize_graph` lift, applied to a scalar `stable_smooth`.  This
+    is the canonical "I have a higher-rank input but want elementwise
+    behavior" path; the narrow `ndim <= 1` claim on `stable_smooth`
+    itself doesn't get in the way."""
+    from pytensor.graph.replace import vectorize_graph
+
+    from taylor_remainder import stable_smooth
+
+    u = pt.dscalar("u")
+    sinc_at_u = stable_smooth(pt.sin(u), u, 0.0, denominator_degree=1)
+
+    # Matrix input
+    x_m = pt.dmatrix("x")
+    sinc_at_xm = vectorize_graph(sinc_at_u, {u: x_m})
+    fn = pytensor.function([x_m], sinc_at_xm)
+    M = np.array([[0.0, 0.5], [1.0, -0.3]])
+    expected = np.array(
+        [
+            [1.0, math.sin(0.5) / 0.5],
+            [math.sin(1.0), math.sin(-0.3) / -0.3],
+        ]
+    )
+    np.testing.assert_allclose(fn(M), expected, rtol=1e-12, atol=1e-15)
+
+    # Gradient through the vectorize_graph lift, evaluated elementwise.
+    g_at_u = pt.grad(sinc_at_u, u)
+    g_at_xm = vectorize_graph(g_at_u, {u: x_m})
+    fn_g = pytensor.function([x_m], g_at_xm)
+    out = fn_g(M)
+    # sinc'(t) = (t cos t - sin t) / t^2, with the t=0 limit handled
+    # by the polynomial branch (it's 0).
+    expected_g = np.zeros_like(M)
+    for i in range(M.shape[0]):
+        for j in range(M.shape[1]):
+            t = M[i, j]
+            if t == 0:
+                expected_g[i, j] = 0.0
+            else:
+                expected_g[i, j] = (t * math.cos(t) - math.sin(t)) / t**2
+    np.testing.assert_allclose(out, expected_g, rtol=1e-12, atol=1e-15)
+
+
 def test_numeric_value_at_a_rejects_free_symbolic_inputs():
     """Auto-eps and _min_order_and_eps need a Python float per Taylor
     coefficient; if the numerator depends on a free symbolic input besides

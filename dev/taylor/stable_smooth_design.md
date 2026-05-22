@@ -321,17 +321,41 @@ Implemented in `test_taylor_remainder.py`:
 - `f/g` composition: `sin(x)/tan(x) = cos(x)` via two `stable_smooth`
   calls of equal `denominator_degree=1`, divided.
 
-## Scalar and elementwise vector
+## Scalar, vector, and higher-rank tensors
 
-`stable_smooth` supports scalar `x` (`ndim=0`) and elementwise vector
-`x` (`ndim=1`) only.  Higher-rank tensors raise
-`NotImplementedError`: the DimShuffle whitelist in the elementwise
-check is broadcast-safe at rank ≤ 1 (the only legal shuffles are
-expand-dims and the identity reorder), but at rank ≥ 2 it can't
-distinguish axis permutations from broadcasts without more careful
-analysis.  Users with higher-rank inputs should ravel the input or
-use the scalar-leaf + `clone_replace` composition pattern documented
-in this file's "Multivariate singularities" section.
+`stable_smooth` itself supports only scalar (`ndim=0`) and vector
+(`ndim=1`) `x`.  Higher-rank tensors raise `NotImplementedError` at
+the entry point: the DimShuffle whitelist in
+`_check_elementwise_in_x` is broadcast-safe at rank ≤ 1 (the only
+legal shuffles are expand-dims and the identity reorder), but at
+rank ≥ 2 it can't distinguish axis permutations from broadcasts
+without more careful analysis.
+
+**This does not prevent elementwise application to higher-rank
+tensors.**  The canonical pattern is to build `stable_smooth` over a
+scalar leaf and lift with pytensor's `vectorize_graph`:
+
+```python
+import pytensor.tensor as pt
+from pytensor.graph.replace import vectorize_graph
+from taylor_remainder import stable_smooth
+
+# Build once over a scalar leaf.
+u = pt.dscalar("u")
+sinc_u = stable_smooth(pt.sin(u), u, 0.0, denominator_degree=1)
+
+# Apply elementwise to a tensor of any rank.
+x = pt.dmatrix("x")              # or dtensor3, or dvector, ...
+sinc_x = vectorize_graph(sinc_u, {u: x})
+```
+
+`vectorize_graph` is pytensor's official elementwise-lift mechanism;
+gradients propagate through it correctly (verified by
+`test_stable_smooth_elementwise_via_vectorize_graph`).  The narrow
+`ndim ≤ 1` claim on `stable_smooth` is just an admission that the
+in-place vector support's structural check is only sound at that
+rank -- users who want higher-rank elementwise behavior should
+delegate to `vectorize_graph`, not to our claim.
 
 For vector `x`, the user's `numerator` must be elementwise in `x`
 (each output entry depends only on the corresponding input entry):
