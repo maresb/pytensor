@@ -1035,7 +1035,8 @@ def _scalarize_elementwise(output, replace):
 
 
 def _check_elementwise_in_x(numerator, x):
-    """For non-scalar `x`, verify that `numerator` is elementwise in `x`.
+    """For non-scalar `x` (we already restrict to ndim <= 1 upstream),
+    verify that `numerator` is elementwise in `x`.
 
     The pullback recovers the per-entry derivative by `pt.grad(f.sum(), x)`,
     which is correct iff the Jacobian is diagonal -- i.e., entry `i` of
@@ -1047,10 +1048,14 @@ def _check_elementwise_in_x(numerator, x):
 
     The check is a whitelist on op classes that *preserve* the
     elementwise correspondence: `Elemwise` (rank-polymorphic scalar
-    ops), `DimShuffle` (broadcast/reorder axes), and the shape-only
-    helpers (`Alloc`, `Shape`, `Shape_i`, `SpecifyShape`) -- the
-    shape helpers carry x's *shape* into the output but not x's
-    *values*, so an op like `pt.ones_like(x)` is fine.
+    ops), `DimShuffle` (for 1-D inputs the only legal shuffles are
+    broadcast/expand and the identity reorder -- which is why the
+    caller restricts `x.ndim <= 1`; if tensor support is added later
+    this whitelist needs to distinguish broadcasting DimShuffles from
+    axis permutations), and the shape-only helpers (`Alloc`, `Shape`,
+    `Shape_i`, `SpecifyShape`), which carry x's *shape* into the
+    output but not x's *values*, so an op like `pt.ones_like(x)` is
+    fine.
 
     For any other op encountered while walking from `numerator` back
     toward `x`, we verify `x` isn't reachable through that op's
@@ -1141,8 +1146,6 @@ def stable_smooth(
     *,
     denominator_degree,
     cancellation_order=0,
-    dtype=None,
-    inline=True,
     cache=None,
     _coefficients=None,
     _orphan_substitutions=None,
@@ -1191,8 +1194,10 @@ def stable_smooth(
         mixing op (`CAReduce`, `Dot`, fancy indexing, ...) on a path
         from `x` to `numerator`.
     x : Variable
-        The input variable.  Scalar or vector/tensor of any rank
-        (elementwise; see `numerator` note above).
+        The input variable.  Scalar (`ndim=0`) or vector (`ndim=1`)
+        only -- higher-rank tensors raise `NotImplementedError` because
+        the elementwise check's DimShuffle whitelist isn't tight enough
+        to distinguish axis permutations from broadcasts in that regime.
     a : float
         Expansion point.
     denominator_degree : int
@@ -1204,18 +1209,6 @@ def stable_smooth(
         means `numerator` is pristine (rel_err ≤ ε_m); declare `c > 0`
         when the expression suffers obvious cancellation near `a` (e.g.
         `x*cos(x) - sin(x)` at `a=0` should declare `c = 2`).
-    dtype : dtype, optional
-        Override for the dtype used to size auto-chosen `eps`. Defaults
-        to `x.dtype`.
-    inline : bool, default True
-        Whether the OpFromGraph's inner graph is inlined at
-        `pytensor.function` compile time.  `True` (the default) merges
-        every level's inner graph into the outer function during compile,
-        so `fn(...)` calls have no per-OFG dispatch overhead.  `False`
-        keeps each level a separately-compiled inner function that
-        compiles lazily on first call -- historically the cheaper-build
-        path, but on current pytensor it loses by a wide margin once the
-        grad chain is more than 2-3 deep (see "Performance note" below).
     cache : TaylorAtPoint, optional
         Pre-built coefficient cache, shared across multiple `stable_smooth`
         calls with the same `(numerator, x, a)`. When passed, the
@@ -1254,22 +1247,15 @@ def stable_smooth(
     Performance note
     ----------------
     Wall-clock numbers below are for sinc at the indicated grad-chain
-    depth on the current pytensor (`inline=False` had a much worse
-    profile here on the pre-OFG-refactor codebase; the upstream
-    cloning fixes flipped the ranking, which is why ``inline=True`` is
-    now the default):
+    depth on the current pytensor:
 
-        depth=3  inline=True :  build ~0.2s  fn ~0.3s  first eval ~0s
-        depth=3  inline=False:  build ~0.6s  fn ~0.1s  first eval ~1.5s
-        depth=5  inline=True :  build ~1.2s  fn ~6.4s  first eval ~0s
-        depth=5  inline=False:  build ~1.5s  fn ~5.8s  first eval ~108s
+        depth=3 :  build ~0.2s  fn ~0.3s  first eval ~0s
+        depth=5 :  build ~1.2s  fn ~6.4s  first eval ~0s
 
-    At depth 5 ``inline=False`` lazy-compiles the inner function of
-    every OFG clone the rewriter produces, on the first ``fn(...)``
-    call -- this was the symptom the prior "depth-5 first-eval cliff"
-    follow-up tracked.  ``inline=True`` avoids it because the inliner
-    runs once at function-build time and the resulting graph holds no
-    OFGs to lazy-compile.
+    `stable_smooth` always builds the OpFromGraph with `inline=True`,
+    which on the current pytensor avoids the lazy-per-OFG compile
+    cascade that the OFG-cloning fixes (commits `6458acc`, `b39fced`,
+    `a11a9b1`, `a821179`, `7821c7e`) made obsolete.
 
     For depths ≥ ~6, prefer `taylor_remainder_poly` if `(x-a)` stays
     bounded -- pure polynomial chain rule scales linearly.
@@ -1305,6 +1291,23 @@ def stable_smooth(
                 f"(got ndim={x.ndim}). Omit cache for vector inputs."
             )
         _validate_user_cache(cache, numerator, x, a)
+
+    # Narrow tensor claim: we explicitly support scalar (ndim=0) and
+    # vector (ndim=1) inputs only.  Higher-rank tensors would force the
+    # elementwise whitelist to reason about axis-permutation safety
+    # (DimShuffle is broadcast-safe but NOT permutation-safe in general),
+    # which isn't a claim this prototype makes.  Users with >1-D inputs
+    # should ravel or use the scalar-leaf + clone_replace composition
+    # pattern documented in stable_smooth_design.md.
+    if x.ndim > 1:
+        raise NotImplementedError(
+            f"stable_smooth: only scalar (ndim=0) and vector (ndim=1) "
+            f"`x` are supported (got ndim={x.ndim}).  Higher-rank tensor "
+            f"support would need a stricter elementwise check that "
+            f"distinguishes broadcasting DimShuffles from axis "
+            f"permutations; for now, ravel the input or use the "
+            f"composition pattern in stable_smooth_design.md."
+        )
 
     # Elementwise structural check: only at user entry (recursive pullback
     # calls set _coefficients/_orphan_substitutions and feed us their own
@@ -1371,7 +1374,6 @@ def stable_smooth(
     order, eps = _min_order_and_eps(
         active_cache,
         n,
-        dtype=dtype,
         cancellation_order=cancellation_order,
     )
     inner_remainder = taylor_remainder(
@@ -1381,7 +1383,6 @@ def stable_smooth(
         n,
         order=order,
         eps=eps,
-        dtype=dtype,
         cache=active_cache,
     )
 
@@ -1389,8 +1390,6 @@ def stable_smooth(
     n_captured = n
     c_captured = cancellation_order
     a_captured = a
-    dtype_captured = dtype
-    inline_captured = inline
     parent_cache = active_cache
 
     def pullback(inputs, outputs, cotangents):
@@ -1435,8 +1434,6 @@ def stable_smooth(
                 a_captured,
                 denominator_degree=n_captured - 1,
                 cancellation_order=c_captured,
-                dtype=dtype_captured,
-                inline=inline_captured,
                 _coefficients=f_prime_coeffs(),
             )
             bracket = R_n_minus_1_f_prime - n_captured * R_orphan
@@ -1459,14 +1456,16 @@ def stable_smooth(
             # bracket vanishes to first order, costing one order of relative
             # precision; new contract is parent's c + 1.
             cancellation_order=c_captured + 1,
-            dtype=dtype_captured,
-            inline=inline_captured,
             _coefficients=bracket_coeffs(),
             _orphan_substitutions={R_orphan: op(xi)},
         )
         return [g * deriv]
 
-    op = OpFromGraph([inner_x], [inner_remainder], pullback=pullback, inline=inline)
+    # inline=True is unconditional: the upstream OFG-cloning fixes
+    # (6458acc, b39fced, a11a9b1, a821179, 7821c7e) made it strictly
+    # cheaper than the lazy-per-OFG path at every depth measured, so
+    # there's no longer a reason to expose the choice.
+    op = OpFromGraph([inner_x], [inner_remainder], pullback=pullback, inline=True)
     return op(x)
 
 

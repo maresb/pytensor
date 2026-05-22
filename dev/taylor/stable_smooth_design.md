@@ -38,13 +38,31 @@ The pitfalls being solved, in increasing order of insidiousness:
 ```python
 stable_smooth(
     numerator,                # PyTensor expression for f(x)
-    x,                        # the variable
-    a=0.0,                    # expansion point
+    x,                        # the variable (scalar or vector)
+    a,                        # expansion point
+    *,
     denominator_degree,       # n in f / (x - a)^n
     cancellation_order=0,     # the user's evaluation-precision contract; see below
-    # derivative_depth=0      # framework-internal, incremented by pt.grad
+    cache=None,               # optional pre-built TaylorAtPoint for cross-call sharing
 )
 ```
+
+Knobs the API deliberately does *not* expose:
+
+- `order` (polynomial-branch length) and `eps` (switch threshold) are
+  picked by `_min_order_and_eps` from the numerator's coefficient
+  sizes at `a`; the user shouldn't have to think about either.
+- `dtype` is read from `x.dtype`; no override is needed since the
+  auto-eps formula is scale-invariant in `f` and the only dtype
+  question is "what is `eps_machine`?".
+- `inline` (OpFromGraph inlining strategy) is always `True`.  The
+  upstream OFG-cloning fixes after `rel-3.0.0` made it strictly the
+  faster path; the lazy-per-OFG path no longer has a use case.
+- `cancellation_order` is the one remaining unresolved API wart: it
+  encodes a precision contract the graph can't reliably infer, so we
+  keep it as an explicit kwarg defaulted to 0.  Future work could
+  split it out into a separate "I know my numerator suffers
+  cancellation" entry point.
 
 | Parameter | Role |
 |---|---|
@@ -305,7 +323,16 @@ Implemented in `test_taylor_remainder.py`:
 
 ## Scalar and elementwise vector
 
-`stable_smooth` supports both scalar `x` and elementwise vector `x`.
+`stable_smooth` supports scalar `x` (`ndim=0`) and elementwise vector
+`x` (`ndim=1`) only.  Higher-rank tensors raise
+`NotImplementedError`: the DimShuffle whitelist in the elementwise
+check is broadcast-safe at rank ≤ 1 (the only legal shuffles are
+expand-dims and the identity reorder), but at rank ≥ 2 it can't
+distinguish axis permutations from broadcasts without more careful
+analysis.  Users with higher-rank inputs should ravel the input or
+use the scalar-leaf + `clone_replace` composition pattern documented
+in this file's "Multivariate singularities" section.
+
 For vector `x`, the user's `numerator` must be elementwise in `x`
 (each output entry depends only on the corresponding input entry):
 the cache is built from a *scalar surrogate* of the numerator
@@ -318,10 +345,12 @@ vector `t = x - a` in the polynomial branch.  The pullback uses
 correct iff `numerator` is elementwise in `x` (diagonal Jacobian).
 
 Non-elementwise numerators (e.g. `pt.sum(pt.sin(x)) * pt.ones_like(x)`)
-are explicitly unsupported -- the forward eval is well-defined (the
-scalar surrogate samples the numerator at a single point), but the
-pullback's `.sum()` trick silently gives the wrong gradient.  The
-docstring documents this assumption.
+are rejected up front by `_check_elementwise_in_x`, a whitelist-based
+structural walk that allows only `Elemwise`, `DimShuffle`, `Alloc`,
+`Shape`, `Shape_i`, `SpecifyShape` -- and only because rank ≤ 1
+makes the DimShuffle case safe.  Tensor support would require a
+tighter check (or a different architecture, e.g. always-scalar OFG
+with `Blockwise` for vectorization).
 
 The `cache=` cross-call sharing parameter currently requires scalar
 `x` (the user can't easily produce a scalar surrogate keyed to their
@@ -330,36 +359,27 @@ vector `x`); cross-call memoization with vector inputs is future work.
 ## Performance
 
 Each grad in the chain creates O(level) new OpFromGraph instances.
-Construction is fast (~21 instances at depth 5).  The interesting
-question is what happens between `pytensor.function([x], cur)` and
-the first `fn(...)` call.
+Construction is fast (~21 instances at depth 5).  `stable_smooth`
+always builds with `OpFromGraph(inline=True)`, which on the current
+pytensor (with the OFG-cloning fixes `6458acc`, `b39fced`, `a11a9b1`,
+`a821179`, `7821c7e` from shortly after rel-3.0.0) avoids the
+lazy-per-OFG first-eval cliff that earlier versions had.
 
-The `inline` knob picks between two compile paths:
+Measured for sinc at the indicated depth (with the default
+`inline=True` path):
 
-- **`inline=True` (default).**  Every level's inner graph is inlined
-  into the outer function during compile.  No OFGs survive into the
-  compiled callable, so first-eval and steady-state evals are both
-  essentially free.
-- **`inline=False`.**  Each level is kept as a `OpFromGraph` whose
-  `_fn` is compiled lazily on its first call.  In a deep chain that
-  means O(N) lazy `pytensor.function` invocations on the first
-  `fn(...)` — historically the "depth-5 first-eval cliff."
+| depth | build | `pytensor.function` | first eval | total |
+|------:|------:|--------------------:|-----------:|------:|
+| 3     | 0.2 s | 0.3 s               | ~0 s       | 0.6 s |
+| 5     | 1.2 s | 6.4 s               | ~0 s       | 7.7 s |
 
-Measured for sinc at the indicated depth on the current pytensor:
-
-| depth | inline | build | `pytensor.function` | first eval | total |
-|------:|:-----:|------:|--------------------:|-----------:|------:|
-| 3     | True  | 0.2 s | 0.3 s               | ~0 s       | 0.6 s |
-| 3     | False | 0.6 s | 0.1 s               | 1.5 s      | 2.1 s |
-| 5     | True  | 1.2 s | 6.4 s               | ~0 s       | 7.7 s |
-| 5     | False | 1.5 s | 5.8 s               | 108 s      | 115 s |
-
-`inline=True` was historically the slower choice because the
-inliner cloned both inner and outer inputs repeatedly through
-`canonicalize`; the upstream cluster of OFG-cloning fixes
-(`6458acc`, `b39fced`, `a11a9b1`, `a821179`, `7821c7e`) landed
-shortly after rel-3.0.0 and made it the strictly faster path.  The
-default flipped accordingly.
+The lazy-per-OFG path (formerly `inline=False`) is no longer reachable
+from `stable_smooth` itself, but it can still be exercised on
+`taylor_remainder`-style lower-level calls if a regression test ever
+needs to.  At depth 5 it took ~115 s wall-clock total *before* the
+upstream fixes; the wall-clock budget test
+(`test_stable_smooth_depth5_under_wallclock_budget`, 30 s budget,
+runs in ~10 s) pins the post-fix profile.
 
 For depth ≥ ~6, `taylor_remainder_poly` is still the simpler escape
 hatch when the input range stays bounded.
