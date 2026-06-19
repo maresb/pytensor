@@ -5170,6 +5170,30 @@ def test_log_div_non_constant_not_rewritten():
 
 
 @pytest.mark.parametrize(
+    "build, removed_op",
+    [
+        (lambda x: pt.exp(pt.softplus(x)), "Softplus"),  # local_exp_log: 1 + exp(x)
+        (lambda x: pt.exp(pt.log1p(x)), "Log1p"),  # local_exp_log_nan_switch: 1 + x
+        (lambda x: pt.expm1(pt.log(x)), "Log"),  # local_exp_log_nan_switch: x - 1
+        (lambda x: pt.exp(pt.log1mexp(x)), "Log1mexp"),  # nan_switch: 1 - exp(x)
+    ],
+)
+def test_exp_log_rewrites_apply_under_numpy_floatX(build, removed_op):
+    # Regression for #1073: these rewrites were silently skipped under numpy+floatX.
+    with config.change_flags(cast_policy="numpy+floatX"):
+        x = pt.vector("x", dtype="float32")
+        fgraph = function([x], build(x)).maker.fgraph
+        op_names = set()
+        for node in fgraph.toposort():
+            scalar_op = getattr(node.op, "scalar_op", None)
+            op_names.add(type(scalar_op or node.op).__name__)
+            inner = getattr(scalar_op, "fgraph", None)
+            if inner is not None:  # a skipped rewrite leaves the op inside the Composite
+                op_names.update(type(n.op).__name__ for n in inner.toposort())
+    assert removed_op not in op_names
+
+
+@pytest.mark.parametrize(
     "build, expected_fn",
     [
         (lambda x: pt.sign(3.0 / x), lambda x: pt.sign(x)),
