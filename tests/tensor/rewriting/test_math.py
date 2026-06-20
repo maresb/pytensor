@@ -4210,14 +4210,20 @@ class TestSigmoidRewrites:
         xd = dscalar()
 
         # Test `exp_over_1_plus_exp`
-        f = pytensor.function([x], 1 - exp(x) / (1 + exp(x)), mode=m)
+        f = pytensor.function(
+            [x], np.float32(1) - exp(x) / (np.float32(1) + exp(x)), mode=m
+        )
         # FIXME: PatternNodeRewriter does not copy stack trace
         #  (see https://github.com/Theano/Theano/issues/4581)
         # assert check_stack_trace(f, ops_to_check=[neg, sigmoid])
         assert equal_computations(f.maker.fgraph.outputs, [sigmoid(-x)])
 
         # Test `inv_1_plus_exp`
-        f = pytensor.function([x], 1 - pt.fill(x, 1.0) / (1 + exp(-x)), mode=m)
+        f = pytensor.function(
+            [x],
+            np.float32(1) - pt.fill(x, np.float32(1.0)) / (np.float32(1) + exp(-x)),
+            mode=m,
+        )
         # assert check_stack_trace(f, ops_to_check=[neg, sigmoid])
         assert equal_computations(f.maker.fgraph.outputs, [sigmoid(-x)])
 
@@ -4492,7 +4498,7 @@ def test_local_logit_sigmoid():
     """Test that graphs of the form ``logit(sigmoid(x))`` and ``sigmoid(logit(x))`` get rewritten to ``x``."""
 
     def logit_fn(x):
-        return log(x / (1 - x))
+        return log(x / (np.float32(1) - x))
 
     x = fmatrix()
 
