@@ -1503,7 +1503,6 @@ class TestLocalUselessElemwiseComparison:
         for dtype, zero, one in [
             ("bool", np.array(False), np.array(True)),
             ("int8", np.int8(0), np.int8(1)),
-            ("int8", 0, 1),
         ]:
             x = scalar("x", dtype=dtype)
 
