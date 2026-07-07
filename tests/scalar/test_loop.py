@@ -202,7 +202,7 @@ def test_inner_composite(mode):
     n_steps = int64("n_steps")
     x = float64("x")
 
-    one = Composite([x], [cos(exp(x)) ** 2 + sin(exp(x)) ** 2])(x)
+    one = Composite([x], [cos(exp(x)) ** np.int8(2) + sin(exp(x)) ** np.int8(2)])(x)
 
     op = ScalarLoop(init=[x], update=[one + x])
     y = op(n_steps, x)
@@ -234,7 +234,7 @@ def test_inner_loop(mode):
     x = float64("x")
 
     x_in = float64("x_in")
-    inner_loop_op = ScalarLoop(init=[x_in], update=[x_in + 1])
+    inner_loop_op = ScalarLoop(init=[x_in], update=[x_in + np.int8(1)])
 
     outer_loop_op = ScalarLoop(
         init=[x], update=[inner_loop_op(n_steps, x)], constant=[n_steps]

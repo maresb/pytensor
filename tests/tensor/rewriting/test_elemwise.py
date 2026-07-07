@@ -685,7 +685,14 @@ class TestFusion:
                     "numpy": "float64",
                 },
             ),  # 40
-            (fx - (fy / np.float32(2.0)), (fx, fy), (fxv, fyv), 1, fxv - (fyv / 2), "float32"),
+            (
+                fx - (fy / np.float32(2.0)),
+                (fx, fy),
+                (fxv, fyv),
+                1,
+                fxv - (fyv / 2),
+                "float32",
+            ),
             (
                 fx - (fy % fz),
                 (fx, fy, fz),
@@ -964,7 +971,10 @@ class TestFusion:
                     np.sum(-((fxv - fyv) ** 2) / 2),
                     -(fxv - fyv),
                 ),
-                ("float32", "float32"),
+                {
+                    "custom": ("float32", "float32"),
+                    "numpy+floatX": (config.floatX, "float32"),
+                },
             ),
             # Two Composite graphs that share the same input, but are split by
             # a non-elemwise operation (Assert)
@@ -1002,7 +1012,10 @@ class TestFusion:
                 (fxv,),
                 4,
                 (np.sum(fxv + 5) * np.exp(fxv) / (fxv + 5),),
-                ("float32",),
+                {
+                    "custom": ("float32",),
+                    "numpy+floatX": (config.floatX,),
+                },
             ),
             (
                 (sin(exp(fx)), exp(sin(fx))),
