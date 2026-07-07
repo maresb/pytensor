@@ -193,6 +193,11 @@ def inputs(xbc=(0, 0), ybc=(0, 0), zbc=(0, 0)):
     return x, y, z
 
 
+def _autocast_int_dtype():
+    """dtype the active cast_policy gives a small Python int literal."""
+    return "int8" if config.cast_policy == "custom" else "int64"
+
+
 def test_add_canonizer_problem0():
     n_segments = 10
     label = lscalar("label")
@@ -1981,7 +1986,7 @@ class TestExpLog:
             f.maker.fgraph.outputs,
             [
                 pt.switch(
-                    x >= np.array([[0]], dtype=np.int64),
+                    x >= np.array([[0]], dtype=_autocast_int_dtype()),
                     pt.log1p(x),
                     np.array([[np.nan]], dtype=np.float32),
                 )
@@ -2006,7 +2011,7 @@ class TestExpLog:
             f.maker.fgraph.outputs,
             [
                 pt.switch(
-                    x >= np.array([[0]], dtype=np.int64),
+                    x >= np.array([[0]], dtype=_autocast_int_dtype()),
                     pt.log1p(-x),
                     np.array([[np.nan]], dtype=np.float32),
                 )
@@ -2029,7 +2034,7 @@ class TestExpLog:
             f.maker.fgraph.outputs,
             [
                 pt.switch(
-                    x <= np.array([[0]], dtype=np.int64),
+                    x <= np.array([[0]], dtype=_autocast_int_dtype()),
                     x,
                     np.array([[np.nan]], dtype=np.float32),
                 )
@@ -2088,7 +2093,7 @@ class TestSqrSqrt:
         out = rewrite_graph(out, include=["canonicalize", "specialize", "stabilize"])
 
         expected = switch(
-            ge(x, np.zeros((1, 1), dtype="int64")),
+            ge(x, np.zeros((1, 1), dtype=_autocast_int_dtype())),
             x,
             np.full((1, 1), np.nan, dtype=out.type.dtype),
         )
@@ -2110,7 +2115,7 @@ class TestSqrSqrt:
         out = rewrite_graph(out, include=["canonicalize", "specialize", "stabilize"])
 
         expected = switch(
-            ge(x, np.zeros((1,), dtype="int64")),
+            ge(x, np.zeros((1,), dtype=_autocast_int_dtype())),
             x,
             np.full((1,), np.nan, dtype=dtype),
         )
