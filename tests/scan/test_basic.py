@@ -404,7 +404,7 @@ class TestScan:
         """We expect an empty output array when ``n_steps == 0``."""
 
         def f_pow(x_tm1):
-            return 2 * x_tm1
+            return np.int8(2) * x_tm1
 
         n_steps = iscalar("n_steps")
         values = scan(
@@ -439,7 +439,7 @@ class TestScan:
         """We expect an empty output array when scanning over an empty sequence."""
 
         def inner_fn(x_seq, x_i):
-            return 2 * x_i
+            return np.int8(2) * x_i
 
         with config.change_flags(mode=mode):
             values = scan(
