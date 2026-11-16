@@ -1,8 +1,8 @@
 import numpy as np
 
 from pytensor.assumptions.alloc import (
-    alloc_diag_at_offset_zero,
-    alloc_of_zero,
+    alloc_diag_has_zero_off_diagonal,
+    alloc_has_zero_off_diagonal,
     eye_zero_or_identity_rule,
 )
 from pytensor.assumptions.core import (
@@ -14,6 +14,7 @@ from pytensor.assumptions.core import (
     register_assumption,
     register_constant_inference,
 )
+from pytensor.assumptions.dimshuffle import conjugate_transpose_input
 from pytensor.assumptions.elemwise import elemwise_preserves_zero_pattern
 from pytensor.assumptions.subtensor import subtensor_propagates_matrix_property
 from pytensor.tensor.basic import Alloc, AllocDiag, Eye
@@ -82,8 +83,8 @@ def indexes_diagonal(node) -> bool:
 
 
 register_assumption(DIAGONAL, Eye)(eye_zero_or_identity_rule)
-register_assumption(DIAGONAL, AllocDiag)(alloc_diag_at_offset_zero)
-register_assumption(DIAGONAL, Alloc)(alloc_of_zero)
+register_assumption(DIAGONAL, AllocDiag)(alloc_diag_has_zero_off_diagonal)
+register_assumption(DIAGONAL, Alloc)(alloc_has_zero_off_diagonal)
 register_assumption(DIAGONAL, Cholesky)(propagate_first)
 register_assumption(DIAGONAL, BlockDiagonal)(all_inputs_have_key)
 register_assumption(DIAGONAL, MatrixInverse)(propagate_first)
@@ -95,15 +96,11 @@ register_assumption(DIAGONAL, Subtensor)(subtensor_propagates_matrix_property)
 
 @register_assumption(DIAGONAL, Dot)
 def _dot_orthogonal_xxt(key, op, feature, fgraph, node, input_states):
-    """x @ x.T is diagonal (identity) when x is orthogonal."""
+    """x @ x.H and x.H @ x are the identity when x is orthogonal (or unitary)."""
     a, b = node.inputs
-    if (
-        feature.check(a, ORTHOGONAL)
-        and b.owner is not None
-        and isinstance(b.owner_op, DimShuffle)
-        and b.owner_op.is_matrix_transpose
-        and b.owner.inputs[0] is a
-    ):
+    if conjugate_transpose_input(b) is a and feature.check(a, ORTHOGONAL):
+        return [FactState.TRUE]
+    if conjugate_transpose_input(a) is b and feature.check(b, ORTHOGONAL):
         return [FactState.TRUE]
 
     return [FactState.UNKNOWN]

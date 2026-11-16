@@ -14,7 +14,7 @@ from pytensor.tensor.blockwise import Blockwise
 from pytensor.tensor.linalg.constructors import BlockDiagonal
 from pytensor.tensor.linalg.products import KroneckerProduct
 from pytensor.tensor.math import Dot
-from tests.unittest_tools import assert_equal_computations
+from tests.unittest_tools import RewriteTester, assert_equal_computations
 
 
 def test_nested_blockdiag_fusion():
@@ -215,6 +215,37 @@ def test_det_of_kronecker():
     )
 
 
+@pytest.mark.parametrize(
+    "build, structural_op",
+    [(pt.linalg.block_diag, BlockDiagonal), (pt.linalg.kron, KroneckerProduct)],
+    ids=["block_diag", "kron"],
+)
+@pytest.mark.parametrize(
+    "reduce_fn",
+    [lambda x: pt.diagonal(x, axis1=-2, axis2=-1), pt.linalg.det],
+    ids=["diag", "det"],
+)
+def test_reduction_of_structured_matrix_through_expand_dims(
+    build, structural_op, reduce_fn
+):
+    a, b = pt.dmatrices("a", "b")
+    out = reduce_fn(pt.expand_dims(build(a, b), 0))
+
+    # Excluding the eager unbatch rewrite keeps the expand_dims in place, so the
+    # look-through peel is what must find the structured matrix
+    rewritten = rewrite_graph(
+        out,
+        include=("canonicalize", "stabilize"),
+        exclude=("local_eager_useless_unbatched_blockwise",),
+    )
+    core_ops = {
+        anc.owner.op.core_op if isinstance(anc.owner.op, Blockwise) else anc.owner.op
+        for anc in ancestors([rewritten])
+        if anc.owner is not None
+    }
+    assert not any(isinstance(op, structural_op) for op in core_ops)
+
+
 def test_slogdet_kronecker_rewrite():
     a, b = pt.dmatrices("a", "b")
     kron_prod = pt.linalg.kron(a, b)
@@ -330,6 +361,19 @@ def test_orthogonal_dot_transpose_to_eye():
     expected_batch = pt.alloc(np.eye(n, dtype=config.floatX), b64, n64, n64)
 
     assert_equal_computations([rewritten_batch], [expected_batch])
+
+
+def test_unitary_dot_conjugate_transpose_to_eye():
+    """For complex X, only the conjugate transpose gives the identity."""
+    n = 5
+    x = pt.matrix("x", shape=(n, n), dtype="complex128")
+    x_orth = assume(x, orthogonal=True)
+    outs = [x_orth @ x_orth.conj().mT, x_orth.mT.conj() @ x_orth, x_orth @ x_orth.mT]
+
+    eye = pt.eye(n, dtype="complex128")
+    passes = ("canonicalize", "ShapeOpt")
+    result = RewriteTester([x], outs, include=passes)
+    result.assert_graph(*rewrite_graph([eye, eye, x @ x.mT], include=passes))
 
 
 class TestSelectionDotToIndexing:

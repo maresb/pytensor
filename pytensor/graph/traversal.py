@@ -145,12 +145,13 @@ def apply_ancestors(
     graphs: Iterable[Variable],
     blockers: Iterable[Variable] | None = None,
 ) -> Generator[Apply, None, None]:
-    """Return the Apply nodes that contribute to those in given graphs (inclusive)."""
+    """Return the Apply nodes that contribute to those in given graphs, excluding the owners of the blockers."""
     seen = {None}  # This filters out Variables without an owner
+    blockers = frozenset(blockers or ())
     for var in ancestors(graphs, blockers):
         # For multi-output nodes, we'll see multiple variables
         # but we should only yield the Apply once
-        if (apply := var.owner) not in seen:
+        if var not in blockers and (apply := var.owner) not in seen:
             yield apply
             seen.add(apply)
     return
@@ -665,9 +666,9 @@ def toposort_with_orderings(
     Parameters
     ----------
     graphs : list or tuple of Variable instances
-        Graph inputs.
-    outputs : list or tuple of Apply instances
         Graph outputs.
+    blockers : list or tuple of Variable instances
+        Graph inputs.
     orderings : dict
         Keys are `Apply` or `Variable` instances, values are lists of `Apply` or `Variable` instances.
 
@@ -756,12 +757,19 @@ def get_var_by_name(
     A ``tuple`` containing all the `Variable`\s that match `target_var_id`.
 
     """
-    from pytensor.graph.op import HasInnerGraph
+    from pytensor.graph.op import HasMultipleInnerGraph
 
     def expand(r: Variable) -> list[Variable] | None:
         if (apply := r.owner) is not None:
-            if isinstance(apply.op, HasInnerGraph):
-                return [*apply.inputs, *apply.op.inner_outputs]
+            if isinstance(apply.op, HasMultipleInnerGraph):
+                return [
+                    *apply.inputs,
+                    *(
+                        out
+                        for fg in apply.op.inner_graphs.values()
+                        for out in fg.outputs
+                    ),
+                ]
             else:
                 # Mypy doesn't know these will never be None
                 return apply.inputs  # type: ignore

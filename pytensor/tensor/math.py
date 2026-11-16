@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 from numpy.lib.array_utils import normalize_axis_tuple
 
+import pytensor
 from pytensor import config, printing
 from pytensor import scalar as ps
 from pytensor.gradient import DisconnectedType, disconnected_type
@@ -21,7 +22,6 @@ from pytensor.scalar.basic import BinaryScalarOp
 from pytensor.tensor import TensorLike
 from pytensor.tensor.basic import (
     alloc,
-    arange,
     as_tensor_variable,
     cast,
     concatenate,
@@ -366,10 +366,55 @@ class FixedOpCAReduce(CAReduce):
 
 
 class NonZeroDimsCAReduce(FixedOpCAReduce):
+    """A reduction that raises on a zero-size reduced axis, like NumPy's ``max``.
+
+    With ``initial=True`` an empty reduction returns the identity of the scalar
+    ``Op`` (``-inf`` for ``maximum``, ``inf`` for ``minimum``) instead of raising,
+    like NumPy's ``initial``. For integer and boolean inputs the lowest/highest
+    value of the dtype is used.
+    """
+
+    __props__ = (*FixedOpCAReduce.__props__, "initial")
+
+    def __init__(self, scalar_op, axis=None, initial=False, **kwargs):
+        self.initial = bool(initial)
+        super().__init__(scalar_op, axis=axis, **kwargs)
+
+    def __str__(self):
+        if not self.initial:
+            return super().__str__()
+        return f"{type(self).__name__}{{{self._axis_str()}, initial}}"
+
+    def initial_value(self, dtype):
+        """The identity as a value of `dtype` (its bounds for ints and bools), or None."""
+        if not self.initial:
+            return None
+        identity = self.scalar_op.identity
+        dtype = np.dtype(dtype)
+        if dtype.kind in "fc":
+            return identity
+        if dtype.kind == "b":
+            return identity > 0
+        info = np.iinfo(dtype)
+        return info.max if identity > 0 else info.min
+
+    def perform(self, node, inp, out):
+        if not self.initial:
+            return super().perform(node, inp, out)
+        [x] = inp
+        dtype = node.outputs[0].type.dtype
+        out[0][0] = np.asarray(
+            self.ufunc.reduce(x, axis=self.axis, initial=self.initial_value(dtype)),
+            dtype=dtype,
+        )
+
     def _c_all(self, node, name, input_names, output_names, sub):
         setup, alloc, loop, cast = super()._c_all(
             node, name, input_names, output_names, sub
         )
+        if self.initial:
+            # Empty reductions return the scalar_op identity
+            return setup, alloc, loop, cast
 
         # We add an additional check for zero-sized dimensions (This seems like
         # something that could enabled in `elemwise_cgen.make_checks`.)
@@ -391,7 +436,7 @@ class NonZeroDimsCAReduce(FixedOpCAReduce):
             for(int i=0;i<PyArray_NDIM({iname});i++){{
                 if(PyArray_DIMS({iname})[i]==0 && tosum[i]){{
                     PyErr_Format(PyExc_ValueError,
-                        "Input of CAReduce{{{node.op.scalar_op}}} has zero-size on axis %%d",i);
+                        "Input of CAReduce{{{node.op.scalar_op}}} has zero-size on axis %d",i);
                     {sub["fail"]};
                 }}
             }}
@@ -400,93 +445,88 @@ class NonZeroDimsCAReduce(FixedOpCAReduce):
         return setup, alloc, loop, cast
 
 
-class Max(NonZeroDimsCAReduce):
+class MaxAndMinCAReduce(NonZeroDimsCAReduce):
+    """Base class for the :class:`Max` and :class:`Min` reduction ``Op``\\s.
+
+    A maximum and a minimum reduction differ only in *which* element along the
+    reduced axes is selected; *how* derivatives propagate through that
+    selection is identical. In both cases the (weak) derivative routes through
+    the position(s) of the input that attain the reduced output. Keeping the
+    differentiation rules in a single place therefore avoids duplication and
+    guarantees that :class:`Max` and :class:`Min` stay consistent.
+
+    Subclasses only need to bind the appropriate scalar ``Op`` (``maximum`` or
+    ``minimum``) in their ``__init__`` and set ``nfunc_spec``.
+    """
+
+    def clone(self, **kwargs):
+        axis = kwargs.get("axis", self.axis)
+        initial = kwargs.get("initial", self.initial)
+        return type(self)(axis=axis, initial=initial)
+
+    def pullback(self, inputs, outputs, output_grads):
+        # The strict-sense mathematical gradient of a maximum/minimum reduction
+        # is not defined at points where the extremum is attained by more than
+        # one coordinate. However, since that set has null Lebesgue measure, the
+        # result below may be interpreted as a weak gradient: the cotangent is
+        # routed to *every* position that attains the extremum (i.e. where the
+        # input equals the reduced output). This rule is identical for `Max` and
+        # `Min`, which is why it lives on the shared base class.
+        #
+        # `out`/`g_out` have one fewer dimension than `x` along each reduced
+        # axis, so we re-insert those axes (`expand_dims`) to let broadcasting
+        # spread the cotangent back over `x`'s shape.
+        [x] = inputs
+        [out] = outputs
+        [g_out] = output_grads
+
+        axis = tuple(range(x.ndim)) if self.axis is None else self.axis
+        out_pad = expand_dims(out, axis)
+        g_out_pad = expand_dims(g_out, axis)
+
+        # Set the grad to the correct position.
+        g_x = eq(out_pad, x) * g_out_pad
+        return (g_x,)
+
+    def pushforward(self, inputs, outputs, tangents):
+        # Forward-mode is the exact transpose of `pullback`: the output tangent
+        # is gathered from the input tangent at the extremum position(s) and
+        # summed over the reduced axes. For a unique extremum (the almost-
+        # everywhere case) this simply selects the tangent of the winning
+        # element; on the zero-measure tie set it sums their tangents, which is
+        # precisely what makes it the transpose of `pullback` (and keeps
+        # forward- and reverse-mode consistent). Working for any number of
+        # reduced axes and input dimensions, this also generalises the previous
+        # matrix-only implementation.
+        [x] = inputs
+        [out] = outputs
+        [x_dot] = tangents
+
+        if isinstance(x_dot.type, DisconnectedType):
+            return [disconnected_type()]
+
+        axis = tuple(range(x.ndim)) if self.axis is None else self.axis
+        out_pad = expand_dims(out, axis)
+
+        out_dot = (eq(out_pad, x) * x_dot).sum(axis=axis)
+        return [out_dot]
+
+
+class Max(MaxAndMinCAReduce):
     nfunc_spec = ("max", 1, 1)
 
-    def __init__(self, axis):
-        super().__init__(ps.maximum, axis)
-
-    def clone(self, **kwargs):
-        axis = kwargs.get("axis", self.axis)
-        return type(self)(axis=axis)
-
-    def pullback(self, inputs, outputs, output_grads):
-        # The strict sense mathematical gradient of the maximum function is
-        # not calculated here for it is not defined at every point where some
-        # coordinates are identical. However, since the latter set has null
-        # Lebesgue measure, the result may be interpreted as weak gradient.
-
-        # @note: This function should work correctly for L{vector}s.
-        # (x, y), (gz, gw)
-        # gz*dz/dx + gw*dw/dx, gz*dz/dy + gw*dw/dy
-        # gMax * dMax/dx + gArgMax * dArgMax/dx,
-        # gMax * dMax/daxis + gArgMax * dArgMax/daxis
-        # g_max has one less dimension than x, so you need to complete
-        # g_max to x's shape when axis=0 the broadcasting mechanism
-        # does it automatically
-        [x] = inputs
-        [out] = outputs
-        [g_out] = output_grads
-
-        axis = tuple(range(x.ndim)) if self.axis is None else self.axis
-        out_pad = expand_dims(out, axis)
-        g_out_pad = expand_dims(g_out, axis)
-
-        # Set the grad to the correct position.
-        g_x = eq(out_pad, x) * g_out_pad
-        return (g_x,)
-
-    def pushforward(self, inputs, outputs, eval_points):
-        [x] = inputs
-        if isinstance(eval_points[0].type, DisconnectedType):
-            return [disconnected_type()]
-        axis = tuple(range(x.ndim) if self.axis is None else self.axis)
-        if isinstance(axis, int):
-            axis = [axis]
-        if len(axis) != 1:
-            raise NotImplementedError("R_op supported for max only for one axis!")
-        if axis[0] > 1:
-            raise NotImplementedError("R_op supported for max only when axis is 0 or 1")
-        if inputs[0].ndim != 2:
-            raise NotImplementedError(
-                "R_op supported for max only when input is a matrix"
-            )
-        max_pos = Argmax(self.axis)(*inputs)
-        if self.axis[0] == 0:
-            return [eval_points[0][max_pos, arange(eval_points[0].shape[1])]]
-        else:
-            return [eval_points[0][arange(eval_points[0].shape[0]), max_pos]]
+    def __init__(self, axis, initial=False):
+        super().__init__(ps.maximum, axis, initial=initial)
 
 
-class Min(NonZeroDimsCAReduce):
+class Min(MaxAndMinCAReduce):
     nfunc_spec = ("min", 1, 1)
 
-    def __init__(self, axis):
-        super().__init__(ps.minimum, axis)
-
-    def clone(self, **kwargs):
-        axis = kwargs.get("axis", self.axis)
-        return type(self)(axis=axis)
-
-    def pullback(self, inputs, outputs, output_grads):
-        # The strict sense mathematical gradient of the minimum function is
-        # not calculated here for it is not defined at every point where some
-        # coordinates are identical. However, since the latter set has null
-        # Lebesgue measure, the result may be interpreted as weak gradient.
-        [x] = inputs
-        [out] = outputs
-        [g_out] = output_grads
-
-        axis = tuple(range(x.ndim)) if self.axis is None else self.axis
-        out_pad = expand_dims(out, axis)
-        g_out_pad = expand_dims(g_out, axis)
-
-        # Set the grad to the correct position.
-        g_x = eq(out_pad, x) * g_out_pad
-        return (g_x,)
+    def __init__(self, axis, initial=False):
+        super().__init__(ps.minimum, axis, initial=initial)
 
 
-def max(x, axis=None, keepdims=False):
+def max(x, axis=None, keepdims=False, initial=None):
     """
     Returns maximum elements obtained by iterating over given axis.
 
@@ -499,20 +539,27 @@ def max(x, axis=None, keepdims=False):
         If this is set to True, the axes which are reduced are left in
         the result as dimensions with size one. With this option, the result
         will broadcast correctly against the original tensor.
+    initial: None or -inf
+        If ``-inf``, reducing an empty axis returns ``-inf`` (the lowest value
+        of the dtype for integer inputs) instead of raising. Other values are
+        not supported yet.
 
     Notes
     -----
-    We return an error as numpy when we reduce a dim with a shape of 0.
+    Without ``initial``, we return an error as numpy when we reduce a dim with
+    a shape of 0.
 
     """
-    out = Max(axis=axis)(x)
+    if initial is not None and float(initial) != -np.inf:
+        raise ValueError(f"initial must be None or -inf for max, got {initial}")
+    out = Max(axis=axis, initial=initial is not None)(x)
 
     if keepdims:
         out = makeKeepDims(x, out, axis)
     return out
 
 
-def min(x, axis=None, keepdims=False):
+def min(x, axis=None, keepdims=False, initial=None):
     """
     Returns minimum elements obtained by iterating over given axis.
 
@@ -525,18 +572,31 @@ def min(x, axis=None, keepdims=False):
         If this is set to True, the axes which are reduced are left in
         the result as dimensions with size one. With this option, the result
         will broadcast correctly against the original tensor.
+    initial: None or inf
+        If ``inf``, reducing an empty axis returns ``inf`` (the highest value
+        of the dtype for integer inputs) instead of raising. Other values are
+        not supported yet.
 
     """
     x = as_tensor_variable(x)
+    if initial is not None and float(initial) != np.inf:
+        raise ValueError(f"initial must be None or inf for min, got {initial}")
+    max_initial = None if initial is None else -np.inf
     str_x_type = str(x.dtype)
+    if str_x_type in int_dtypes and initial is not None:
+        # -max(-x) would overflow on the empty result
+        out = Min(axis=axis, initial=True)(x)
+        return makeKeepDims(x, out, axis) if keepdims else out
     if str_x_type.startswith("float") or str_x_type in int_dtypes:
-        return -max(-x, axis=axis, keepdims=keepdims)
+        return -max(-x, axis=axis, keepdims=keepdims, initial=max_initial)
     elif str_x_type in uint_dtypes:
         itype = np.iinfo(x.dtype)
         max_val = np.array(itype.max, dtype=itype.dtype)
-        return max_val - max(max_val - x, axis=axis, keepdims=keepdims)
+        return max_val - max(
+            max_val - x, axis=axis, keepdims=keepdims, initial=max_initial
+        )
     elif str_x_type == "bool":
-        return ~max(~x, axis=axis, keepdims=keepdims)
+        return ~max(~x, axis=axis, keepdims=keepdims, initial=max_initial)
     else:
         # Be careful about unsigned integers, complex
         raise NotImplementedError()
@@ -1542,8 +1602,8 @@ def sign(a):
 
     Notes
     -----
-    For complex inputs, this function
-    returns the sign of the magnitude.
+    For complex inputs, returns ``a / abs(a)`` when ``a != 0``, and zero
+    otherwise. The result gives the phase of each nonzero element.
     """
 
 
@@ -1795,7 +1855,6 @@ def sqrt(a):
     """
 
 
-@scalar_elemwise
 def deg2rad(a):
     """convert degree a to radian
 
@@ -1825,9 +1884,11 @@ def deg2rad(a):
     This function corresponds to NumPy's `np.deg2rad` function.
     The conversion formula is: radians = degrees * (π / 180)
     """
+    a = as_tensor_variable(a)
+    (out_type,) = ps.upgrade_to_float(ps.get_scalar_type(a.type.dtype))
+    return a * np.asarray(np.pi / 180, dtype=out_type.dtype)
 
 
-@scalar_elemwise
 def rad2deg(a):
     """convert radian a to degree
 
@@ -1858,6 +1919,9 @@ def rad2deg(a):
     This function corresponds to NumPy's `np.rad2deg` function.
     The conversion formula is: degrees = radians * (180 / π)
     """
+    a = as_tensor_variable(a)
+    (out_type,) = ps.upgrade_to_float(ps.get_scalar_type(a.type.dtype))
+    return a * np.asarray(180 / np.pi, dtype=out_type.dtype)
 
 
 @scalar_elemwise
@@ -2376,6 +2440,11 @@ def erfcinv(a):
 
 
 @scalar_elemwise
+def ndtri_exp(a):
+    """inverse standard normal cdf of the exponent of a"""
+
+
+@scalar_elemwise
 def owens_t(h, a):
     """owens t function"""
 
@@ -2424,14 +2493,14 @@ def gammaincc(k, x):
     """Regularized upper gamma function"""
 
 
-@scalar_elemwise
 def gammau(k, x):
     """Upper incomplete gamma function."""
+    return gammaincc(k, x) * gamma(k)
 
 
-@scalar_elemwise
 def gammal(k, x):
     """Lower incomplete gamma function."""
+    return gammainc(k, x) * gamma(k)
 
 
 @scalar_elemwise
@@ -2551,9 +2620,10 @@ def imag(z):
 _tensor_py_operators.imag = property(imag, doc=imag.__doc__)
 
 
-@scalar_elemwise
 def angle(z):
     """Return polar-coordinate angle of complex-valued tensor `z`"""
+    z = as_tensor_variable(z)
+    return arctan2(imag(z), real(z))
 
 
 @scalar_elemwise  # numpy.complex cannot build tensors
@@ -2576,9 +2646,14 @@ def conjugate(x):
 conj = conjugate
 
 
-@scalar_elemwise
 def complex_from_polar(abs, angle):
     """Return complex-valued tensor from polar coordinate specification."""
+    warnings.warn(
+        "complex_from_polar is deprecated and will be removed in a future release. "
+        "Use `complex(abs * cos(angle), abs * sin(angle))` instead.",
+        FutureWarning,
+    )
+    return complex(abs * cos(angle), abs * sin(angle))
 
 
 def mean(input, axis=None, dtype=None, keepdims=False, acc_dtype=None):
@@ -2681,15 +2756,12 @@ def var(input, axis=None, ddof=0, keepdims=False, corrected=False):
                           axis=None, ddof=0, keepdims=False, corrected=False)"
         )
 
+    input = as_tensor_variable(input)
     input_ndim = input.type.ndim
     if axis is None:
         axis = list(range(input_ndim))
-    elif isinstance(axis, int | np.integer):
-        axis = [axis]
-    elif isinstance(axis, np.ndarray) and axis.ndim == 0:
-        axis = [int(axis)]
     else:
-        axis = [int(a) for a in axis]
+        axis = list(normalize_axis_tuple(axis, input_ndim))
 
     # compute the axis-wise mean
     mean_input = mean(input, axis, keepdims=True)
@@ -2700,23 +2772,23 @@ def var(input, axis=None, ddof=0, keepdims=False, corrected=False):
     # return the mean sqr
     two = constant(2, dtype=centered_input.dtype)
     if ddof == 0:
-        v = mean((centered_input**two), axis, keepdims=keepdims)
+        v = mean((centered_input**two), axis=axis, keepdims=keepdims)
     else:
-        shp = shape(input) - ddof
+        shp = shape(input)
+        reduced_dims = [shp[i] for i in axis]
+        n_elems = variadic_mul(*reduced_dims)
+        div = (n_elems - ddof).astype(centered_input.dtype)
         v = sum((centered_input**two), axis=axis, keepdims=keepdims)
-        for i in axis:
-            v = true_div(v, shp[i])
+        v = true_div(v, div)
 
     # use 'corrected_two_pass' algorithm
     if corrected:
         if ddof == 0:
-            error = mean(centered_input, axis, keepdims=keepdims) ** 2
+            error = mean(centered_input, axis=axis, keepdims=keepdims) ** 2
         else:
-            shp = shape(input) - ddof
-            shp_inp = shape(input)
+            denom = ((n_elems - ddof) * n_elems).astype(centered_input.dtype)
             error = sum(centered_input, axis=axis, keepdims=keepdims) ** 2
-            for i in axis:
-                error = true_div(error, shp[i] * shp_inp[i])
+            error = true_div(error, denom)
         v = v - error
 
     v.name = "var"
@@ -2778,8 +2850,6 @@ def median(x: TensorLike, axis=None) -> TensorVariable:
         Compute the median along this axis of the tensor.
         None means all axes (like numpy).
     """
-    from pytensor.ifelse import ifelse
-
     x = as_tensor_variable(x)
     x_ndim = x.type.ndim
     if axis is None:
@@ -2805,7 +2875,7 @@ def median(x: TensorLike, axis=None) -> TensorVariable:
     even_median = (k_values + km1_values) / 2.0
     odd_median = k_values.astype(even_median.type.dtype)
     even_k = eq(mod(raveled_size, 2), 0)
-    return ifelse(even_k, even_median, odd_median, name="median")
+    return pytensor.ifelse(even_k, even_median, odd_median, name="median")
 
 
 @scalar_elemwise
@@ -3038,8 +3108,6 @@ class Dot(Op):
     -----
     Matrix-matrix products are sometimes optimized to Dot22 or Gemm ops
     (see tensor.blas).
-    Vector-vector products are sometimes optimized to Ger or CGer (see
-    tensor.blas).
     Matrix-vector products are sometimes optimized to Gemv, CGemv (see
     tensor.blas).
 
@@ -3189,8 +3257,6 @@ def dense_dot(a, b):
     -----
     Matrix-matrix products are sometimes optimized to Dot22 or Gemm ops
     (see tensor.blas).
-    Vector-vector products are sometimes optimized to Ger or CGer (see
-    tensor.blas).
     Matrix-vector products are sometimes optimized to Gemv, CGemv (see
     tensor.blas).
 
@@ -3883,53 +3949,6 @@ def power(x, y):
     return x**y
 
 
-def logaddexp(*xs):
-    """Logarithm of the sum of exponentiations of the inputs.
-
-    See ``numpy.logaddexp``.
-
-    Parameters
-    ----------
-    xs : symbolic tensors
-        Input
-
-    Returns
-    -------
-    TensorVariable
-
-    """
-
-    return log(add(*[exp(x) for x in xs]))
-
-
-def logsumexp(x, axis=None, keepdims=False):
-    """Compute the log of the sum of exponentials of input elements.
-
-    See ``scipy.special.logsumexp``.
-
-    Parameters
-    ----------
-    x : symbolic tensor
-        Input
-
-    axis : None or int or tuple of ints, optional
-        Axis or axes over which the sum is taken. By default axis is None,
-        and all elements are summed.
-
-    keepdims : bool, optional
-        If this is set to True, the axes which are reduced are left in the
-        result as dimensions with size one. With this option, the result will
-        broadcast correctly against the original array.
-
-    Returns
-    -------
-    TensorVariable
-
-    """
-
-    return log(sum(exp(x), axis=axis, keepdims=keepdims))
-
-
 _matmul = Blockwise(_dot, name="Matmul")
 
 
@@ -4313,8 +4332,6 @@ __all__ = [
     "log1pexp",
     "log2",
     "log10",
-    "logaddexp",
-    "logsumexp",
     "lt",
     "matmul",
     "matvec",
@@ -4328,6 +4345,7 @@ __all__ = [
     "mod",
     "mul",
     "nan_to_num",
+    "ndtri_exp",
     "neg",
     "neq",
     "not_equal",
@@ -4356,7 +4374,6 @@ __all__ = [
     "sqr",
     "sqrt",
     "square",
-    "std",
     "std",
     "sub",
     "sum",

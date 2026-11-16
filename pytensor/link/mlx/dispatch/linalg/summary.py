@@ -5,23 +5,13 @@ from pytensor.tensor.linalg.summary import Det, SLogDet
 
 
 def _lu_det_parts(x):
-    """Shared helper: compute sign and logdet via LU factorization."""
-    lu, pivots = mx.linalg.lu_factor(x, stream=mx.cpu)
-    diag_u = mx.diagonal(lu, stream=mx.cpu)
-    n_swaps = mx.sum(
-        pivots != mx.arange(pivots.shape[0], dtype=pivots.dtype, stream=mx.cpu),
-        stream=mx.cpu,
-    )
+    """Compute sign and logdet via LU factorization. Call within a CPU stream context."""
+    lu, pivots = mx.linalg.lu_factor(x)
+    diag_u = mx.diagonal(lu, axis1=-2, axis2=-1)
+    n_swaps = mx.sum(pivots != mx.arange(pivots.shape[-1], dtype=pivots.dtype), axis=-1)
     pivot_sign = 1 - 2 * (n_swaps % 2)
-    sign = mx.multiply(
-        pivot_sign,
-        mx.prod(mx.sign(diag_u, stream=mx.cpu), stream=mx.cpu),
-        stream=mx.cpu,
-    )
-    logabsdet = mx.sum(
-        mx.log(mx.abs(diag_u, stream=mx.cpu), stream=mx.cpu),
-        stream=mx.cpu,
-    )
+    sign = pivot_sign * mx.prod(mx.sign(diag_u), axis=-1)
+    logabsdet = mx.sum(mx.log(mx.abs(diag_u)), axis=-1)
     return sign, logabsdet
 
 
@@ -30,9 +20,11 @@ def mlx_funcify_Det(op, node, **kwargs):
     X_dtype = getattr(mx, node.inputs[0].dtype)
 
     def det(x):
-        sign, logabsdet = _lu_det_parts(x.astype(dtype=X_dtype, stream=mx.cpu))
-        return mx.multiply(sign, mx.exp(logabsdet, stream=mx.cpu), stream=mx.cpu)
+        with mx.stream(mx.cpu):
+            sign, logabsdet = _lu_det_parts(x.astype(dtype=X_dtype))
+            return sign * mx.exp(logabsdet)
 
+    det.natively_batched = True
     return det
 
 
@@ -41,6 +33,8 @@ def mlx_funcify_SLogDet(op, node, **kwargs):
     X_dtype = getattr(mx, node.inputs[0].dtype)
 
     def slogdet(x):
-        return _lu_det_parts(x.astype(dtype=X_dtype, stream=mx.cpu))
+        with mx.stream(mx.cpu):
+            return _lu_det_parts(x.astype(dtype=X_dtype))
 
+    slogdet.natively_batched = True
     return slogdet

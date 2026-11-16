@@ -32,7 +32,9 @@ from pytensor.scalar.math import (
     Ive,
     Kve,
     Log1mexp,
+    NdtriExp,
     Psi,
+    Sigmoid,
     TriGamma,
 )
 
@@ -262,12 +264,37 @@ def jax_funcify_Erfinv(op, **kwargs):
 
 
 @jax_funcify.register(BetaIncInv)
-@jax_funcify.register(Erfcx)
-@jax_funcify.register(Erfcinv)
 def jax_funcify_from_tfp(op, **kwargs):
     tfp_jax_op = try_import_tfp_jax_op(op)
 
     return tfp_jax_op
+
+
+@jax_funcify.register(Erfcx)
+def jax_funcify_Erfcx(op, **kwargs):
+    if hasattr(jax.scipy.special, "erfcx"):
+        return jax.scipy.special.erfcx
+    # jax < 0.11 has no native erfcx
+    return try_import_tfp_jax_op(op)
+
+
+@jax_funcify.register(Erfcinv)
+def jax_funcify_Erfcinv(op, **kwargs):
+    def erfcinv(x):
+        # erfc(z) = 2 ndtr(-z * sqrt(2)), so z = -ndtri(x / 2) / sqrt(2)
+        return -jax.scipy.special.ndtri(x / 2) / jnp.sqrt(2)
+
+    return erfcinv
+
+
+@jax_funcify.register(NdtriExp)
+def jax_funcify_NdtriExp(op, **kwargs):
+    def ndtri_exp(x):
+        # JAX has no ndtri_exp, so this composition loses accuracy where
+        # exp(x) underflows
+        return jax.scipy.special.ndtri(jnp.exp(x))
+
+    return ndtri_exp
 
 
 @jax_funcify.register(Ive)
@@ -306,21 +333,27 @@ def jax_funcify_TriGamma(op, node, **kwargs):
     return tri_gamma
 
 
+@jax_funcify.register(Sigmoid)
+def jax_funcify_Sigmoid(op, node, **kwargs):
+    out_dtype = node.outputs[0].dtype
+
+    def sigmoid(x):
+        x = jnp.asarray(x, dtype=out_dtype)
+        # exp(-|x|) is shared with Softplus, so XLA can reuse it when both are fused
+        e = jnp.exp(-jnp.abs(x))
+        return jnp.where(x >= 0, 1, e) / (1 + e)
+
+    return sigmoid
+
+
 @jax_funcify.register(Softplus)
-def jax_funcify_Softplus(op, **kwargs):
+def jax_funcify_Softplus(op, node, **kwargs):
+    out_dtype = node.outputs[0].dtype
+
     def softplus(x):
-        return jnp.where(
-            x < -37.0,
-            jnp.exp(x),
-            jnp.where(
-                x < 18.0,
-                jnp.log1p(jnp.exp(x)),
-                jnp.where(
-                    x < 33.3,
-                    x + jnp.exp(-x),
-                    x,
-                ),
-            ),
-        )
+        x = jnp.asarray(x, dtype=out_dtype)
+        # Branch-free, and exp(-|x|) is shared with Sigmoid. `where` rather than `maximum`,
+        # whose JAX gradient splits the tie at 0 and would cancel the log1p term's.
+        return jnp.where(x >= 0, x, 0) + jnp.log1p(jnp.exp(-jnp.abs(x)))
 
     return softplus

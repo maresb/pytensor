@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 import scipy.special
 from numpy.testing import assert_array_equal
-from scipy.special import logsumexp as scipy_logsumexp
 
 import pytensor
 import pytensor.scalar as ps
@@ -89,8 +88,6 @@ from pytensor.tensor.math import (
     log1p,
     log2,
     log10,
-    logaddexp,
-    logsumexp,
     matmul,
     matvec,
     max,
@@ -120,6 +117,7 @@ from pytensor.tensor.math import (
     smallest,
     sqr,
     sqrt,
+    std,
     sub,
     tan,
     tanh,
@@ -151,7 +149,6 @@ from pytensor.tensor.type import (
     matrices,
     matrix,
     scalar,
-    scalars,
     tensor,
     tensor3,
     tensor4,
@@ -414,7 +411,7 @@ TestNegBroadcast = makeBroadcastTester(
 TestSgnBroadcast = makeBroadcastTester(
     op=sign,
     expected=np.sign,
-    good=_good_broadcast_unary_normal_no_complex,
+    good=_good_broadcast_unary_normal,
     grad=_grad_broadcast_unary_normal,
 )
 
@@ -1269,6 +1266,32 @@ class TestArgminArgmax:
 class TestMinMax:
     def setup_method(self):
         Max.debug = 0
+
+    @pytest.mark.parametrize("dtype", ["float64", "int64", "uint8", "bool"])
+    def test_initial(self, dtype):
+        x = tensor("x", shape=(None, 3), dtype=dtype)
+        f = function(
+            [x], [max(x, axis=0, initial=-np.inf), min(x, axis=0, initial=np.inf)]
+        )
+        if dtype == "float64":
+            lo, hi = -np.inf, np.inf
+        elif dtype == "bool":
+            lo, hi = False, True
+        else:
+            lo, hi = np.iinfo(dtype).min, np.iinfo(dtype).max
+        empty_max, empty_min = f(np.zeros((0, 3), dtype=dtype))
+        assert_array_equal(empty_max, np.full(3, lo, dtype=dtype))
+        assert_array_equal(empty_min, np.full(3, hi, dtype=dtype))
+
+        data = np.array([[1, 0, 1], [0, 0, 1]], dtype=dtype)
+        res_max, res_min = f(data)
+        assert_array_equal(res_max, data.max(axis=0))
+        assert_array_equal(res_min, data.min(axis=0))
+
+        with pytest.raises(ValueError):
+            max(x, initial=0)
+        with pytest.raises(ValueError):
+            min(x, initial=-np.inf)
 
     def test_scalar(self):
         for fct in [max, min]:
@@ -2571,8 +2594,38 @@ def test_var():
     v = v - error
     assert np.allclose(v, f(a_val))
 
-    # Test that we don't upcast float16 computation
+    # Test that we don't upcast float16/float32 computation
     assert vector(dtype="float16").var().dtype == "float16"
+    assert vector(dtype="float16").var(ddof=1).dtype == "float16"
+    assert vector(dtype="float32").var(ddof=1).dtype == "float32"
+
+
+@pytest.mark.parametrize(
+    "axis",
+    [None, 0, (0, 1), (1, 2), (-2, -1), (0, 1, 2)],
+)
+@pytest.mark.parametrize("ddof", [0, 1])
+@pytest.mark.parametrize("corrected", [False, True])
+@pytest.mark.parametrize("keepdims", [False, True])
+def test_var_std_multi_axis_ddof(axis, ddof, corrected, keepdims):
+    # Regression test for https://github.com/pymc-devs/pytensor/issues/2493
+    # Multi-axis sample variance and standard deviation must compute the divisor
+    # as (N - ddof) where N is the total number of reduced elements across all axes,
+    # rather than subtracting ddof from each dimension separately.
+    x = tensor3("x", dtype="float64")
+    f_var = function(
+        [x], var(x, axis=axis, ddof=ddof, keepdims=keepdims, corrected=corrected)
+    )
+    f_std = function(
+        [x], std(x, axis=axis, ddof=ddof, keepdims=keepdims, corrected=corrected)
+    )
+
+    val = np.arange(24, dtype="float64").reshape(2, 3, 4)
+    np_var = np.var(val, axis=axis, ddof=ddof, keepdims=keepdims)
+    np_std = np.std(val, axis=axis, ddof=ddof, keepdims=keepdims)
+
+    np.testing.assert_allclose(f_var(val), np_var)
+    np.testing.assert_allclose(f_std(val), np_std)
 
 
 class TestSum:
@@ -3701,80 +3754,10 @@ def test_tanh_grad_broadcast():
     grad(tanh(x + y).sum(), [x, y])
 
 
-def test_logaddexp():
-    # Test more than two multidimensional inputs
-    x, y, z = matrices("x", "y", "z")
-    out = logaddexp(x, y, z)
-    f = function([x, y, z], out)
-
-    inp = np.zeros((3, 3), dtype=config.floatX)
-    np.testing.assert_allclose(
-        f(inp, inp, inp),
-        np.full((3, 3), np.log(3)),
-    )
-
-    # Test scalar inputs
-    x, y = scalars("x", "y")
-    out = logaddexp(x, y)
-    f = function([x, y], out)
-
-    res = f(0, 0)
-    assert np.ndim(res) == 0
-    assert np.isclose(res, np.log(2))
-
-    # Test scalar and matrix inputs
-    x = scalar("x")
-    y = matrix("y")
-    out = logaddexp(x, y)
-    f = function([x, y], out)
-
-    res = f(
-        np.array(0, dtype=config.floatX),
-        np.zeros((3, 3), dtype=config.floatX),
-    )
-    assert np.shape(res) == (3, 3)
-    np.testing.assert_allclose(
-        res,
-        np.full((3, 3), np.log(2)),
-    )
-
-
-@pytest.mark.parametrize(
-    ["shape", "axis"],
-    [
-        ((1,), 0),
-        ((3,), 0),
-        ((3, 4), None),
-        ((3, 4), 0),
-        ((3, 4), 1),
-        ((3, 4, 5), None),
-        ((3, 3, 5), 0),
-        ((3, 4, 5), 1),
-        ((3, 4, 5), 2),
-    ],
-)
-@pytest.mark.parametrize(
-    "keepdims",
-    [True, False],
-)
-def test_logsumexp(shape, axis, keepdims):
-    scipy_inp = np.zeros(shape)
-    scipy_out = scipy_logsumexp(scipy_inp, axis=axis, keepdims=keepdims)
-
-    pytensor_inp = as_tensor_variable(scipy_inp)
-    f = function([], logsumexp(pytensor_inp, axis=axis, keepdims=keepdims))
-    pytensor_out = f()
-
-    np.testing.assert_array_almost_equal(
-        pytensor_out,
-        scipy_out,
-    )
-
-
 def test_pprint():
     x = vector("x")
     y = pt_sum(x, axis=0)
-    assert pprint(y) == "sum(x, axis=(0,))"
+    assert pprint(y) == "sum(x, axis=None)"
 
 
 def test_log1mexp_grad_lim():

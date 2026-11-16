@@ -26,7 +26,15 @@ from pytensor.graph.basic import (
 from pytensor.graph.features import AlreadyThere, Feature
 from pytensor.graph.fg import FunctionGraph, Output
 from pytensor.graph.op import Op
-from pytensor.graph.rewriting.unify import OpPattern, Var, convert_strs_to_vars
+from pytensor.graph.rewriting.unify import (
+    Asterisk,
+    OpPattern,
+    PatternNode,
+    PatternVar,
+    convert_strs_to_vars,
+    match_pattern,
+    reify_pattern,
+)
 from pytensor.graph.traversal import (
     apply_ancestors,
     applys_between,
@@ -35,7 +43,6 @@ from pytensor.graph.traversal import (
 )
 from pytensor.graph.utils import AssocList, InconsistencyError
 from pytensor.misc.ordered_set import OrderedSet
-from pytensor.utils import flatten
 
 
 _logger = logging.getLogger("pytensor.graph.rewriting.basic")
@@ -697,6 +704,15 @@ class MergeOptimizer(GraphRewriter):
             fgraph.attach_feature(MergeFeature())
 
     def apply(self, fgraph):
+        def has_direct_destroyer(var):
+            """Whether any direct client destroys `var` (view-chain destroyers not seen)."""
+            return any(
+                i in destroyed_idxs
+                for client, i in fgraph.clients[var]
+                if client.op.destroy_map
+                for destroyed_idxs in client.op.destroy_map.values()
+            )
+
         sched = fgraph.merge_feature.scheduled
         nb_fail = 0
         t0 = time.perf_counter()
@@ -747,15 +763,17 @@ class MergeOptimizer(GraphRewriter):
                         continue
 
                     if hasattr(fgraph, "destroy_handler"):
-                        # If both nodes have clients that destroy them, we
-                        # can't merge them.
-                        clients = (
-                            fgraph.clients[pairs[0][0]] + fgraph.clients[pairs[0][1]]
-                        )
-                        if any(
-                            i in flatten(c.op.destroy_map.values())
-                            for c, i in clients
-                            if c.op.destroy_map
+                        # Merging two variables that both have a destroyer is
+                        # always rejected by `DestroyHandler` validation
+                        # ("multiple destroyers") -- skip those outright
+                        # instead of paying a checkpoint + failed validate +
+                        # revert per scheduled pair. A single-destroyer merge
+                        # may still be feasible, and destroyers reachable only
+                        # through view chains are rare: both are left to
+                        # validation, keeping this check O(clients) with no
+                        # droot recomputation.
+                        if has_direct_destroyer(pairs[0][0]) and has_direct_destroyer(
+                            pairs[0][1]
                         ):
                             continue
 
@@ -1119,7 +1137,7 @@ class OpToRewriterTracker:
                     else:
                         # An OpPattern without parameters behaves like a regular tracked_type
                         self.tracked_types[c.op_type].append(rw)
-                if isinstance(c, type):
+                elif isinstance(c, type):
                     self.tracked_types[c].append(rw)
                 else:
                     self.tracked_instances[c].append(rw)
@@ -1462,17 +1480,27 @@ class PatternNodeRewriter(NodeRewriter):
 
     .. code-block:: python
 
+        from pytensor.graph.basic import Constant
         from pytensor.graph.rewriting.basic import PatternNodeRewriter
-        from pytensor.tensor import add, mul, sub, pow, square
+        from pytensor.tensor import add, log, mul, pow, square, sub, true_div
 
-        PatternNodeRewriter((add, "x", "y"), (add, "y", "x"))
+
+        def positive_constant(expr):
+            return isinstance(expr, Constant) and bool((expr.data > 0).all())
+
+
         PatternNodeRewriter((mul, "x", "x"), (square, "x"))
         PatternNodeRewriter((sub, (add, "x", "y"), "y"), "x")
         PatternNodeRewriter((pow, "x", 2.0), (square, "x"))
+        # log(x / c) -> log(x) - log(c), but only when `c` is a positive constant.
+        # The dict form attaches a constraint that restricts when "c" matches.
         PatternNodeRewriter(
-            (mul, {"pattern": "x", "constraint": lambda expr: expr.ndim == 0}, "y"),
-            (mul, "y", "x"),
+            (log, (true_div, "x", {"pattern": "c", "constraint": positive_constant})),
+            (sub, (log, "x"), (log, "c")),
         )
+
+    Inputs of commutative ops (such as ``add`` and ``mul``) are matched in any
+    order automatically, so there is no need to write both orderings of a pattern.
 
     You can use OpPattern to match a subtype of an Op, with some parameter constraints
     You can also specify a callable as the output pattern, which will be called with (fgraph, node, subs_dict) as arguments.
@@ -1566,9 +1594,14 @@ class PatternNodeRewriter(NodeRewriter):
         frequent `Op`, which will prevent the rewrite from being tried as often.
 
         """
-        var_map: dict[str, Var] = {}
+        var_map: dict[str, PatternVar] = {}
         self.in_pattern = convert_strs_to_vars(in_pattern, var_map=var_map)
         self.out_pattern = convert_strs_to_vars(out_pattern, var_map=var_map)
+        if not isinstance(self.in_pattern, PatternNode):
+            raise TypeError(
+                "The in_pattern must be a tuple starting with an Op or OpPattern; "
+                f"got {in_pattern!r} of type {type(in_pattern)}"
+            )
         self.values_eq_approx = values_eq_approx
         self.allow_cast = allow_cast
         self.allow_multiple_clients = allow_multiple_clients
@@ -1580,27 +1613,15 @@ class PatternNodeRewriter(NodeRewriter):
                 raise ValueError("Custom `tracks` requires `get_nodes` to be provided.")
             self._tracks = tracks
         else:
-            if isinstance(in_pattern, list | tuple):
-                op = self.in_pattern[0]
-            elif isinstance(in_pattern, dict):
-                op = self.in_pattern["pattern"][0]
-            else:
-                raise TypeError(
-                    f"The in_pattern must be a sequence or a dict, but got {in_pattern} of type {type(in_pattern)}"
-                )
+            op = self.in_pattern.op_match
             if isinstance(op, Op):
                 self._tracks = [op]
-            elif isinstance(op, type) and issubclass(op, Op):
-                raise ValueError(
-                    f"The in_pattern starts with an Op class {op}, not an instance.\n"
-                    "You can use pytensor.graph.unify.OpPattern instead if you want to match instances of a class."
-                )
             elif isinstance(op, OpPattern):
                 self._tracks = [op.op_type]
             else:
                 raise ValueError(
                     f"The in_pattern must start with a specific Op or an OpPattern instance. "
-                    f"Got {op}, with type {type(op)}."
+                    f"Got {op!r}, with type {type(op)}."
                 )
 
     def tracks(self):
@@ -1612,9 +1633,6 @@ class PatternNodeRewriter(NodeRewriter):
         If it does, it constructs ``out_pattern`` and performs the replacement.
 
         """
-        from etuples.core import ExpressionTuple
-        from unification import reify, unify
-
         if get_nodes and self.get_nodes is not None:
             for real_node in self.get_nodes(fgraph, node):
                 ret = self.transform(fgraph, real_node, get_nodes=False)
@@ -1625,13 +1643,20 @@ class PatternNodeRewriter(NodeRewriter):
             # PatternNodeRewriter doesn't support replacing multi-output nodes
             return False
 
-        s = unify(self.in_pattern, node.out, {})
-
-        if s is False:
+        s = match_pattern(self.in_pattern, node)
+        if s is None:
             return False
 
         if not self.allow_multiple_clients:
-            input_vars = set(s.values())
+            # The matched subgraph's internal nodes (those strictly between the
+            # captured inputs and the root) must not be used elsewhere, or the
+            # replacement would leave/duplicate their computation.
+            input_vars = set()
+            for v in s.values():
+                if isinstance(v, tuple):  # Asterisk captures a tuple of inputs
+                    input_vars.update(v)
+                else:
+                    input_vars.add(v)
             clients = fgraph.clients
             if any(
                 len(clients[v]) > 1
@@ -1651,9 +1676,7 @@ class PatternNodeRewriter(NodeRewriter):
                     f"The output of the PatternNodeRewriter callable must be a variable got {ret} of type {type(ret)}."
                 )
         else:
-            ret = reify(self.out_pattern, s)
-            if isinstance(ret, ExpressionTuple):
-                ret = ret.evaled_obj
+            ret = reify_pattern(self.out_pattern, s)
 
         if self.values_eq_approx:
             ret.tag.values_eq_approx = self.values_eq_approx
@@ -1683,13 +1706,15 @@ class PatternNodeRewriter(NodeRewriter):
             return self.__name__
 
         def pattern_to_str(pattern):
-            if isinstance(pattern, list | tuple):
-                args = ", ".join(pattern_to_str(p) for p in pattern[1:])
-                return f"{pattern[0]!s}({args})"
-            elif isinstance(pattern, dict):
-                a = pattern_to_str(pattern["pattern"])
-                b = pattern.get("constraint", "no conditions")
-                return f"{a} subject to {b}"
+            if isinstance(pattern, PatternNode):
+                args = ", ".join(pattern_to_str(p) for p in pattern.inputs)
+                return f"{pattern.op_match!s}({args})"
+            elif isinstance(pattern, PatternVar):
+                if pattern.constraint is not None:
+                    return f"{pattern.token} subject to {pattern.constraint}"
+                return pattern.token
+            elif isinstance(pattern, Asterisk):
+                return f"*{pattern.token}"
             else:
                 return str(pattern)
 
@@ -2400,7 +2425,7 @@ class EquilibriumGraphRewriter(NodeProcessingGraphRewriter):
                     for node_rewriter in self.node_tracker.get_trackers(node.op):
                         nb = change_tracker.nb_imported
                         t_rewrite = time.perf_counter()
-                        # Tracks are already enfoced by `self.node_tracker.get_trackers`
+                        # Tracks are already enforced by `self.node_tracker.get_trackers`
                         node_rewriter_change = self.process_node(
                             fgraph, node, node_rewriter, enforce_tracks=False
                         )
@@ -2853,9 +2878,9 @@ def copy_stack_trace(from_var, to_var):
     Parameters
     ----------
     from_var :
-        `Variable` or list `Variable`\s to copy stack traces from.
+        `Variable` or list/tuple of `Variable`\s to copy stack traces from.
     to_var :
-        `Variable` or list `Variable`\s to copy stack traces to.
+        `Variable` or list/tuple of `Variable`\s to copy stack traces to.
 
     Notes
     -----
@@ -2864,34 +2889,98 @@ def copy_stack_trace(from_var, to_var):
     and so on. Each list of tuples contains the truples belonging to a
     particular `Variable`.
 
+    Self-copies are ignored, including overlap between source and destination
+    lists or tuples.
+
     """
 
-    # Store stack traces from from_var
-    tr = []
-    if isinstance(from_var, Iterable) and not isinstance(from_var, Variable):
-        # If from_var is a list, store concatenated stack traces
-        for v in from_var:
-            tr += getattr(v.tag, "trace", [])
+    # Access metadata directly to avoid Scratchpad's Python attribute hooks.
+    if isinstance(from_var, Variable):
+        if isinstance(to_var, Variable):
+            target = to_var
+        elif len(to_var) == 1:
+            target = to_var[0]
+        else:
+            if trace := object.__getattribute__(from_var.tag, "__dict__").get("trace"):
+                if isinstance(trace[0], tuple):
+                    trace = [trace]
+                for var in to_var:
+                    if var is not from_var:
+                        tag = object.__getattribute__(var.tag, "__dict__")
+                        tag["trace"] = tag.get("trace", []) + trace
+            return to_var
 
+        if from_var is target:
+            return to_var
+        if trace := object.__getattribute__(from_var.tag, "__dict__").get("trace"):
+            if isinstance(trace[0], tuple):
+                trace = [trace]
+            tag = object.__getattribute__(target.tag, "__dict__")
+            tag["trace"] = tag.get("trace", []) + trace
+    elif isinstance(to_var, Variable):
+        tr = []
+        for var in from_var:
+            if var is to_var:
+                continue
+            if trace := object.__getattribute__(var.tag, "__dict__").get("trace"):
+                tr += trace
+        if tr:
+            if isinstance(tr[0], tuple):
+                tr = [tr]
+            tag = object.__getattribute__(to_var.tag, "__dict__")
+            tag["trace"] = tag.get("trace", []) + tr
     else:
-        # If from_var is not a list, it must be a single tensor variable,
-        # so just store that particular stack trace
-        tr = getattr(from_var.tag, "trace", [])
+        if len(from_var) == 1 and len(to_var) == 1:
+            source, target = from_var[0], to_var[0]
+            if source is target:
+                return to_var
+            if trace := object.__getattribute__(source.tag, "__dict__").get("trace"):
+                if isinstance(trace[0], tuple):
+                    trace = [trace]
+                tag = object.__getattribute__(target.tag, "__dict__")
+                tag["trace"] = tag.get("trace", []) + trace
+            return to_var
 
-    if tr and isinstance(tr[0], tuple):
-        # There was one single stack trace, we encapsulate it in a list
-        tr = [tr]
+        if set(from_var).isdisjoint(to_var):
+            tr = []
+            for var in from_var:
+                tr += object.__getattribute__(var.tag, "__dict__").get("trace", ())
+            if tr:
+                if isinstance(tr[0], tuple):
+                    tr = [tr]
+                for var in to_var:
+                    tag = object.__getattribute__(var.tag, "__dict__")
+                    tag["trace"] = tag.get("trace", []) + tr
+            return to_var
 
-    # Copy over stack traces to to_var
-    if isinstance(to_var, Iterable) and not isinstance(to_var, Variable):
-        # Copy over stack traces from from_var to each variable in
-        # to_var, including the stack_trace of the to_var before
-        for v in to_var:
-            v.tag.trace = getattr(v.tag, "trace", []) + tr
-    else:
-        # Copy over stack traces from from_var to each variable to
-        # to_var, including the stack_trace of the to_var before
-        to_var.tag.trace = getattr(to_var.tag, "trace", []) + tr
+        # Snapshot sources and aggregate once for destinations without overlap.
+        source_traces = {}
+        tr = []
+        for var in from_var:
+            source_traces[var] = trace = (
+                object.__getattribute__(var.tag, "__dict__").get("trace") or ()
+            )
+            tr += trace
+        if not tr:
+            return to_var
+        if isinstance(tr[0], tuple):
+            tr = [tr]
+
+        for var in to_var:
+            if var in source_traces:
+                trace = [
+                    trace
+                    for source in from_var
+                    if source is not var
+                    for trace in source_traces[source]
+                ]
+                if trace and isinstance(trace[0], tuple):
+                    trace = [trace]
+            else:
+                trace = tr
+            if trace:
+                tag = object.__getattribute__(var.tag, "__dict__")
+                tag["trace"] = tag.get("trace", []) + trace
     return to_var
 
 

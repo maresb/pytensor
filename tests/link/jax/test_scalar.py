@@ -1,8 +1,10 @@
 import numpy as np
 import pytest
+from scipy.special import expit
 
 import pytensor.scalar.basic as ps
 import pytensor.tensor as pt
+from pytensor import function
 from pytensor.configdefaults import config
 from pytensor.graph.fg import FunctionGraph
 from pytensor.scalar.basic import Composite
@@ -23,6 +25,7 @@ from pytensor.tensor.math import (
     kve,
     log,
     log1mexp,
+    ndtri_exp,
     polygamma,
     psi,
     sigmoid,
@@ -30,7 +33,7 @@ from pytensor.tensor.math import (
     tri_gamma,
 )
 from pytensor.tensor.type import matrix, scalar, vector
-from tests.link.jax.test_basic import compare_jax_and_py
+from tests.link.jax.test_basic import compare_jax_and_py, jax_mode
 
 
 jax = pytest.importorskip("jax")
@@ -43,6 +46,12 @@ try:
     TFP_INSTALLED = True
 except ModuleNotFoundError:
     TFP_INSTALLED = False
+
+
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+def test_complex_sign(dtype):
+    x = vector("x", dtype=dtype)
+    compare_jax_and_py([x], [pt.sign(x)], [np.array([0, 3 + 4j, -2j, -1], dtype=dtype)])
 
 
 def test_second():
@@ -143,11 +152,16 @@ def test_erfinv():
     compare_jax_and_py([x], [out], [0.95])
 
 
+def test_ndtri_exp():
+    x = scalar("x")
+    out = ndtri_exp(x)
+
+    compare_jax_and_py([x], [out], [-4.0])
+
+
 @pytest.mark.parametrize(
     "op, test_values",
     [
-        (erfcx, (0.7,)),
-        (erfcinv, (0.7,)),
         (iv, (0.3, 0.7)),
         (kve, (-2.5, 2.0)),
     ],
@@ -158,6 +172,24 @@ def test_tfp_ops(op, test_values):
     output = op(*inputs)
 
     compare_jax_and_py(inputs, [output], test_values)
+
+
+@pytest.mark.skipif(
+    not (hasattr(jax.scipy.special, "erfcx") or TFP_INSTALLED),
+    reason="erfcx needs jax >= 0.11 or tensorflow-probability",
+)
+def test_erfcx():
+    x = scalar("x")
+    out = erfcx(x)
+
+    compare_jax_and_py([x], [out], [0.7])
+
+
+def test_erfcinv():
+    x = scalar("x")
+    out = erfcinv(x)
+
+    compare_jax_and_py([x], [out], [0.7])
 
 
 def test_betaincinv():
@@ -231,13 +263,37 @@ def test_log1mexp():
 
 def test_nnet():
     x = vector("x")
-    x_test_value = np.r_[1.0, 2.0].astype(config.floatX)
+    x_test_value = np.r_[-1e3, -40.0, -17.5, 0.0, 1.0, 17.5, 40.0, 1e3].astype(
+        config.floatX
+    )
 
     out = sigmoid(x)
     compare_jax_and_py([x], [out], [x_test_value])
 
     out = softplus(x)
     compare_jax_and_py([x], [out], [x_test_value])
+
+    x = vector("x", dtype="uint8")
+    compare_jax_and_py(
+        [x], [sigmoid(x), softplus(x)], [np.array([0, 20, 255], dtype="uint8")]
+    )
+
+
+@pytest.mark.parametrize("op", [sigmoid, softplus])
+def test_sigmoid_softplus_jax_autodiff(op):
+    # JAX autodiff of the lowered formulas, as with a JAX gradient backend
+    x = scalar("x", dtype="float64")
+    jax_fn = function([x], op(x), mode=jax_mode).vm.jit_fn
+    d1 = jax.grad(lambda v: jax_fn(v)[0])
+    d2 = jax.grad(d1)
+
+    x_test = np.array([0.0, 1e-8, -1e-8, 20.0, -20.0, 800.0, -800.0])
+    s, sm = expit(x_test), expit(-x_test)
+    expected = [s, s * sm] if op is softplus else [s * sm, s * sm * (sm - s)]
+    for d, expected_d in zip((d1, d2), expected):
+        np.testing.assert_allclose(
+            [d(v) for v in x_test], expected_d, rtol=1e-7, atol=1e-15
+        )
 
 
 def test_jax_variadic_Scalar():

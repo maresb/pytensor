@@ -1,4 +1,10 @@
 # isort: off
+# Patch numba's cgutils.pointer_add before any dispatch codegen runs
+import pytensor.link.numba.dispatch._patch_pointer_add
+
+# Patch numba's list_to_tuple peephole so >30-argument calls don't lower quadratically
+import pytensor.link.numba.dispatch._patch_list_to_tuple
+
 from pytensor.link.numba.dispatch.basic import numba_funcify, numba_typify
 
 # Load dispatch specializations
@@ -7,6 +13,7 @@ import pytensor.link.numba.dispatch.compile_ops
 import pytensor.link.numba.dispatch.elemwise
 import pytensor.link.numba.dispatch.extra_ops
 import pytensor.link.numba.dispatch.linalg
+import pytensor.link.numba.dispatch.optimize
 import pytensor.link.numba.dispatch.random
 import pytensor.link.numba.dispatch.scan
 import pytensor.link.numba.dispatch.scalar

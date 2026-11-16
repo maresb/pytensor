@@ -22,14 +22,15 @@ permissions: {}
 
 jobs:
   check_changes:
+    name: Check for changes
     runs-on: ubuntu-latest
     outputs:
-      should_run: ${{ steps.set_should_run.outputs.should_run }}
+      should_run: ${{ github.event_name == 'release' || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && steps.filter.outputs.any_changed == 'true') }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: filter
         with:
           filters: |
@@ -40,20 +41,6 @@ jobs:
               - 'pytensor/_version.py'
               - 'pytensor/scan_perform.pyx'
               - 'pytensor/scan_perform_ext.py'
-      - name: Set should_run output
-        id: set_should_run
-        run: |
-          if [[ "${{ github.event_name == 'release' || 
-                github.ref == 'refs/heads/main' ||
-                (
-                  github.event_name == 'pull_request'
-                  && steps.filter.outputs.any_changed == 'true'
-                )
-              }}" == "true" ]]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_run=false" >> $GITHUB_OUTPUT
-          fi
 
   # The job to build precompiled pypi wheels.
   make_sdist:
@@ -64,11 +51,10 @@ jobs:
       needs.check_changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     permissions:
-      # write id-token and attestations are required to attest build provenance
-      id-token: write
-      attestations: write
+      id-token: write  # required to attest build provenance
+      attestations: write  # required to attest build provenance
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           submodules: true
@@ -78,13 +64,13 @@ jobs:
         run: pipx run build --sdist
 
       - name: Attest GitHub build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         # Don't attest from forks
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         with:
           subject-path: dist/*.tar.gz
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -100,11 +86,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: hynek/build-and-inspect-python-package@d44ca7d91762de7a7d5436ddae667c6da6d1c3df # v2.18.0
+      - uses: hynek/build-and-inspect-python-package@67230f7b8410ae0052b39c1efc89d89fff43ff10 # v3.0.2
 
   build_wheels:
     name: Build wheels for ${{ matrix.platform }}
@@ -114,9 +100,8 @@ jobs:
       needs.check_changes.outputs.should_run == 'true'
     runs-on: ${{ matrix.platform }}
     permissions:
-      # write id-token and attestations are required to attest build provenance
-      id-token: write
-      attestations: write
+      id-token: write  # required to attest build provenance
+      attestations: write  # required to attest build provenance
     strategy:
       matrix:
         platform:
@@ -124,22 +109,22 @@ jobs:
           - windows-latest
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@f03ac7617d6cff873ccf24cc0d567ef5ba5a9e6d # v4.0.0
+        uses: pypa/cibuildwheel@f9b966cfadf4109556cadc5bb39ddb72d0ce664e # v4.3.5
 
       - name: Attest GitHub build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         # Don't attest from forks
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         with:
           subject-path: ./wheelhouse/*.whl
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.platform }}
           path: ./wheelhouse/*.whl
@@ -152,17 +137,16 @@ jobs:
       needs.check_changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     permissions:
-      # write id-token and attestations are required to attest build provenance
-      id-token: write
-      attestations: write
+      id-token: write  # required to attest build provenance
+      attestations: write  # required to attest build provenance
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -174,13 +158,13 @@ jobs:
           PYODIDE=1 python setup.py bdist_wheel --universal
 
       - name: Attest GitHub build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         # Don't attest from forks
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         with:
           subject-path: dist/*.whl
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: universal_wheel
           path: dist/*.whl
@@ -190,19 +174,19 @@ jobs:
     needs: [check_changes, make_sdist, build_wheels]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: sdist
           path: dist
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -225,28 +209,27 @@ jobs:
     # workflow by requiring signoff from a maintainer.
     environment: release
     permissions:
-      # write id-token is required for trusted publishing (OIDC)
-      id-token: write
+      id-token: write  # required for trusted publishing (OIDC)
     needs: [check_dist]
     runs-on: ubuntu-latest
     # Don't publish from forks
     if: github.repository_owner == 'pymc-devs' && github.event_name == 'release' && github.event.action == 'published'
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: sdist
           path: dist
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: universal_wheel
           path: dist
 
-      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         # Implicitly attests that the packages were uploaded in the context of this workflow.

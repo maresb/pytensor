@@ -6,6 +6,7 @@ import pytest
 from pytensor.configdefaults import config
 from pytensor.graph import rewrite_graph
 from pytensor.graph.basic import Apply, Constant, equal_computations
+from pytensor.graph.destroyhandler import DestroyHandler
 from pytensor.graph.features import Feature
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
@@ -16,6 +17,7 @@ from pytensor.graph.rewriting.basic import (
     PatternNodeRewriter,
     SequentialNodeRewriter,
     WalkingGraphRewriter,
+    copy_stack_trace,
     in2out,
     logging,
     node_rewriter,
@@ -43,6 +45,82 @@ from tests.graph.utils import (
     op_z,
 )
 from tests.unittest_tools import assert_equal_computations
+
+
+def test_copy_stack_trace():
+    x, y = MyVariable("x"), MyVariable("y")
+    x_trace = [[("file.py", 1, "function", "line")]]
+    y_trace = [[("other.py", 2, "other_function", "other_line")]]
+    x.tag.trace = x_trace
+    y.tag.trace = y_trace
+
+    assert copy_stack_trace(x, y) is y
+    assert x.tag.trace == x_trace
+    assert y.tag.trace == y_trace + x_trace
+
+    assert copy_stack_trace(x, x) is x
+    assert x.tag.trace == x_trace
+
+    outputs = [x]
+    assert copy_stack_trace(x, outputs) is outputs
+    assert x.tag.trace is x_trace
+
+    assert copy_stack_trace([x], outputs) is outputs
+    assert x.tag.trace is x_trace
+
+    y.tag.trace = y_trace
+    outputs = [y]
+    assert copy_stack_trace([x], outputs) is outputs
+    assert y.tag.trace == y_trace + x_trace
+
+    y.tag.trace = y_trace
+    assert copy_stack_trace(x, outputs) is outputs
+    assert y.tag.trace == y_trace + x_trace
+
+
+@pytest.mark.parametrize(
+    "source_indices, target_indices, expected_indices",
+    [
+        (0, [0, 1], [[0], [1, 0], [2]]),
+        ([0, 1], 0, [[0, 1], [1], [2]]),
+        ([0, 1], [0, 1], [[0, 1], [1, 0], [2]]),
+        ([0, 1], [1, 2], [[0], [1, 0], [2, 0, 1]]),
+    ],
+)
+def test_copy_stack_trace_overlapping_iterables(
+    source_indices, target_indices, expected_indices
+):
+    variables = [MyVariable(name) for name in ("x", "y", "z")]
+    traces = [[(f"{var.name}.py", 1, "function", "line")] for var in variables]
+    for var, trace in zip(variables, traces, strict=True):
+        var.tag.trace = [trace]
+    sources = (
+        variables[source_indices]
+        if isinstance(source_indices, int)
+        else tuple(variables[i] for i in source_indices)
+    )
+    targets = (
+        variables[target_indices]
+        if isinstance(target_indices, int)
+        else [variables[i] for i in target_indices]
+    )
+    if source_indices == target_indices:
+        sources = targets
+
+    assert copy_stack_trace(sources, targets) is targets
+    assert [var.tag.trace for var in variables] == [
+        [traces[i] for i in indices] for indices in expected_indices
+    ]
+
+
+def test_copy_stack_trace_missing_source_trace():
+    x, y = MyVariable("x"), MyVariable("y")
+    trace = [[("file.py", 1, "function", "line")]]
+    y.tag.trace = trace
+
+    copy_stack_trace([x, y], [x, y])
+    assert x.tag.trace == trace
+    assert y.tag.trace == trace
 
 
 class AssertNoChanges(Feature):
@@ -374,6 +452,47 @@ class TestMergeOptimizer:
         g = FunctionGraph([x, y, z], [e])
         g.attach_feature(AssertNoChanges())
         MergeOptimizer().rewrite(g)
+
+    def test_no_merge_attempt_on_destroyed_variables(self):
+        x, y = MyVariable("x"), MyVariable("y")
+        twin1, twin2 = op2(x, y), op2(x, y)
+        destroyer = MyOp("destroyer", dmap={0: [0]})
+        g = FunctionGraph([x, y], [destroyer(twin1), destroyer(twin2)], clone=False)
+        g.attach_feature(DestroyHandler())
+        prof = MergeOptimizer().rewrite(g)
+        nb_fail = prof[0]
+        assert nb_fail == 0
+        assert g.outputs[0].owner.inputs[0] is not g.outputs[1].owner.inputs[0]
+
+    def test_merge_single_destroyer_feasible(self):
+        # Only one twin is destroyed: the merge goes through, with the reader
+        # ordered before the destroyer.
+        x, y = MyVariable("x"), MyVariable("y")
+        twin1, twin2 = op2(x, y), op2(x, y)
+        destroyer = MyOp("destroyer", dmap={0: [0]})
+        g = FunctionGraph([x, y], [destroyer(twin1), op1(twin2)], clone=False)
+        g.attach_feature(DestroyHandler())
+        prof = MergeOptimizer().rewrite(g)
+        nb_fail = prof[0]
+        assert nb_fail == 0
+        assert g.outputs[0].owner.inputs[0] is g.outputs[1].owner.inputs[0]
+
+    def test_merge_single_destroyer_infeasible(self):
+        # The reader needs both the undestroyed twin and the destroyer's
+        # result, so it cannot run before the destroyer: validation rejects
+        # the attempted merge and the twins stay distinct.
+        x, y = MyVariable("x"), MyVariable("y")
+        twin1, twin2 = op2(x, y), op2(x, y)
+        destroyer = MyOp("destroyer", dmap={0: [0]})
+        g = FunctionGraph([x, y], [op1(twin2, destroyer(twin1))], clone=False)
+        g.attach_feature(DestroyHandler())
+        prof = MergeOptimizer().rewrite(g)
+        nb_fail = prof[0]
+        # The attempt is made (and rejected) -- single-destroyer pairs are for
+        # validation to decide, not for the cheap guard to skip.
+        assert nb_fail >= 1
+        reader = g.outputs[0].owner
+        assert reader.inputs[0] is not reader.inputs[1].owner.inputs[0]
 
     def test_merge_outputs(self):
         x, y, z = MyVariable("x"), MyVariable("y"), MyVariable("z")

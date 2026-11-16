@@ -1,8 +1,10 @@
 name: Bump numba upper bound
 
-# Watches PyPI for new numba releases. When one appears above our current
-# upper bound in pyproject.toml, opens a PR raising the cap so our normal
-# CI (Tests workflow) validates the new version before we ship it.
+# Watches conda-forge for new numba releases. When one appears above our
+# current upper bound in pyproject.toml, opens a PR raising the cap so our
+# normal CI (Tests workflow) validates the new version before we ship it.
+# CI installs numba from conda-forge, so gating here (rather than on PyPI)
+# ensures the bumped version is actually installable when CI runs.
 
 on:
   schedule:
@@ -10,28 +12,35 @@ on:
     - cron: "0 8 * * 1"
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+# Serialize runs; don't cancel an in-progress commit/PR creation midway.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
 
 jobs:
   bump:
+    name: bump
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # push the auto-bump branch
+      pull-requests: write  # open the bump PR
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
       - name: Install packaging
         run: python -m pip install --upgrade packaging
 
-      - name: Check PyPI and rewrite pin if needed
+      - name: Check conda-forge and rewrite pin if needed
         id: bump
         run: python scripts/bump_numba_upper_bound.py
 
@@ -62,7 +71,7 @@ jobs:
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push "$remote" "$branch"
 
-          body="numba ${LATEST} is available on PyPI. This PR raises the upper bound in \`pyproject.toml\` to \`<=${NEW_CAP}\` so the normal Tests workflow validates the new release. Merge after CI passes."
+          body="numba ${LATEST} is available on conda-forge. This PR raises the upper bound in \`pyproject.toml\` to \`<=${NEW_CAP}\` so the normal Tests workflow validates the new release. Merge after CI passes."
           body="${body}"$'\n\n'"**Note:** GitHub suppresses workflow runs triggered by the default \`GITHUB_TOKEN\`, so CI (Tests, mypy, etc.) will not start automatically on this PR. Close and reopen it (or push an empty commit) to trigger the checks."
 
           gh pr create \

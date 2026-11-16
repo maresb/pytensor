@@ -14,6 +14,7 @@ from pytensor.tensor.basic import (
     Eye,
     Join,
     MakeVector,
+    Nonzero,
     ScalarFromTensor,
     Split,
     TensorFromScalar,
@@ -30,6 +31,13 @@ An example of a graph that can be compiled to JAX:
 >>> import pytensor.tensor as pt
 >>> pt.arange(1, 10, 2)
 """
+
+
+@jax_funcify.register(Nonzero)
+def jax_funcify_Nonzero(op, **kwargs):
+    raise NotImplementedError(
+        "JAX does not support nonzero, its output shape is data-dependent"
+    )
 
 
 @jax_funcify.register(AllocEmpty)
@@ -71,7 +79,10 @@ def jax_funcify_ARange(op, node, **kwargs):
             case (Subtensor(), shape_var, *_) if isinstance(shape_var.owner_op, Shape):
                 constant_args.append(None)
             case _ if isinstance(arg, Constant):
-                constant_args.append(arg.value)
+                # Cast to the Op's dtype: PyTensor types integer literals (e.g. 0/1 arange
+                # start/step) as int8, and jnp.arange bounds-checks stop against the argument dtype,
+                # overflowing for stop > 127.
+                constant_args.append(np.asarray(arg.value, op.dtype))
             case _:
                 # TODO: This might be failing without need (e.g., if arg = shape(x)[-1] + 1)!
                 raise NotImplementedError(ARANGE_CONCRETE_VALUE_ERROR)

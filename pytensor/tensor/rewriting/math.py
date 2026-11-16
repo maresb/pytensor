@@ -1,7 +1,6 @@
 r"""Rewrites for the `Op`\s in :mod:`pytensor.tensor.math`."""
 
 import itertools
-import operator
 from collections import defaultdict
 from functools import partial, reduce
 
@@ -9,7 +8,7 @@ import numpy as np
 
 import pytensor.scalar.basic as ps
 import pytensor.scalar.math as ps_math
-from pytensor.assumptions import DIAGONAL, check_assumption
+from pytensor.assumptions import DIAGONAL, UNIT_MAGNITUDE, check_assumption
 from pytensor.graph.basic import Constant, Variable
 from pytensor.graph.rewriting.basic import (
     NodeRewriter,
@@ -36,6 +35,7 @@ from pytensor.tensor.basic import (
     moveaxis,
     ones_like,
     register_infer_shape,
+    second,
     split,
     switch,
     zeros,
@@ -62,7 +62,6 @@ from pytensor.tensor.math import (
     arcsinh,
     arctanh,
     cosh,
-    deg2rad,
     digamma,
     dot,
     eq,
@@ -72,7 +71,6 @@ from pytensor.tensor.math import (
     expm1,
     ge,
     int_div,
-    isinf,
     ive,
     kve,
     le,
@@ -80,13 +78,10 @@ from pytensor.tensor.math import (
     log1mexp,
     log1p,
     log1pexp,
-    makeKeepDims,
-    maximum,
     mul,
     neg,
     polygamma,
     prod,
-    rad2deg,
     reciprocal,
     sigmoid,
     sign,
@@ -102,9 +97,7 @@ from pytensor.tensor.math import (
     variadic_mul,
 )
 from pytensor.tensor.math import abs as pt_abs
-from pytensor.tensor.math import max as pt_max
 from pytensor.tensor.math import pow as pt_pow
-from pytensor.tensor.math import sum as pt_sum
 from pytensor.tensor.rewriting.basic import (
     broadcast_like_elemwise,
     local_second_sink,
@@ -115,9 +108,13 @@ from pytensor.tensor.rewriting.basic import (
     register_useless,
 )
 from pytensor.tensor.rewriting.blockwise import blockwise_of
-from pytensor.tensor.rewriting.elemwise import apply_local_dimshuffle_lift
+from pytensor.tensor.rewriting.elemwise import apply_local_dimshuffle_merge
 from pytensor.tensor.shape import Shape, Shape_i, specify_shape
-from pytensor.tensor.subtensor import Subtensor, _is_provably_positive
+from pytensor.tensor.subtensor import (
+    Subtensor,
+    _is_provably_non_negative,
+    _is_provably_positive,
+)
 from pytensor.tensor.type import (
     complex_dtypes,
     uint_dtypes,
@@ -461,28 +458,11 @@ def local_batched_matmul_to_core_matmul_with_reshape(fgraph, node):
 @register_specialize
 @node_rewriter([_matmul, Dot])
 def local_dot_to_mul(fgraph, node):
-    """Rewrite dots that correspond to multiplication without summation.
-
-    We don't touch outer product without batch-dimensions, to allow rewriting into GER,
-    which seems more performant in that case.
-
-    # TODO: Once we blockwise Blas operations we shouldn't do it for outer product with batch-dimensions either
-    # TODO: We may still want to canonicalize outer dot as mul, and detect that for GER.
-    """
+    """Rewrite dots that correspond to multiplication without summation."""
     a, b = node.inputs
-    a_static_shape = a.type.shape
-    b_static_shape = b.type.shape
 
     # Check if we have matrix-matrix product: (..., m, 1) * (..., 1, n) -> (..., m, n)
-    if not (a_static_shape[-1] == 1 or b_static_shape[-2] == 1):
-        return None
-
-    # If it's a core Dot we only rewrite if there's no outer product
-    # (1, 1) * (1, n) or (m, 1) * (1, 1)
-    # Otherwise we leave as is, so GER can be used instead
-    if isinstance(node.op, Dot) and not (
-        a_static_shape[-2] == 1 or b_static_shape[-1] == 1
-    ):
+    if not (a.type.shape[-1] == 1 or b.type.shape[-2] == 1):
         return None
 
     # Add specify_shape for unknown dimensions that must be 1
@@ -498,7 +478,6 @@ def local_dot_to_mul(fgraph, node):
 
 
 for pair in (
-    (deg2rad, rad2deg),
     (cosh, arccosh),
     (tanh, arctanh),
     (sinh, arcsinh),
@@ -516,7 +495,12 @@ for pair in (
             allow_cast=True,
             name=f"useless_{op}_of_{inv_op}",
         )
-        register_canonicalize(rewrite)
+        if op is not neg:
+            # `local_neg_to_mul` already cancels neg(neg(x)) during
+            # canonicalize, so matching the pattern there as well is wasted
+            # work in the equilibrium loop. It is still needed in specialize,
+            # where `local_neg_to_mul` does not run.
+            register_canonicalize(rewrite)
         register_specialize(rewrite)
 
         if op is inv_op:
@@ -597,22 +581,82 @@ def local_sqrt_sqr(fgraph, node):
         return [new_out]
 
 
+@register_canonicalize
+@register_stabilize
 @register_specialize
-@node_rewriter([log])
-def local_log_sqrt(fgraph, node):
-    x = node.inputs[0]
+@node_rewriter([pt_abs])
+def local_useless_abs(fgraph, node):
+    # Case for abs(x) -> x, when x is already non-negative
+    [x] = node.inputs
 
-    if (
-        not x.owner
-        or not isinstance(x.owner.op, Elemwise)
-        or not isinstance(x.owner.op.scalar_op, ps.Sqrt)
-    ):
+    if x.dtype.startswith("complex") or not _is_provably_non_negative(x):
         return
 
-    # Case for log(sqrt(x)) -> 0.5 * log(x)
-    x = x.owner.inputs[0]
+    return [x]
+
+
+@register_stabilize("shape_unsafe")
+@register_specialize("shape_unsafe")
+@node_rewriter([pt_abs])
+def local_abs_mul_unit(fgraph, node):
+    """abs(u * x) -> abs(x), when every element of u has unit magnitude."""
+    [inp] = node.inputs
+    match inp.owner_op_and_inputs:
+        case (Elemwise(ps.Mul()), *factors):
+            rest = [
+                x for x in factors if not check_assumption(fgraph, x, UNIT_MAGNITUDE)
+            ]
+            if len(rest) == len(factors):
+                return
+            magnitude = pt_abs(variadic_mul(*rest).astype(inp.dtype))
+            return [broadcast_like_elemwise(magnitude, node, fgraph=fgraph)]
+
+
+@register_stabilize
+@register_specialize
+@node_rewriter([sign])
+def local_sign_unit(fgraph, node):
+    """sign(u) -> u and sign(u * x) -> u * sign(x), when abs(u) == 1."""
+    [inp] = node.inputs
+    if check_assumption(fgraph, inp, UNIT_MAGNITUDE):
+        return [inp]
+    if inp.type.numpy_dtype.kind not in "fc":
+        return
+    match inp.owner_op_and_inputs:
+        case (Elemwise(ps.Mul()), *factors):
+            unit = [x for x in factors if check_assumption(fgraph, x, UNIT_MAGNITUDE)]
+            if not unit:
+                return
+            rest = [x for x in factors if x not in unit]
+            return [variadic_mul(*unit) * sign(variadic_mul(*rest).astype(inp.dtype))]
+
+
+@register_stabilize
+@register_specialize
+@node_rewriter([log])
+def local_log_sqrt_sqr(fgraph, node):
+    """log(sqrt(x)) -> 0.5 * log(x); log(abs(sqr(x))) -> 2 * log(abs(x))."""
+    [x] = node.inputs
+    with_abs = False
+    match x.owner_op_and_inputs:
+        case (Elemwise(ps.Abs()), inner):
+            x = inner
+            with_abs = True
+
+    match x.owner_op_and_inputs:
+        case (Elemwise(ps.Sqrt()), inner) if not with_abs:
+            factor, inner_out = 0.5, log(inner)
+        case (Elemwise(ps.Sqr()), inner):
+            if not with_abs and inner.type.numpy_dtype.kind == "c":
+                if isinstance(inner.owner_op, Prod):
+                    return [log(sign(x)) + 2 * log(pt_abs(inner))]
+                return
+            factor, inner_out = 2.0, log(pt_abs(inner))
+        case _:
+            return
+
     old_out = node.outputs[0]
-    new_out = mul(as_tensor_variable(0.5, dtype=x.dtype), log(x))
+    new_out = mul(as_tensor_variable(factor, dtype=old_out.dtype), inner_out)
     if new_out.dtype != old_out.dtype:
         new_out = cast(new_out, old_out.dtype)
 
@@ -710,6 +754,8 @@ def local_log_div(fgraph, node):
     constant operand is involved, so its log folds and the op count stays flat.
     """
     (inp,) = node.inputs
+    if inp.type.numpy_dtype.kind == "c":
+        return None
     if not (inp.owner and isinstance(inp.owner.op, Elemwise)):
         return None
     scalar_op = inp.owner.op.scalar_op
@@ -738,6 +784,8 @@ def local_sign_div(fgraph, node):
     otherwise.
     """
     (inp,) = node.inputs
+    if inp.type.numpy_dtype.kind == "c":
+        return
     if not (inp.owner and isinstance(inp.owner.op, Elemwise)):
         return None
     scalar_op = inp.owner.op.scalar_op
@@ -758,6 +806,62 @@ def local_sign_div(fgraph, node):
     for side, other in ((num, den), (den, num)):
         if isinstance(side, Constant) and np.all(np.asarray(side.data) < 0):
             return [neg(sign(other))]
+
+
+@register_canonicalize
+@register_stabilize
+@register_specialize
+@node_rewriter([sign])
+def local_useless_sign(fgraph, node):
+    """sign(x) -> ones_like(x), when x is provably strictly positive.
+
+    A failed Cholesky factorization yields NaN, which this rewrite replaces
+    with 1 when the proof runs through a Cholesky diagonal; the
+    log-determinant path still propagates the NaN.
+    """
+    [x] = node.inputs
+    if _is_provably_positive(x, strict=True):
+        new = ones_like(x, dtype=node.outputs[0].dtype)
+        copy_stack_trace(node.outputs[0], new)
+        return [new]
+
+
+@register_canonicalize
+@register_stabilize
+@register_specialize
+@node_rewriter([sign])
+def local_sign_prod(fgraph, node):
+    """sign(prod(x)) -> prod(sign(x)); sign(sqr(x)) -> sqr(sign(x)).
+
+    Stabilize floating-point signs/phases without forming the magnitude first.
+    Look through one DimShuffle, preserving accumulation and output dtype guards.
+    """
+    [arg] = node.inputs
+    dimshuffle = None
+    match arg.owner_op_and_inputs:
+        case (DimShuffle() as dimshuffle, inner):
+            arg = inner
+    if arg.type.numpy_dtype.kind not in "fc":
+        return
+    match arg.owner_op_and_inputs:
+        case (Prod(axis=axis, acc_dtype=acc_dtype), inner) if (
+            np.dtype(acc_dtype).kind in "fc" and inner.type.numpy_dtype.kind != "b"
+        ):
+            if inner.type.numpy_dtype.kind == "c" and arg.type.numpy_dtype.kind == "f":
+                return
+            new = prod(sign(inner), axis=axis, dtype=arg.dtype)
+        case (Elemwise(ps.Sqr()), inner):
+            if inner.type.numpy_dtype.kind not in "fc":
+                return
+            new = sqr(sign(inner))
+        case _:
+            return
+    if dimshuffle is not None:
+        new = dimshuffle(new)
+    if new.dtype != node.out.dtype:
+        new = cast(new, dtype=node.out.dtype)
+    copy_stack_trace(node.out, new)
+    return [new]
 
 
 @register_canonicalize
@@ -1147,6 +1251,14 @@ class AlgebraicCanonizer(NodeRewriter):
         should be returned as a list of one element, unless
         the value is such that ``value = main()``. In that case,
         the return value should be an empty list.
+    absorbing_element
+        The absorbing (annihilating) element of `main`, if it has one, such
+        that ``main(absorbing_element, x) == absorbing_element`` for every
+        ``x`` (e.g. ``0`` for mul). When given, any `main` node with a
+        constant `absorbing_element` among its factors folds to that element
+        directly, and constants folding to it in `simplify_constants` drop
+        the surviving non-constant terms. `add` has no absorbing element, so
+        `local_add_canonizer` leaves this as ``None``.
 
     Examples
     --------
@@ -1172,12 +1284,21 @@ class AlgebraicCanonizer(NodeRewriter):
 
     """
 
-    def __init__(self, main, inverse_fn, reciprocal_fn, calculate, use_reciprocal=True):
+    def __init__(
+        self,
+        main,
+        inverse_fn,
+        reciprocal_fn,
+        calculate,
+        use_reciprocal=True,
+        absorbing_element=None,
+    ):
         self.main = main
         self.inverse = inverse_fn
         self.reciprocal = reciprocal_fn
         self.calculate = calculate
         self.use_reciprocal = use_reciprocal
+        self.absorbing_element = absorbing_element
 
         self.external_simplifiers = []
 
@@ -1209,86 +1330,43 @@ class AlgebraicCanonizer(NodeRewriter):
         | x * y * z -> ([x, y, z], [])
 
         """
-        # This function is recursive.  The idea is that there is a
-        # get_num_denum recursion in which the internal ops are all
-        # one of (main, inverse, reciprocal, DimShuffle) and the
-        # internal data nodes all have the dtype of the 'input'
-        # argument. The leaf-Variables of the graph covered by the
-        # recursion may be of any Variable type.
-
-        if inp.owner is None or inp.owner.op not in [
-            self.main,
-            self.inverse,
-            self.reciprocal,
-        ]:
-            if inp.owner and isinstance(inp.owner.op, DimShuffle):
-                # If input is a DimShuffle of some input which does
-                # something like this:
-
-                # * change a vector of length N into a 1xN row matrix
-                # * change a scalar into a 1x1x1 tensor
-                # * in general, complete the shape of a tensor
-                #   with broadcastable 1s to the *left*
-                # Then we will simply discard the DimShuffle and return
-                # the num/denum of its input
-                dsn = inp.owner  # dimshuffle node
-                dsop = dsn.op  # dimshuffle op
-
-                # the first input of the dimshuffle i.e. the ndarray to redim
-                dsi0 = dsn.inputs[0]
-
-                # The compatible order is a DimShuffle "new_order" of the form:
-                # ('x', ..., 'x', 0, 1, 2, ..., dimshuffle_input.type.ndim)
-
-                # That kind of DimShuffle only adds broadcastable
-                # dimensions on the left, without discarding any
-                # existing broadcastable dimension and is inserted
-                # automatically by Elemwise when the inputs have
-                # different numbers of dimensions (hence why we can
-                # discard its information - we know we can retrieve it
-                # later on).
-                compatible_order = ("x",) * (inp.type.ndim - dsi0.type.ndim) + tuple(
-                    range(dsi0.type.ndim)
-                )
-                if dsop.new_order == compatible_order:
-                    # If the "new_order" is the one we recognize,
-                    # we return the num_denum of the dimshuffled input.
-                    return self.get_num_denum(inp.owner.inputs[0])
-                else:
-                    # This is when the input isn't produced by main,
-                    # inverse or reciprocal.
-                    return [inp], []
+        # The graph is walked with an explicit stack of (variable, inverted)
+        # pairs, where inverted variables accumulate into denum. Children are
+        # pushed in reverse so elements land in left-to-right traversal order.
+        # Op dispatch checks identity before (the much slower) equality, since
+        # graphs are almost always built from the singleton mul/div/... ops.
+        main, inverse, reciprocal = self.main, self.inverse, self.reciprocal
+        num, denum = [], []
+        stack = [(inp, False)]
+        while stack:
+            v, inverted = stack.pop()
+            apply = v.owner
+            if apply is None:
+                (denum if inverted else num).append(v)
+                continue
+            op = apply.op
+            if op is main or op == main:
+                # main(x, y, ...) contributes each argument's num/denum as is
+                stack.extend((i, inverted) for i in reversed(apply.inputs))
+            elif op is inverse or op == inverse:
+                # inverse(x, y) contributes y with num/denum flipped
+                x, y = apply.inputs
+                stack.append((y, not inverted))
+                stack.append((x, inverted))
+            elif op is reciprocal or op == reciprocal:
+                # reciprocal(x) contributes x with num/denum flipped
+                stack.append((apply.inputs[0], not inverted))
+            elif isinstance(op, DimShuffle) and (
+                op.is_left_expand_dims
+                or op.new_order == tuple(range(apply.inputs[0].type.ndim))
+            ):
+                # DimShuffles that only complete the shape with broadcastable
+                # dimensions to the left are inserted automatically by Elemwise
+                # when inputs have different numbers of dimensions. They are
+                # transparent to the walk: merge_num_denum recreates them.
+                stack.append((apply.inputs[0], inverted))
             else:
-                return [inp], []
-        num = []
-        denum = []
-        parent = inp.owner
-
-        # We get the (num, denum) pairs for each input
-        # pairs = [self.get_num_denum(input2) if input2.type.dtype ==
-        # input.type.dtype else ([input2], []) for input2 in
-        # parent.inputs]
-        pairs = [self.get_num_denum(input2) for input2 in parent.inputs]
-
-        if parent.op == self.main:
-            # If we have main(x, y, ...), numx, denumx, numy, denumy, ...
-            # then num is concat(numx, numy, num...) and denum is
-            # concat(denumx, denumy, denum...) note that main() can have any
-            # number of arguments >= 0 concat is list concatenation
-            num = reduce(list.__iadd__, map(operator.itemgetter(0), pairs))
-            denum = reduce(list.__iadd__, map(operator.itemgetter(1), pairs))
-        elif parent.op == self.inverse:
-            # If we have inverse(x, y), numx, denumx, numy and denumy
-            # then num is concat(numx, denumy) and denum is
-            # concat(denumx, numy) note that inverse() is binary
-            num = pairs[0][0] + pairs[1][1]
-            denum = pairs[0][1] + pairs[1][0]
-        elif parent.op == self.reciprocal:
-            # If we have reciprocal(x), numx, denumx
-            # then num is denumx and denum is numx
-            # note that reciprocal() is unary
-            num = pairs[0][1]
-            denum = pairs[0][0]
+                (denum if inverted else num).append(v)
         return num, denum
 
     def merge_num_denum(self, num, denum):
@@ -1369,6 +1447,8 @@ class AlgebraicCanonizer(NodeRewriter):
         """
         ln = len(num)
         ld = len(denum)
+        if not (ln and ld):
+            return num, denum
         if ld > 2 and ln > 2:
             # Faster version for "big" inputs.
             while True:
@@ -1426,6 +1506,11 @@ class AlgebraicCanonizer(NodeRewriter):
             else:
                 denum.append(v)
 
+        if not numct and not denumct and (self.use_reciprocal or num):
+            # No constants to fold; `calculate` would return the neutral
+            # element and everything below would be a no-op.
+            return num, denum
+
         if self.use_reciprocal or num:
             # This will calculate either:
             # [inverse(main(*numct), main(*denumct))]
@@ -1443,6 +1528,19 @@ class AlgebraicCanonizer(NodeRewriter):
 
         # Wrapping ct in a Constant with the right dtype
         ct = [constant(c, dtype=out_type.dtype) for c in ct]
+
+        if (
+            self.absorbing_element is not None
+            and len(ct) == 1
+            and (num or denum)
+            and np.all(ct[0].data == self.absorbing_element)
+        ):
+            # The constants folded to the absorbing element of `main`, so every
+            # surviving factor is irrelevant: main(0, x, y) == 0. This has to
+            # come before the single-constant shortcut below, which would
+            # otherwise hand back `orig_num` untouched and leave the factors in
+            # place.
+            return ct, []
 
         if orig_num and len(numct) == 1 and len(denumct) == 0 and ct:
             # In that case we should only have one constant in `ct`.
@@ -1475,15 +1573,33 @@ class AlgebraicCanonizer(NodeRewriter):
 
         return ct + num, denum
 
+    def _broadcast_like_output(self, new, node):
+        # Equivalent to broadcast_arrays(new, *node.inputs)[0], without
+        # building the n-1 chains whose results would be discarded.
+        for inp in node.inputs:
+            new = second(inp, new)
+        return new
+
     def transform(self, fgraph, node, enforce_tracks=True):
+        # Op checks test identity before (the much slower) equality, since
+        # graphs are almost always built from the singleton mul/div/... ops.
         op = node.op
-        if enforce_tracks and (op not in {self.main, self.inverse, self.reciprocal}):
+        main, inverse, reciprocal = self.main, self.inverse, self.reciprocal
+        if enforce_tracks and not (
+            op is main
+            or op is inverse
+            or op is reciprocal
+            or op == main
+            or op == inverse
+            or op == reciprocal
+        ):
             return False
 
         assert len(node.outputs) == 1
         out = node.outputs[0]
 
-        out_clients = fgraph.clients.get(out)
+        clients = fgraph.clients
+        out_clients = clients.get(out)
 
         if not out_clients:
             return False
@@ -1491,27 +1607,80 @@ class AlgebraicCanonizer(NodeRewriter):
         # check if any of the clients of this node would be part of
         # this canonized graph...  if so, we do nothing and wait for
         # them to be transformed.
-        for c, c_idx in out_clients:
-            while (
-                isinstance(c.op, DimShuffle) and len(fgraph.clients[c.outputs[0]]) <= 1
+        for c, _ in out_clients:
+            c_op = c.op
+            while isinstance(c_op, DimShuffle):
+                c_out_clients = clients[c.outputs[0]]
+                if len(c_out_clients) > 1:
+                    break
+                c = c_out_clients[0][0]
+                c_op = c.op
+            if (
+                c_op is main
+                or c_op is inverse
+                or c_op is reciprocal
+                or c_op == main
+                or c_op == inverse
+                or c_op == reciprocal
             ):
-                c = fgraph.clients[c.outputs[0]][0][0]
-            if c.op in [self.main, self.inverse, self.reciprocal]:
                 return False
+
+        absorbing = self.absorbing_element
+        if absorbing is not None and (op is main or op == main):
+            # main(0, x, y) == 0. Checking the direct inputs lets us skip the
+            # whole get_num_denum walk for what is by far the common case.
+            # Restricted to `main`: for `inverse` the element only absorbs in
+            # the numerator position (0 / x == 0, but x / 0 != 0).
+            for inp in node.inputs:
+                if isinstance(inp, TensorConstant):
+                    # The cached unique_value avoids the exception-driven
+                    # constant walk for the direct constant case.
+                    value = inp.unique_value
+                    if value is None or value != absorbing:
+                        continue
+                elif (inp_node := inp.owner) is not None:
+                    # Inputs produced by main/inverse/reciprocal need no walk:
+                    # any absorbing constant they hide is recovered by the
+                    # get_num_denum flatten and folded in simplify_constants.
+                    inp_op = inp_node.op
+                    if (
+                        inp_op is main
+                        or inp_op is inverse
+                        or inp_op is reciprocal
+                        or inp_op == main
+                        or inp_op == inverse
+                        or inp_op == reciprocal
+                    ):
+                        continue
+                    try:
+                        value = get_underlying_scalar_constant_value(inp)
+                    except NotScalarConstantError:
+                        continue
+                    if value != absorbing:
+                        continue
+                else:
+                    continue
+                out_type = out.type
+                # Matching the output ndim up front spares Elemwise from
+                # wrapping the constant in a DimShuffle.
+                new = constant(
+                    np.full((1,) * out_type.ndim, absorbing, dtype=out_type.dtype)
+                )
+                if new.type.broadcastable != out_type.broadcastable:
+                    new = self._broadcast_like_output(new, node)
+                copy_stack_trace(out, new)
+                return [new]
 
         # Here we make the canonical version of the graph around this node
         # See the documentation of get_num_denum and simplify
-        orig_num, orig_denum = self.get_num_denum(node.outputs[0])
+        orig_num, orig_denum = self.get_num_denum(out)
         num, denum = self.simplify(list(orig_num), list(orig_denum), out.type)
 
-        def same(x, y):
-            return len(x) == len(y) and all(
-                np.all(xe == ye) for xe, ye in zip(x, y, strict=True)
-            )
-
         if (
-            same(orig_num, num)
-            and same(orig_denum, denum)
+            # Variable equality is identity, so these are cheap element-wise
+            # identity checks.
+            orig_num == num
+            and orig_denum == denum
             and
             # Check to see if we've collapsed some nested ops.
             not (
@@ -1526,7 +1695,7 @@ class AlgebraicCanonizer(NodeRewriter):
             # Do a similar check for the reciprocal op.
             not (
                 self.use_reciprocal
-                and node.op == self.reciprocal
+                and (op is reciprocal or op == reciprocal)
                 and len(orig_num) == 0
                 and node.inputs[0].owner
                 and len(node.inputs[0].owner.inputs) < len(orig_denum)
@@ -1539,7 +1708,7 @@ class AlgebraicCanonizer(NodeRewriter):
             new = cast(new, out.type.dtype)
 
         if new.type.broadcastable != out.type.broadcastable:
-            new = broadcast_arrays(new, *node.inputs)[0]
+            new = self._broadcast_like_output(new, node)
 
         if (new.type.dtype == out.type.dtype) and (
             new.type.broadcastable == out.type.broadcastable
@@ -1583,7 +1752,7 @@ def mul_calculate(num, denum, aslist=False, out_type=None):
 
 
 local_mul_canonizer = AlgebraicCanonizer(
-    mul, true_div, reciprocal, mul_calculate, False
+    mul, true_div, reciprocal, mul_calculate, False, absorbing_element=0
 )
 register_canonicalize(local_mul_canonizer, "shape_unsafe", name="local_mul_canonizer")
 
@@ -1591,7 +1760,42 @@ register_canonicalize(local_mul_canonizer, "shape_unsafe", name="local_mul_canon
 @register_canonicalize
 @node_rewriter([neg])
 def local_neg_to_mul(fgraph, node):
-    return [mul(np.array(-1, dtype=node.inputs[0].dtype), node.inputs[0])]
+    """Rewrite neg(x) as a multiplication by -1.
+
+    The naive emission `mul(-1, x)` hands `local_mul_canonizer` a fresh `Mul`
+    to flatten and re-fold on the next canonicalize iteration. The cases below
+    emit the already-canonical form directly, so that hand-off never happens.
+    """
+    [x] = node.inputs
+
+    match x.owner_op_and_inputs:
+        case Elemwise(ps.Neg()), y:
+            # neg(neg(y)) -> y
+            return [y]
+
+        case Elemwise(ps.Mul()), *factors:
+            for i, factor in enumerate(factors):
+                # neg(mul(c, *rest)) -> mul(-c, *rest): fold the sign into the
+                # constant rather than adding a factor. Only valid when negating the
+                # constant in its own dtype is exact under the output dtype:
+                # floats/complex always are; matching integer dtypes wrap
+                # consistently (-(c*x) == (-c)*x mod 2^n), but a narrow int constant
+                # in a wider mul is not (e.g. uint8 2 must become -2.0, not 254).
+                if isinstance(factor, TensorConstant) and (
+                    factor.type.numpy_dtype.kind in "fc" or factor.dtype == x.dtype
+                ):
+                    new_factors = list(factors)
+                    new_factors[i] = constant(-factor.data, dtype=factor.dtype)
+                    return [mul(*new_factors)]
+            # neg(mul(*xs)) -> mul(-1, *xs), flat rather than mul(-1, mul(*xs)).
+            return [mul(np.array(-1, dtype=x.dtype), *factors)]
+
+        case (None,) if isinstance(x, TensorConstant) and x.dtype != "bool":
+            # neg(c) -> -c
+            return [constant(-x.data, dtype=x.dtype)]
+
+        case _:
+            return [mul(np.array(-1, dtype=x.dtype), x)]
 
 
 @register_specialize
@@ -1955,23 +2159,6 @@ def local_useless_elemwise_comparison(fgraph, node):
 
 
 @register_canonicalize
-@node_rewriter([Sum, Prod])
-def local_sum_prod_all_to_none(fgraph, node):
-    """
-    Sum{0,1,...N} -> Sum{} or
-    Prod{0,1,...N} -> Prod{}
-
-    """
-    op_type = Sum if isinstance(node.op, Sum) else Prod
-    # if all the axes are named, then use None as a shorthand
-    # this permits more merging
-    if node.op.axis is None:
-        return
-    if set(node.op.axis) == set(range(node.inputs[0].type.ndim)):
-        return [op_type(axis=None, dtype=node.op.dtype)(node.inputs[0])]
-
-
-@register_canonicalize
 @node_rewriter([CAReduce])
 def local_reduce_chain(fgraph, node) -> list[TensorVariable] | None:
     """
@@ -1994,13 +2181,20 @@ def local_reduce_chain(fgraph, node) -> list[TensorVariable] | None:
     if outer_op.scalar_op != inner_op.scalar_op:
         return None
 
+    # Keeping `initial` from either side only turns an empty-axis error into it
+    clone_kwargs = {}
+    if getattr(inner_op, "initial", False):
+        if not hasattr(outer_op, "initial"):
+            return None
+        clone_kwargs["initial"] = True
+
     outer_axis = outer_op.axis
     inner_axis = inner_op.axis
     [x] = inner_reduce.owner.inputs
     # check to see either the inner or outer prod is doing a
     # product over all axis, in which case we can remove it
     if outer_axis is None or inner_axis is None:
-        return [outer_op.clone(axis=None)(x)]
+        return [outer_op.clone(axis=None, **clone_kwargs)(x)]
 
     # Merge axis
     newaxis = list(inner_axis)
@@ -2013,7 +2207,7 @@ def local_reduce_chain(fgraph, node) -> list[TensorVariable] | None:
         newaxis.append(new_i)
 
     assert len(newaxis) == len(inner_axis) + len(outer_axis)
-    return [outer_op.clone(axis=sorted(newaxis))(x)]
+    return [outer_op.clone(axis=sorted(newaxis), **clone_kwargs)(x)]
 
 
 @register_canonicalize
@@ -2058,7 +2252,7 @@ def local_reduce_join(fgraph, node):
         if not inp.type.broadcastable[join_axis]:
             return None
         # Most times inputs to join have an expand_dims, we eagerly clean up those here
-        new_input = apply_local_dimshuffle_lift(fgraph, inp.squeeze(join_axis))
+        new_input = apply_local_dimshuffle_merge(fgraph, inp.squeeze(join_axis))
         new_inputs.append(new_input)
 
     ret = Elemwise(node.op.scalar_op)(*new_inputs)
@@ -2090,39 +2284,73 @@ def local_reduce_broadcastable(fgraph, node):
     """Remove reduction over broadcastable dimensions."""
     (reduced,) = node.inputs
     odtype = node.outputs[0].dtype
-    if node.op.axis is None:
+    axis = node.op.axis
+    if axis is None:
         if all(reduced.broadcastable):
             return [reduced.dimshuffle().astype(odtype)]
-    else:
-        axis = list(node.op.axis)
-        cuttable = [a for a in axis if reduced.broadcastable[a]]
-        if cuttable:
-            # -- we can remove some axes of summation.
-            new_axis = []
-            pattern = []
-            ii = 0
-            for p in range(reduced.ndim):
-                if p not in cuttable:
-                    if p in axis:
-                        new_axis.append(ii)
-                    pattern.append(p)
-                    ii += 1
-            new_reduced = reduced.dimshuffle(*pattern)
-            if new_axis:
-                if type(node.op) is CAReduce:
-                    # This case handles `CAReduce` instances
-                    # (e.g. generated by `scalar_elemwise`), and not the
-                    # scalar `Op`-specific subclasses
-                    # TODO FIXME: This highlights a major design flaw in
-                    # `CAReduce` (or at least our use of it), and it needs
-                    # to be fixed
-                    new_op = node.op.__class__(node.op.scalar_op, axis=new_axis)
-                else:
-                    new_op = node.op.__class__(axis=new_axis)
-                return [new_op(new_reduced)]
-            else:
-                # -- in this case we can remove the reduction completely
-                return [new_reduced.astype(odtype)]
+        axis = range(reduced.ndim)
+    cuttable = [a for a in axis if reduced.broadcastable[a]]
+    if cuttable:
+        # -- we can remove some axes of summation.
+        new_axis = []
+        pattern = []
+        ii = 0
+        for p in range(reduced.ndim):
+            if p not in cuttable:
+                if p in axis:
+                    new_axis.append(ii)
+                pattern.append(p)
+                ii += 1
+        new_reduced = reduced.dimshuffle(*pattern)
+        if new_axis:
+            # `clone` keeps the other props of the reduction, like `initial`
+            return [node.op.clone(axis=new_axis)(new_reduced)]
+        else:
+            # -- in this case we can remove the reduction completely
+            return [new_reduced.astype(odtype)]
+
+
+@register_canonicalize
+@register_specialize
+@node_rewriter([CAReduce])
+def local_careduce_of_dimshuffle(fgraph, node):
+    """Remove a `DimShuffle` feeding a reduction, when it does nothing to the output.
+
+    ``CAReduce{axis}(DimShuffle(x)) -> CAReduce{new_axis}(x)``
+
+    The reduced dimensions can be in any order, and `DimShuffle` can add
+    broadcastable dimensions among them, because the reduction combines all their
+    elements anyway. The dimensions that are kept must reach the output in the same
+    relative order as in ``x``, and must not be new broadcastable dimensions.
+    """
+    x_ds = node.inputs[0]
+    # Reject dropped dimensions to avoid undoing `local_reduce_broadcastable`
+    # and creating a rewrite loop.
+    match x_ds.owner_op_and_inputs:
+        case (DimShuffle(drop=()) as dimshuffle, x):
+            pass
+        case _:
+            return None
+
+    axis = node.op.axis
+    reduced = set(range(x_ds.ndim)) if axis is None else set(axis)
+    # Remap reduced axes; kept axes must be original dimensions in their original order.
+    new_axis = []
+    kept = []
+    for out_dim, in_dim in enumerate(dimshuffle.new_order):
+        if out_dim in reduced:
+            if in_dim != "x":
+                new_axis.append(in_dim)
+        elif in_dim == "x":
+            # TODO: Keep required expansions while removing permutations of reduced axes.
+            return None
+        else:
+            kept.append(in_dim)
+
+    if kept != sorted(kept):
+        return None
+
+    return [node.op.clone(axis=new_axis)(x)]
 
 
 @register_specialize
@@ -2179,15 +2407,29 @@ def local_careduce_of_alloc(fgraph, node):
     # them into a multiplication by their size, ``Prod``/``ProdWithoutZeros``
     # into a power; idempotent reductions (max/min/all/any) are unaffected, as
     # repeating a value doesn't change its maximum, minimum, or truth.
-    if isinstance(node.op, Sum | Prod | ProdWithoutZeros):
-        size_shapes = [shapes[a] for a in axis if a < offset or value_bcast[a - offset]]
-        if size_shapes:
-            size = variadic_mul(*size_shapes)
-            if value.dtype in ("float16", "float32"):
-                # Avoid a float64 upcast from the int64 shapes (or a float16
-                # downcast); either would be amplified by the mul/pow below.
-                size = size.astype("float32")
-            value = value * size if isinstance(node.op, Sum) else value**size
+    size_shapes = [shapes[a] for a in axis if a < offset or value_bcast[a - offset]]
+    if size_shapes and isinstance(node.op, Sum | Prod | ProdWithoutZeros):
+        size = variadic_mul(*size_shapes)
+        if value.dtype in ("float16", "float32"):
+            # Avoid a float64 upcast from the int64 shapes (or a float16
+            # downcast); either would be amplified by the mul/pow below.
+            size = size.astype("float32")
+        if isinstance(node.op, Sum):
+            value = value * size
+        elif isinstance(node.op, Prod):
+            value = value**size
+        else:
+            # An empty ProdWithoutZeros reduction is 0, not 1
+            value = switch(eq(size, 0), 0, value**size)
+
+    # With `initial`, a broadcast axis that is empty at runtime makes the result `initial`
+    if size_shapes and getattr(node.op, "initial", False):
+        dtype = node.outputs[0].dtype
+        value = switch(
+            eq(variadic_mul(*size_shapes), 0),
+            np.asarray(node.op.initial_value(dtype), dtype=dtype),
+            value,
+        )
 
     # The reduction may change the dtype; a single elemwise has no accumulation
     # error, so ignore acc_dtype and just cast to the reduction's output dtype.
@@ -2261,12 +2503,17 @@ def local_add_neg_to_sub(fgraph, node):
                     return [new_out]
 
 
-@register_canonicalize
 @node_rewriter([mul])
 def local_mul_zero(fgraph, node):
     """
-    As part of canonicalization, we replace multiplication by zero
-    with zero.
+    Replace multiplication by zero with zero.
+
+    Not registered in canonicalize: `local_mul_canonizer` handles the
+    absorbing element itself (`absorbing_element=0`), and does so in strictly
+    more cases -- it also folds `mul(2, x, 0.5, 0)`, where the zero only shows
+    up after the constants are folded together, which the direct-input scan
+    below misses. Kept for use in rewrite databases that run without the
+    canonizer.
 
     """
     otype = node.outputs[0].type
@@ -2584,7 +2831,20 @@ def check_for_x_over_absX(numerators, denominators):
     # TODO: this function should dig/search through dimshuffles
     # This won't catch a dimshuffled absolute value
     for den in list(denominators):
-        if den.owner and den.owner.op == pt_abs and den.owner.inputs[0] in numerators:
+        # Identity/scalar_op checks reject non-abs ops without paying for the
+        # props-based Elemwise equality.
+        if (
+            den.owner
+            and (
+                (den_op := den.owner.op) is pt_abs
+                or (
+                    isinstance(den_op, Elemwise)
+                    and isinstance(den_op.scalar_op, ps.Abs)
+                    and den_op == pt_abs
+                )
+            )
+            and den.owner.inputs[0] in numerators
+        ):
             if den.owner.inputs[0].type.dtype.startswith("complex"):
                 # TODO: Make an Op that projects a complex number to
                 #      have unit length but projects 0 to 0.  That
@@ -2691,87 +2951,6 @@ def local_log1p(fgraph, node):
 
         new_out = log1p(neg(other))
         return [broadcast_like_elemwise(new_out, node, fgraph=fgraph, stack_trace=True)]
-
-
-@register_stabilize
-@register_specialize
-@node_rewriter([log])
-def local_log_add_exp(fgraph, node):
-    """
-    ``log(exp(x)+exp(y)+exp(z)) = max + log(x-max, y-max, z-max)``
-
-    TODO: in canonicalize, change log10 and log2 -> log
-    """
-
-    z = node.inputs[0]
-    if z.owner and z.owner.op == add:
-        zi = z.owner.inputs
-        pre_exp = [x.owner.inputs[0] for x in zi if x.owner and x.owner.op == exp]
-        # all arguments to add are exp(<something>)
-        if len(pre_exp) == len(zi):
-            # Do not offset when max_pre = -np.inf, to avoid nan in the output
-            # Switch statement is placed directly inside add to break the self-symmetry
-            # of the returned output (otherwise the rewrite would not stabilize)
-            max_pre = reduce(maximum, pre_exp)
-            ret = max_pre + log(
-                add(
-                    *[
-                        switch(isinf(max_pre), exp(max_pre), exp(p - max_pre))
-                        for p in pre_exp
-                    ]
-                )
-            )
-            return [ret]
-
-
-@register_stabilize
-@register_specialize
-@node_rewriter([log])
-def local_log_sum_exp(fgraph, node):
-    # log(sum_i(exp(x_i))) = x_max + log(sum_i(exp(x_i - x_max)))
-
-    sum_node = node.inputs[0].owner
-    # If the sum has keepdims=True, there might be a dimshuffle
-    if sum_node and isinstance(sum_node.op, DimShuffle):
-        dimshuffle_op = sum_node.op
-        sum_node = sum_node.inputs[0].owner
-    else:
-        dimshuffle_op = None
-
-    if not (sum_node and isinstance(sum_node.op, Sum)):
-        return
-
-    exp_node, axis = sum_node.inputs[0].owner, sum_node.op.axis
-    if not (
-        exp_node
-        and isinstance(exp_node.op, Elemwise)
-        and isinstance(exp_node.op.scalar_op, ps.Exp)
-    ):
-        return
-
-    pre_exp = exp_node.inputs[0]
-    max_pre_exp = pt_max(pre_exp, axis=axis)
-    max_pre_exp_keepdims = makeKeepDims(pre_exp, max_pre_exp, axis)
-
-    # Do not offset when max_pre = -np.inf, to avoid nan in the output
-    # Switch statement is placed directly inside sum to break the self-symmetry
-    # of the returned output (otherwise the rewrite would not stabilize)
-    ret = max_pre_exp + log(
-        pt_sum(
-            switch(
-                isinf(max_pre_exp_keepdims),
-                exp(max_pre_exp_keepdims),
-                exp(pre_exp - max_pre_exp_keepdims),
-            ),
-            axis=axis,
-        ),
-    )
-
-    # Restore the dimshuffle op, if any.
-    if dimshuffle_op:
-        ret = dimshuffle_op(ret)
-
-    return [ret]
 
 
 def add_calculate(num, denum, aslist=False, out_type=None):
@@ -3698,7 +3877,6 @@ def perform_sigm_times_exp(
     sigm_minus_x=None,
     parent=None,
     child_idx=None,
-    full_tree=None,
 ):
     """
     Core processing of the `local_sigm_times_exp` rewrite.
@@ -3728,9 +3906,6 @@ def perform_sigm_times_exp(
     child_idx
         Index of `tree` in its parent's inputs (``None`` if `tree` is the global
         root).
-    full_tree
-        The global multiplication tree (should not be set except by recursive
-        calls to this function). Used for debugging only.
 
     Returns
     -------
@@ -3747,16 +3922,6 @@ def perform_sigm_times_exp(
         sigm_x = []
     if sigm_minus_x is None:
         sigm_minus_x = []
-    if full_tree is None:
-        full_tree = tree
-    # if False:  # Debug code.
-    #     print("<perform_sigm_times_exp>")
-    #     print(f"  full_tree   = {full_tree}")
-    #     print(f"  tree        = {tree}")
-    #     print(f"  exp_x       = {exp_x}")
-    #     print(f"  exp_minus_x = {exp_minus_x}")
-    #     print(f"  sigm_x      = {sigm_x}")
-    #     print(f"  sigm_minus_x= {sigm_minus_x}")
     neg, inputs = tree
     if isinstance(inputs, list):
         # Recurse through inputs of the multiplication.
@@ -3770,7 +3935,6 @@ def perform_sigm_times_exp(
                 exp_minus_x=exp_minus_x,
                 sigm_x=sigm_x,
                 sigm_minus_x=sigm_minus_x,
-                full_tree=full_tree,
             )
         return rval
     else:
@@ -3937,19 +4101,6 @@ logdiffexp_to_log1mexpdiff = PatternNodeRewriter(
 )
 register_stabilize(logdiffexp_to_log1mexpdiff)
 
-# log(sigmoid(x) / (1 - sigmoid(x))) -> x
-# i.e logit(sigmoid(x)) -> x
-local_logit_sigmoid = PatternNodeRewriter(
-    (log, (true_div, (sigmoid, "x"), (sub, 1, (sigmoid, "x")))),
-    "x",
-    tracks=[sigmoid],
-    get_nodes=get_clients_at_depth2,
-    allow_multiple_clients=True,
-    name="local_logit_sigmoid",
-)
-register_canonicalize(local_logit_sigmoid)
-register_specialize(local_logit_sigmoid)
-
 # sigmoid(log(x / (1-x)) -> x
 # i.e., sigmoid(logit(x)) -> x
 local_sigmoid_logit = PatternNodeRewriter(
@@ -3960,6 +4111,37 @@ local_sigmoid_logit = PatternNodeRewriter(
 )
 register_canonicalize(local_sigmoid_logit)
 register_specialize(local_sigmoid_logit)
+
+# sigmoid(x) / (1 - sigmoid(x)) -> exp(x)
+# i.e. odds(sigmoid(x)) -> exp(x)
+# 1 - sigmoid(x) cancels to exactly zero for x >~ 37, making the ratio inf where the
+# true value stays representable up to x ~ 709.
+# Composed with log(exp(x)) -> x this also covers logit(sigmoid(x)) -> x, so no
+# separate rewrite is needed for the logged form.
+local_odds_sigmoid = PatternNodeRewriter(
+    (true_div, (sigmoid, "x"), (sub, 1, (sigmoid, "x"))),
+    (exp, "x"),
+    tracks=[sigmoid],
+    get_nodes=get_clients_at_depth1,
+    allow_multiple_clients=True,
+    name="local_odds_sigmoid",
+)
+register_canonicalize(local_odds_sigmoid)
+register_stabilize(local_odds_sigmoid)
+register_specialize(local_odds_sigmoid)
+
+# (1 - sigmoid(x)) / sigmoid(x) -> exp(-x)
+local_inv_odds_sigmoid = PatternNodeRewriter(
+    (true_div, (sub, 1, (sigmoid, "x")), (sigmoid, "x")),
+    (exp, (neg, "x")),
+    tracks=[sigmoid],
+    get_nodes=get_clients_at_depth1,
+    allow_multiple_clients=True,
+    name="local_inv_odds_sigmoid",
+)
+register_canonicalize(local_inv_odds_sigmoid)
+register_stabilize(local_inv_odds_sigmoid)
+register_specialize(local_inv_odds_sigmoid)
 
 
 @register_canonicalize

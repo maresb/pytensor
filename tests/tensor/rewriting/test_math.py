@@ -10,6 +10,7 @@ import pytensor
 import pytensor.scalar as ps
 import pytensor.tensor as pt
 from pytensor import shared
+from pytensor.assumptions import assume
 from pytensor.compile import optdb
 from pytensor.compile.debug.debugmode import DebugMode
 from pytensor.compile.maker import function
@@ -27,7 +28,7 @@ from pytensor.graph.rewriting.basic import (
     out2in,
 )
 from pytensor.graph.rewriting.db import RewriteDatabaseQuery
-from pytensor.graph.rewriting.utils import is_same_graph, rewrite_graph
+from pytensor.graph.rewriting.utils import rewrite_graph
 from pytensor.graph.traversal import ancestors
 from pytensor.printing import debugprint, pprint
 from pytensor.scalar import PolyGamma, Psi, TriGamma
@@ -107,14 +108,19 @@ from pytensor.tensor.rewriting.elemwise import local_dimshuffle_lift
 from pytensor.tensor.rewriting.math import (
     compute_mul,
     is_1pexp,
+    local_add_canonizer,
+    local_careduce_of_dimshuffle,
     local_div_switch_sink,
     local_grad_log_erfc_neg,
     local_greedy_distributor,
+    local_log_sqrt_sqr,
     local_mul_canonizer,
     local_mul_switch_sink,
+    local_neg_to_mul,
+    local_reduce_broadcastable,
     local_reduce_chain,
-    local_reduce_join,
     local_sum_prod_of_mul_or_div,
+    local_useless_abs,
     mul_canonizer,
     parse_mul_tree,
     perform_sigm_times_exp,
@@ -195,6 +201,11 @@ def inputs(xbc=(0, 0), ybc=(0, 0), zbc=(0, 0)):
     y = TensorType(dtype="float64", shape=ybc)("y")
     z = TensorType(dtype="float64", shape=zbc)("z")
     return x, y, z
+
+
+def _autocast_int_dtype():
+    """dtype the active cast_policy gives a small Python int literal."""
+    return "int8" if config.cast_policy == "custom" else "int64"
 
 
 def test_add_canonizer_problem0():
@@ -283,6 +294,45 @@ class TestAlgebraicCanonizer:
     def test_muldiv(self, e, exp_g):
         g_rewritten = rewrite_graph(e, custom_rewrite=mul_canonizer)
         assert equal_computations([g_rewritten], [exp_g])
+
+    @pytest.mark.parametrize(
+        "e",
+        [
+            # Absorbing element sitting directly among the factors
+            lambda x, y: pt.mul(0.0, x, y),
+            # Other constants fold together with the absorbing element
+            lambda x, y: pt.mul(2.0, x, 0.5, 0.0, y),
+            # Absorbing element in the numerator of a division
+            lambda x, y: pt.mul(0.0, x) / y,
+            # Absorbing element hidden inside a division factor
+            lambda x, y: x * (0.0 / y),
+        ],
+        ids=["direct", "among_other_constants", "numerator", "in_subfactor"],
+    )
+    def test_mul_absorbing_element(self, e):
+        """`mul` has an absorbing element: mul(0, x, y) == 0, factors and all."""
+        x, y = pt.scalars("xy")
+        result = RewriteTester(
+            [x, y], [e(x, y)], include=[], custom_rewrite=local_mul_canonizer
+        )
+        result.assert_graph(constant(0.0, dtype=config.floatX))
+
+    def test_mul_absorbing_element_broadcast(self):
+        """The absorbed factors still contribute to the shape of the output."""
+        x, y = self.x, self.y
+        zero = constant(np.zeros((1, 1), dtype=config.floatX))
+        result = RewriteTester(
+            [x, y], [pt.mul(zero, x, y)], include=[], custom_rewrite=local_mul_canonizer
+        )
+        result.assert_graph(second(y, second(x, second(zero, zero))))
+
+    def test_add_has_no_absorbing_element(self):
+        """`add` only has a neutral element, so 0 must not absorb its terms."""
+        x, y = self.x, self.y
+        result = RewriteTester(
+            [x, y], [pt.add(0.0, x, y)], include=[], custom_rewrite=local_add_canonizer
+        )
+        result.assert_graph(x + y)
 
     def test_elemwise_multiple_inputs_rewrites(self):
         """Verify that the `AlgebraicCanonizer` merges sequential ``Elemwise({mul,add})``."""
@@ -891,9 +941,9 @@ class TestAlgebraicCanonizer:
         # a = pt.pt_abs(x)
 
         if config.mode == "FAST_COMPILE":
-            mode = get_mode("FAST_RUN").excluding("local_elemwise_fusion")
+            mode = get_mode("FAST_RUN").excluding("local_elemwise_fusion", "scalarize")
         else:
-            mode = get_default_mode().excluding("local_elemwise_fusion")
+            mode = get_default_mode().excluding("local_elemwise_fusion", "scalarize")
 
         f = function([x], [(4 * x) / abs(2 * x)], mode=mode)
         f(0.1)
@@ -1171,44 +1221,6 @@ def test_log1p():
     z = imatrix()
     f = function([z], log(1 + (z)), mode=m)
     assert [node.op for node in f.maker.fgraph.toposort()] == [log1p]
-
-
-def test_local_log_add_exp():
-    m = config.mode
-    if m == "FAST_COMPILE":
-        m = "FAST_RUN"
-    m = get_mode(m)
-    m = m.excluding("fusion")
-    m = copy.copy(m)
-    # No need to put them back as we have a new object
-    m.check_isfinite = False
-
-    # check some basic cases
-    x = dvector()
-    y = dvector()
-    f = function([x, y], log(exp(x) + exp(y)), mode=m)
-
-    # test that it gives the correct result when it doesn't overflow
-    f([10], [10])  # doesn't causes overflow
-    utt.assert_allclose(f([10], [10]), 10 + np.log1p(1))
-
-    assert np.isfinite(f([10000], [10000]))  # causes overflow if handled incorrectly
-    utt.assert_allclose(f([10000], [10000]), 10000 + np.log1p(1))
-
-    # test that when max = +-inf, rewritten output still works correctly
-    assert f([-np.inf], [-np.inf]) == -np.inf
-    assert f([np.inf], [np.inf]) == np.inf
-    assert f([np.inf], [-np.inf]) == np.inf
-
-    # test that it also works with more than two args
-    x = dvector()
-    y = dvector()
-    f = function([x, y], log(exp(x) + exp(y) + exp(x - y) + exp(x + y)), mode=m)
-
-    assert np.isfinite(f([10000], [10000]))  # causes overflow if handled incorrectly
-    utt.assert_allclose(f([10000], [10000]), 20000)
-
-    # TODO: test that the rewrite works in the presence of broadcasting.
 
 
 def test_local_elemwise_sub_zeros():
@@ -1507,7 +1519,6 @@ class TestLocalUselessElemwiseComparison:
         for dtype, zero, one in [
             ("bool", np.array(False), np.array(True)),
             ("int8", np.int8(0), np.int8(1)),
-            ("int8", 0, 1),
         ]:
             x = scalar("x", dtype=dtype)
 
@@ -1548,6 +1559,78 @@ class TestLocalUselessElemwiseComparison:
 
         f = function([x], le(x, x), mode=mode)
         assert check_stack_trace(f, ops_to_check="last")
+
+
+class TestLocalNegToMul:
+    """`neg(x)` becomes a multiplication by -1, already in canonical form."""
+
+    def test_neg_of_neg(self):
+        x = matrix("x")
+        assert rewrite_graph(-(-x), include=("canonicalize",)) is x
+
+    def test_neg_of_mul_absorbs_constant(self):
+        """neg(mul(c, x)) -> mul(-c, x), rather than mul(-1, mul(c, x))."""
+        x = matrix("x")
+        out = rewrite_graph(-(2.0 * x), include=("canonicalize",))
+
+        assert isinstance(out.owner.op, Elemwise)
+        assert isinstance(out.owner.op.scalar_op, ps.Mul)
+        # Just the negated constant and `x` -- no leftover -1 factor.
+        assert len(out.owner.inputs) == 2
+        [const] = [i for i in out.owner.inputs if isinstance(i, TensorConstant)]
+        assert np.all(const.data == -2.0)
+
+    @pytest.mark.parametrize("dtype, value", [("uint8", 2), ("int8", -128)])
+    def test_neg_of_mul_wrapping_int_constant(self, dtype, value):
+        """The sign is not folded into an int constant narrower than the mul.
+
+        Negating uint8(2) wraps to 254 and negating int8(-128) wraps to -128,
+        neither of which is the negation under the wider output dtype.
+        """
+        x = pt.vector("x")  # float64
+        c = pt.constant(np.array([value], dtype=dtype))
+
+        result = RewriteTester(
+            [x], [-pt.mul(c, x)], include=None, custom_rewrite=local_neg_to_mul
+        )
+        result.assert_graph(pt.mul(np.array(-1.0), c, x))
+        result.assert_eval(np.array([1.0, 2.0]))
+
+    def test_neg_of_mul_same_int_dtype_folds(self):
+        """Same-dtype integer constants wrap consistently, so the fold fires."""
+        x = pt.vector("x", dtype="int8")
+        c = pt.constant(np.array([3], dtype="int8"))
+
+        result = RewriteTester(
+            [x], [-pt.mul(c, x)], include=None, custom_rewrite=local_neg_to_mul
+        )
+        result.assert_graph(pt.mul(pt.constant(np.array([-3], dtype="int8")), x))
+        result.assert_eval(np.array([1, 2], dtype="int8"))
+
+    def test_neg_of_mul_stays_flat(self):
+        """neg(mul(x, y)) -> mul(-1, x, y), rather than mul(-1, mul(x, y))."""
+        x, y = matrices("xy")
+        out = rewrite_graph(-(x * y), include=("canonicalize",))
+
+        assert isinstance(out.owner.op, Elemwise)
+        assert isinstance(out.owner.op.scalar_op, ps.Mul)
+        assert len(out.owner.inputs) == 3
+        assert not any(
+            var.owner is not None
+            and isinstance(var.owner.op, Elemwise)
+            and isinstance(var.owner.op.scalar_op, ps.Mul)
+            for var in out.owner.inputs
+        )
+
+    def test_values(self):
+        x, y = matrices("xy")
+        xv = np.random.random((3, 3))
+        yv = np.random.random((3, 3))
+        f = function([x, y], [-(-x), -(2.0 * x), -(x * y)])
+        neg_neg, neg_mul_const, neg_mul = f(xv, yv)
+        np.testing.assert_allclose(neg_neg, xv)
+        np.testing.assert_allclose(neg_mul_const, -2.0 * xv)
+        np.testing.assert_allclose(neg_mul, -(xv * yv))
 
 
 def test_local_mul_specialize():
@@ -1986,7 +2069,7 @@ class TestExpLog:
             f.maker.fgraph.outputs,
             [
                 pt.switch(
-                    x >= np.array([[0]], dtype=np.int8),
+                    x >= np.array([[0]], dtype=_autocast_int_dtype()),
                     pt.log1p(x),
                     np.array([[np.nan]], dtype=np.float32),
                 )
@@ -2011,7 +2094,7 @@ class TestExpLog:
             f.maker.fgraph.outputs,
             [
                 pt.switch(
-                    x >= np.array([[0]], dtype=np.int8),
+                    x >= np.array([[0]], dtype=_autocast_int_dtype()),
                     pt.log1p(-x),
                     np.array([[np.nan]], dtype=np.float32),
                 )
@@ -2034,7 +2117,7 @@ class TestExpLog:
             f.maker.fgraph.outputs,
             [
                 pt.switch(
-                    x <= np.array([[0]], dtype=np.int8),
+                    x <= np.array([[0]], dtype=_autocast_int_dtype()),
                     x,
                     np.array([[np.nan]], dtype=np.float32),
                 )
@@ -2066,16 +2149,203 @@ class TestExpLog:
         assert len(ops_graph) == expected_switches
 
 
-def test_log_sqrt() -> None:
+def test_log_sqrt():
     x = pt.tensor("x", shape=(None, None))
-    out = log(sqrt(x))
-
-    out = rewrite_graph(out, include=["specialize"])
-
-    assert utt.assert_equal_computations(
-        [out],
-        [mul(pt.as_tensor_variable([[0.5]], dtype=x.dtype), log(x))],
+    result = RewriteTester(
+        [x], [log(sqrt(x))], include=None, custom_rewrite=local_log_sqrt_sqr
     )
+
+    result.assert_graph(0.5 * log(x))
+    result.assert_eval(np.array([[1.0, 2.0], [3.0, 4.0]]))
+
+
+def test_log_sqrt_integer_input():
+    # A 0.5 factor typed from the integer input would truncate to 0
+    x = ivector("x")
+    result = RewriteTester(
+        [x], [log(sqrt(x))], include=None, custom_rewrite=local_log_sqrt_sqr
+    )
+
+    result.assert_graph(0.5 * log(x))
+    result.assert_eval(np.array([2, 3, 4], dtype="int32"))
+
+
+@pytest.mark.parametrize(
+    "dtype, with_abs",
+    [(config.floatX, False), (config.floatX, True), ("complex128", True)],
+    ids=["real", "real_abs", "complex_abs"],
+)
+def test_log_sqr(dtype, with_abs):
+    x = pt.matrix("x", dtype=dtype)
+    squared = pt_abs(sqr(x)) if with_abs else sqr(x)
+    result = RewriteTester(
+        [x], [log(squared)], include=None, custom_rewrite=local_log_sqrt_sqr
+    )
+
+    result.assert_graph(2.0 * log(pt_abs(x)))
+    values = np.array([[1.0, -2.0], [3.0, -4.0]], dtype=dtype)
+    if dtype.startswith("complex"):
+        values += 2j
+    result.assert_eval(values)
+
+
+def test_sign_prod_output_cast():
+    x = pt.dvector()
+    z = pt.zvector()
+    outputs = [sign(prod(x, dtype="int8")), sign(prod(z, dtype="float64"))]
+    result = RewriteTester([x, z], outputs, include=["stabilize", "specialize"])
+    result.assert_graph(*outputs)
+
+
+@pytest.mark.parametrize("dtype", ["float64", "complex128"])
+def test_sign_prod_real_and_complex(dtype):
+    x = pt.matrix(dtype=dtype)
+    result = RewriteTester(
+        [x],
+        [sign(prod(x, axis=-1))],
+        include=["stabilize", "specialize"],
+    )
+    result.assert_graph(prod(sign(x), axis=-1))
+    values = np.array([[1, -2, 3], [-1, 0, 3], [1, np.nan, 0]], dtype=dtype)
+    if dtype.startswith("complex"):
+        values *= 3 + 4j
+    result.assert_eval(values)
+
+
+@pytest.mark.parametrize("dtype", ["float64", "complex128"])
+def test_unit_magnitude_consumers(dtype):
+    x = pt.matrix("x", dtype=dtype)
+    p = pt.vector("p", dtype=dtype)
+    unit = assume(p, unit_magnitude=True)
+    phase = p * sign(x).prod(axis=-1)
+    magnitude = log(pt_abs(x)).sum(axis=-1)
+    expected_log = (
+        log(phase) + magnitude
+        if dtype.startswith("complex")
+        else pt.where(pt.eq(phase, -1), pt.constant(np.nan, dtype=dtype), magnitude)
+    )
+    result = RewriteTester(
+        [x, p],
+        [
+            sign(unit * x.prod(axis=-1)),
+            log(pt_abs(unit * x.prod(axis=-1))),
+            log(unit * x.prod(axis=-1)),
+        ],
+        include=[
+            "canonicalize",
+            "stabilize",
+            "specialize",
+        ],
+    )
+    result.assert_graph(
+        *rewrite_graph(
+            [phase, magnitude, expected_log], include=["stabilize", "specialize"]
+        )
+    )
+    values = np.array([[1, -2, 3], [-1, 2, 0], [1, np.nan, 0]], dtype=dtype)
+    units = np.array([-1, 1, 1], dtype=dtype)
+    if dtype.startswith("complex"):
+        values *= 3 + 4j
+        units *= 1j
+    result.assert_eval(values, units)
+
+
+def test_abs_of_all_unit_factors():
+    p = pt.dvector("p")
+    q = pt.dvector("q")
+    unit_product = assume(p, unit_magnitude=True) * assume(q, unit_magnitude=True)
+    result = RewriteTester(
+        [p, q],
+        [pt_abs(unit_product)],
+        include=[
+            "drain_specify_assumptions",
+            "canonicalize",
+            "stabilize",
+            "specialize",
+        ],
+    )
+    result.assert_graph(
+        rewrite_graph(
+            pt.alloc(pt.constant(1.0, dtype="float64"), (p * q).shape[0]),
+            include=["canonicalize", "specialize"],
+        )
+    )
+    result.assert_eval(np.array([1.0, -1.0]), np.array([-1.0, -1.0]))
+
+
+def test_log_sqr_extreme_magnitudes():
+    # sqr() saturates to inf above ~1e154 and to zero below ~1e-162 in float64, so the
+    # rewritten graph is deliberately not equivalent to the original one here
+    x = pt.vector("x")
+    result = RewriteTester(
+        [x], [log(sqr(x))], include=None, custom_rewrite=local_log_sqrt_sqr
+    )
+
+    x_test = np.array([1e200, 1e-200, 3.0])
+    [orig_out] = result.orig_fn(x_test)
+    [rewr_out] = result.rewr_fn(x_test)
+    assert np.isinf(orig_out).sum() == 2
+    np.testing.assert_allclose(rewr_out, 2 * np.log(np.abs(x_test)))
+
+
+def test_useless_abs():
+    x = pt.tensor("x", shape=(None, None))
+    result = RewriteTester(
+        [x], [pt_abs(exp(x))], include=None, custom_rewrite=local_useless_abs
+    )
+
+    result.assert_graph(exp(x))
+    result.assert_eval(np.array([[1.0, -2.0], [3.0, -4.0]]))
+
+
+def test_useless_abs_complex_cholesky():
+    # The positive diagonal is complex-typed; abs must still return a real dtype.
+    x = pt.zmatrix("x")
+    out = pt_abs(pt.diagonal(pt.linalg.cholesky(x)))
+    result = RewriteTester(
+        [x], [out], include=["canonicalize", "stabilize", "specialize"]
+    )
+    result.assert_graph(out)
+
+
+def test_useless_abs_keeps_signed_zero():
+    # sqrt(-0.0) is -0.0, which abs() normalizes to +0.0, so dropping the abs would flip
+    # the sign of any downstream division
+    x = pt.vector("x")
+    out = pt_abs(sqrt(x))
+    result = RewriteTester([x], [out], include=None, custom_rewrite=local_useless_abs)
+
+    result.assert_graph(out)
+    [rewr_out] = result.rewr_fn(np.array([-0.0]))
+    assert not np.signbit(rewr_out)
+
+
+def test_useless_abs_signed_integer_overflow():
+    # sqr() wraps on signed ints, so its output is not non-negative and the abs()
+    # has to stay
+    x = pt.vector("x", dtype="int8")
+    out = pt_abs(sqr(x))
+    result = RewriteTester([x], [out], include=None, custom_rewrite=local_useless_abs)
+
+    result.assert_graph(out)
+    [rewr_out] = result.rewr_fn(np.array([12, 16, 3], dtype="int8"))
+    np.testing.assert_array_equal(rewr_out, np.array([112, 0, 9], dtype="int8"))
+
+
+@pytest.mark.parametrize(
+    "original_fn, rewrite",
+    [
+        pytest.param(lambda x: log(sqr(x)), local_log_sqrt_sqr, id="log_sqr"),
+        pytest.param(lambda x: pt_abs(sqr(x)), local_useless_abs, id="abs_sqr"),
+    ],
+)
+def test_sqr_rewrites_skip_complex(original_fn, rewrite):
+    # abs() of a complex input is real, so both rewrites would change the output dtype
+    x = pt.vector("x", dtype="complex128")
+    out = original_fn(x)
+    result = RewriteTester([x], [out], include=None, custom_rewrite=rewrite)
+
+    result.assert_graph(out)
 
 
 class TestSqrSqrt:
@@ -2093,7 +2363,7 @@ class TestSqrSqrt:
         out = rewrite_graph(out, include=["canonicalize", "specialize", "stabilize"])
 
         expected = switch(
-            ge(x, np.zeros((1, 1), dtype="int8")),
+            ge(x, np.zeros((1, 1), dtype=_autocast_int_dtype())),
             x,
             np.full((1, 1), np.nan, dtype=out.type.dtype),
         )
@@ -2115,7 +2385,7 @@ class TestSqrSqrt:
         out = rewrite_graph(out, include=["canonicalize", "specialize", "stabilize"])
 
         expected = switch(
-            ge(x, np.zeros((1,), dtype="int8")),
+            ge(x, np.zeros((1,), dtype=_autocast_int_dtype())),
             x,
             np.full((1,), np.nan, dtype=dtype),
         )
@@ -2671,7 +2941,7 @@ class TestReduceChain:
     def setup_method(self):
         self.mode = get_default_mode().including("canonicalize", "specialize")
 
-    def test_local_sum_prod_all_to_none(self):
+    def test_all_axes_reductions(self):
         a = tensor3()
         input = np.arange(3 * 4 * 5, dtype=config.floatX).reshape(3, 4, 5)
         # test sum
@@ -2828,6 +3098,18 @@ class TestReduceChain:
         [new_out] = local_reduce_chain.transform(fg, out.owner)
         assert equal_computations([new_out], [x.all(axis=(0, 2))])
 
+    @pytest.mark.parametrize("inner_initial", [None, -np.inf])
+    @pytest.mark.parametrize("outer_initial", [None, -np.inf])
+    def test_max_initial(self, inner_initial, outer_initial):
+        x = tensor3("x")
+        out = x.max(axis=-1, initial=inner_initial).max(axis=0, initial=outer_initial)
+        result = RewriteTester(
+            [x], [out], include=None, custom_rewrite=local_reduce_chain
+        )
+        initial = -np.inf if -np.inf in (inner_initial, outer_initial) else None
+        result.assert_graph(x.max(axis=(0, 2), initial=initial))
+        result.assert_eval(np.random.default_rng(0).normal(size=(2, 3, 4)))
+
 
 class TestLocalSumProd:
     """Test sum/prod rewrites."""
@@ -2843,7 +3125,13 @@ class TestLocalSumProd:
     )
 
     def setup_method(self):
-        self.mode = get_default_mode().including("canonicalize", "specialize")
+        # Exclude the Numba reduction fusion so CAReduce nodes stay visible in
+        # the toposort for the structural assertions below.
+        self.mode = (
+            get_default_mode()
+            .including("canonicalize", "specialize")
+            .excluding("fuse_indexed_into_elemwise")
+        )
 
     def test_local_sum_prod_of_scalar_mul(self):
         # Test the rewrite `local_sum_prod_mul_by_scalar` for both Sum and
@@ -3290,6 +3578,33 @@ class TestLocalSumProd:
         result.assert_graph(pt.alloc(v * np.array([6]), 4, 3))
         result.assert_eval(v_val)
 
+    def test_local_careduce_of_alloc_initial(self):
+        # A broadcast axis may be empty at runtime, where the result is `initial`
+        v = vector("v")
+        n = scalar("n", dtype="int64")
+        alloc_v = pt.alloc(v, n, 3)
+        outs = [
+            pt.max(alloc_v, axis=0, initial=-np.inf),
+            pt.max(alloc_v, axis=None, initial=-np.inf),
+            pt.max(alloc_v, axis=1, initial=-np.inf),
+        ]
+        f = function([v, n], outs, mode=get_default_mode().including("specialize"))
+        # Only the 1d alloc of the axis=1 result may remain
+        assert not any(
+            isinstance(node.op, Alloc) and node.outputs[0].type.ndim == 2
+            for node in f.maker.fgraph.toposort()
+        )
+
+        v_val = np.array([1.0, 3.0, 2.0], dtype=v.dtype)
+        dropped, reduced, kept = f(v_val, 0)
+        np.testing.assert_array_equal(dropped, np.full(3, -np.inf))
+        assert reduced == -np.inf
+        assert kept.shape == (0,)
+        dropped, reduced, kept = f(v_val, 2)
+        np.testing.assert_array_equal(dropped, v_val)
+        assert reduced == 3.0
+        np.testing.assert_array_equal(kept, [3.0, 3.0])
+
     @pytest.mark.parametrize("reduce_op", [Max, Min, All, Any])
     def test_local_careduce_of_alloc_idempotent(self, reduce_op):
         # Idempotent reductions (max/min/all/any) over the alloc's broadcast axes
@@ -3335,11 +3650,19 @@ class TestLocalSumProd:
         )
         result.assert_eval(m_val)
 
+        x = dscalar("x")
+        n = lscalar("n")
+        result = RewriteTester(
+            [x, n], [ProdWithoutZeros(axis=None)(pt.alloc(x, n))], **cfg
+        )
+        result.assert_graph(pt.switch(pt.eq(n, 0), 0, x**n))
+        result.assert_eval(np.float64(2.0), np.int64(0))
+
     def test_local_sum_prod_mul_by_scalar_stack_trace(self):
         """Test that stack trace is copied over correctly for `local_sum_prod_mul_by_scalar`."""
         m0 = (
             get_default_mode()
-            .excluding("inplace_elemwise_opt")
+            .excluding("inplace_elemwise_opt", "scalarize")
             .including("canonicalize", "specialize")
         )
 
@@ -3467,7 +3790,9 @@ class TestLocalSumProd:
         c_val = rng.standard_normal((2, 2, 2)).astype(config.floatX)
         d_val = np.asarray(rng.standard_normal(), config.floatX)
 
-        default_mode = get_default_mode()
+        # Exclude the Numba reduction fusion so the outer reduction op stays
+        # visible in the toposort for the structural assertions below.
+        default_mode = get_default_mode().excluding("fuse_indexed_into_elemwise")
         # `FusionOptimizer` is included to make sure that `expected_outer_operator`
         # remains the same for all rewrite modes.
         mode_with_rewrite = default_mode.including(
@@ -3524,8 +3849,12 @@ class TestLocalSumProd:
 
 class TestLocalReduce:
     def setup_method(self):
-        self.mode = get_default_mode().including(
-            "canonicalize", "specialize", "uncanonicalize"
+        # Exclude the Numba reduction fusion so CAReduce nodes stay visible in
+        # the toposort for the structural assertions below.
+        self.mode = (
+            get_default_mode()
+            .including("canonicalize", "specialize", "uncanonicalize")
+            .excluding("fuse_indexed_into_elemwise")
         )
 
     def test_local_reduce_broadcast_all_0(self):
@@ -3597,6 +3926,90 @@ class TestLocalReduce:
             assert not any(
                 isinstance(node.op, CAReduce) for node in f.maker.fgraph.toposort()
             )
+
+    def test_local_reduce_broadcast_some_initial(self):
+        # Dropping the broadcastable axis must keep `initial`, the other axis can be empty
+        x = TensorType("float64", shape=(1, None))("x")
+        result = RewriteTester(
+            [x],
+            [pt_max(x, axis=[0, 1], initial=-np.inf)],
+            include=None,
+            custom_rewrite=local_reduce_broadcastable,
+        )
+        result.assert_graph(pt_max(x.squeeze(0), axis=0, initial=-np.inf))
+        result.assert_eval(np.zeros((1, 0)))
+
+
+class TestLocalCAReduceOfDimShuffle:
+    rewrite_kwargs = {
+        "include": None,
+        "custom_rewrite": local_careduce_of_dimshuffle,
+    }
+
+    @pytest.mark.parametrize(
+        "op, dtype",
+        [
+            (Sum, "int64"),
+            (Prod, "int64"),
+            (Max, "int64"),
+            (Min, "int64"),
+            (All, "bool"),
+            (Any, "bool"),
+        ],
+    )
+    def test_removes_dimshuffle(self, op, dtype):
+        x = pt.tensor3("x", dtype=dtype)
+        out = op(axis=None)(x.dimshuffle(2, "x", 0, 1))
+        result = RewriteTester([x], [out], **self.rewrite_kwargs)
+        result.assert_graph(op(axis=(0, 1, 2))(x), strict_dtype=True)
+        x_test = np.random.default_rng(1).integers(0, 3, size=(2, 3, 4)).astype(dtype)
+        result.assert_eval(x_test)
+
+    @pytest.mark.parametrize(
+        "shuffle, axis, new_axis",
+        [
+            ((2, 1, 0), (0, 1), (1, 2)),
+            ((0, "x", 2, 1), (1, 3), (1,)),
+            ((2, 0, "x", 1), (0, 2), (2,)),
+        ],
+    )
+    def test_removes_dimshuffle_when_kept_dims_in_order(self, shuffle, axis, new_axis):
+        x = pt.tensor3("x")
+        out = pt_sum(x.dimshuffle(*shuffle), axis=axis)
+        result = RewriteTester([x], [out], **self.rewrite_kwargs)
+        result.assert_graph(pt_sum(x, axis=new_axis))
+        x_test = np.random.default_rng(2).normal(size=(2, 3, 4))
+        result.assert_eval(x_test)
+
+    def test_generic_careduce(self):
+        x = pt.matrix("x", dtype="int8")
+        out = CAReduce(ps.add, axis=None, upcast_discrete_output=True)(
+            x.dimshuffle("x", 1, 0)
+        )
+        result = RewriteTester([x], [out], **self.rewrite_kwargs)
+        expected = CAReduce(ps.add, axis=(0, 1), upcast_discrete_output=True)(x)
+        result.assert_graph(expected, strict_dtype=True)
+        result.assert_eval(np.full((2, 3), 100, dtype="int8"))
+
+    @pytest.mark.parametrize(
+        "shuffle, axis",
+        [
+            ((1, 0, 2), 2),  # kept dims are transposed
+            ((2, 1, 0), 1),  # kept dims are transposed
+            ((0, "x", 1, 2), (0, 2)),  # kept new broadcastable dimension
+        ],
+    )
+    def test_kept_when_dimshuffle_changes_output(self, shuffle, axis):
+        x = pt.tensor3("x")
+        out = pt_sum(x.dimshuffle(*shuffle), axis=axis)
+        result = RewriteTester([x], [out], **self.rewrite_kwargs)
+        result.assert_graph(out)
+
+    def test_kept_when_dimshuffle_drops_dims(self):
+        x = pt.tensor("x", shape=(1, None, None))
+        out = pt_sum(x.dimshuffle(2, 1))
+        result = RewriteTester([x], [out], **self.rewrite_kwargs)
+        result.assert_graph(out)
 
 
 class TestReduceJoin:
@@ -3700,10 +4113,8 @@ class TestReduceJoin:
         x = vector("x")
         out = join(0, exp(x[None]), log(x[None])).sum(axis=0)
 
-        fg = FunctionGraph([x], [out], clone=False)
-        [rewritten_out] = local_reduce_join.transform(fg, out.owner)
-        expected_out = add(exp(x), log(x))
-        assert equal_computations([rewritten_out], [expected_out])
+        result = RewriteTester([x], [out])
+        result.assert_graph(add(exp(x), log(x)))
 
 
 def test_local_useless_adds():
@@ -3871,7 +4282,11 @@ def test_local_mul_exp_to_exp_add():
     # Default and FAST_RUN modes put a Composite op into the final graph,
     # whereas FAST_COMPILE doesn't.  To unify the graph the test cases analyze across runs,
     # we'll avoid the insertion of Composite ops in each mode by skipping Fusion rewrites
-    mode = get_default_mode().excluding("fusion").including("local_mul_exp_to_exp_add")
+    mode = (
+        get_default_mode()
+        .excluding("fusion", "scalarize")
+        .including("local_mul_exp_to_exp_add")
+    )
 
     x = scalar("x")
     y = scalar("y")
@@ -3981,7 +4396,7 @@ def test_local_mul_pow_to_pow_add():
     # we'll avoid the insertion of Composite ops in each mode by skipping Fusion rewrites
     mode = (
         get_default_mode()
-        .excluding("fusion")
+        .excluding("fusion", "scalarize")
         .including("local_mul_exp_to_exp_add")
         .including("local_mul_pow_to_pow_add")
     )
@@ -4077,92 +4492,6 @@ def test_local_expm1():
         isinstance(n.op, Elemwise) and isinstance(n.op.scalar_op, ps.basic.Expm1)
         for n in r.maker.fgraph.toposort()
     )
-
-
-def compile_graph_log_sum_exp(x, axis, dimshuffle_op=None):
-    sum_exp = pt_sum(exp(x), axis=axis)
-    if dimshuffle_op:
-        sum_exp = dimshuffle_op(sum_exp)
-    y = log(sum_exp)
-    MODE = get_default_mode().including("local_log_sum_exp")
-    return function([x], y, mode=MODE)
-
-
-def check_max_log_sum_exp(x, axis, dimshuffle_op=None):
-    f = compile_graph_log_sum_exp(x, axis, dimshuffle_op)
-
-    fgraph = f.maker.fgraph.toposort()
-    for node in fgraph:
-        if hasattr(node.op, "scalar_op") and node.op.scalar_op == ps.basic.maximum:
-            return
-
-        # In mode FAST_COMPILE, the rewrites don't replace the
-        # `Max` `Op`.
-        if isinstance(node.op, Max):
-            return
-
-    # TODO FIXME: Refactor this test so that it makes a direct assertion and
-    # nothing more.
-    raise AssertionError("No maximum detected after log_sum_exp rewrite")
-
-
-def test_local_log_sum_exp_maximum():
-    """Test that the rewrite is applied by checking the presence of the maximum."""
-    x = tensor3("x")
-    check_max_log_sum_exp(x, axis=(0,), dimshuffle_op=None)
-    check_max_log_sum_exp(x, axis=(1,), dimshuffle_op=None)
-    check_max_log_sum_exp(x, axis=(2,), dimshuffle_op=None)
-    check_max_log_sum_exp(x, axis=(0, 1), dimshuffle_op=None)
-    check_max_log_sum_exp(x, axis=(0, 1, 2), dimshuffle_op=None)
-
-    # If a transpose is applied to the sum
-    transpose_op = DimShuffle(input_ndim=2, new_order=(1, 0))
-    check_max_log_sum_exp(x, axis=2, dimshuffle_op=transpose_op)
-
-    # If the sum is performed with keepdims=True
-    x = TensorType(dtype="floatX", shape=(None, 1, None))("x")
-    sum_keepdims_op = x.sum(axis=(0, 1), keepdims=True).owner.op
-    check_max_log_sum_exp(x, axis=(0, 1), dimshuffle_op=sum_keepdims_op)
-
-
-def test_local_log_sum_exp_near_one():
-    """Test that the rewritten result is correct around 1.0."""
-
-    x = tensor3("x")
-    x_val = 1.0 + np.random.random((4, 3, 2)).astype(config.floatX) / 10.0
-
-    f = compile_graph_log_sum_exp(x, axis=(1,))
-    naive_ret = np.log(np.sum(np.exp(x_val), axis=1))
-    rewritten_ret = f(x_val)
-    assert np.allclose(naive_ret, rewritten_ret)
-
-    # If a transpose is applied
-    transpose_op = DimShuffle(input_ndim=2, new_order=(1, 0))
-    f = compile_graph_log_sum_exp(x, axis=(1,), dimshuffle_op=transpose_op)
-    naive_ret = np.log(np.sum(np.exp(x_val), axis=1).T)
-    rewritten_ret = f(x_val)
-    assert np.allclose(naive_ret, rewritten_ret)
-
-
-def test_local_log_sum_exp_large():
-    """Test that the rewrite result is correct for extreme value 100."""
-    x = vector("x")
-    f = compile_graph_log_sum_exp(x, axis=0)
-
-    x_val = np.array([-100.0, 100.0]).astype(config.floatX)
-
-    rewritten_ret = f(x_val)
-    assert np.allclose(rewritten_ret, 100.0)
-
-
-def test_local_log_sum_exp_inf():
-    """Test that when max = +-inf, the rewritten output still works correctly."""
-    x = vector("x")
-    f = compile_graph_log_sum_exp(x, axis=0)
-
-    assert f([-np.inf, -np.inf]) == -np.inf
-    assert f([np.inf, np.inf]) == np.inf
-    assert f([-np.inf, np.inf]) == np.inf
 
 
 def test_local_reciprocal_1_plus_exp():
@@ -4335,19 +4664,25 @@ class TestSigmoidRewrites:
         f(data)
 
     def test_local_1msigmoid(self):
-        m = self.get_mode(excluding=["fusion", "inplace"])
+        m = self.get_mode(excluding=["fusion", "inplace", "scalarize"])
         x = fscalar()
         xd = dscalar()
 
         # Test `exp_over_1_plus_exp`
-        f = pytensor.function([x], 1 - exp(x) / (1 + exp(x)), mode=m)
+        f = pytensor.function(
+            [x], np.float32(1) - exp(x) / (np.float32(1) + exp(x)), mode=m
+        )
         # FIXME: PatternNodeRewriter does not copy stack trace
         #  (see https://github.com/Theano/Theano/issues/4581)
         # assert check_stack_trace(f, ops_to_check=[neg, sigmoid])
         assert equal_computations(f.maker.fgraph.outputs, [sigmoid(-x)])
 
         # Test `inv_1_plus_exp`
-        f = pytensor.function([x], 1 - pt.fill(x, 1.0) / (1 + exp(-x)), mode=m)
+        f = pytensor.function(
+            [x],
+            np.float32(1) - pt.fill(x, np.float32(1.0)) / (np.float32(1) + exp(-x)),
+            mode=m,
+        )
         # assert check_stack_trace(f, ops_to_check=[neg, sigmoid])
         assert equal_computations(f.maker.fgraph.outputs, [sigmoid(-x)])
 
@@ -4417,7 +4752,7 @@ class TestSigmoidRewrites:
             trees = [parse_mul_tree(e) for e in (expr1, expr2)]
             perform_sigm_times_exp(trees[0])
             trees[0] = simplify_mul(trees[0])
-            good = is_same_graph(compute_mul(trees[0]), compute_mul(trees[1]))
+            good = equal_computations([compute_mul(trees[0])], [compute_mul(trees[1])])
             # if not good:
             #     print(trees[0])
             #     print(trees[1])
@@ -4568,7 +4903,7 @@ class TestSoftplusRewrites:
     def test_log1p_neg_sigmoid_to_softpuls(self):
         x = scalar()
         out = log1p(-sigmoid(x))
-        f = pytensor.function([x], out, mode=self.m)
+        f = pytensor.function([x], out, mode=self.m.excluding("scalarize"))
 
         topo = f.maker.fgraph.toposort()
         assert len(topo) == 2
@@ -4587,7 +4922,7 @@ class TestSigmoidUtils:
         tree = (x * y) * -z
         mul_tree = parse_mul_tree(tree)
         assert parse_mul_tree(compute_mul(mul_tree)) == mul_tree
-        assert is_same_graph(compute_mul(parse_mul_tree(tree)), tree)
+        assert equal_computations([compute_mul(parse_mul_tree(tree))], [tree])
 
     def test_parse_mul_tree(self):
         x, y, z = vectors("x", "y", "z")
@@ -4609,7 +4944,7 @@ class TestSigmoidUtils:
             is_1pexp(x, only_process_constants=False)
             for x in [(1 + exp_op(-x)), (exp_op(-x) + 1)]
         ):
-            assert not neg_ and is_same_graph(exp_arg, -x)
+            assert not neg_ and equal_computations([exp_arg], [-x])
         assert is_1pexp(1 - exp_op(x), False) is None
         assert is_1pexp(2 + exp_op(x), False) is None
         assert is_1pexp(exp_op(x) + 2, False) is None
@@ -4622,7 +4957,7 @@ def test_local_logit_sigmoid():
     """Test that graphs of the form ``logit(sigmoid(x))`` and ``sigmoid(logit(x))`` get rewritten to ``x``."""
 
     def logit_fn(x):
-        return log(x / (1 - x))
+        return log(x / (np.float32(1) - x))
 
     x = fmatrix()
 
@@ -4635,6 +4970,24 @@ def test_local_logit_sigmoid():
     fg = rewrite(FunctionGraph([x], [out]))
     assert not list(fg.toposort())
     assert fg.inputs[0] is fg.outputs[0]
+
+
+def test_local_odds_sigmoid():
+    """Test that ``sigmoid(x) / (1 - sigmoid(x))`` and its inverse rewrite to ``exp(+-x)``.
+
+    1 - sigmoid(x) cancels to exactly zero for x >~ 37, so the un-rewritten ratio is
+    inf (resp. 0) long before exp(+-x) stops being representable.
+    """
+    x = dscalar("x")
+
+    result = RewriteTester([x], [sigmoid(x) / (1 - sigmoid(x))])
+    result.assert_graph(exp(x))
+    result.assert_eval(np.array(0.5))
+
+    # canonicalization spells the negation as a mul
+    result = RewriteTester([x], [(1 - sigmoid(x)) / sigmoid(x)])
+    result.assert_graph(exp(-1.0 * x))
+    result.assert_eval(np.array(0.5))
 
 
 def test_local_useless_conj():
@@ -5013,15 +5366,13 @@ def test_local_dot_to_mul(batched, a_shape, b_shape):
         == 1
     )
 
-    # For now we do not rewrite only the case of unbatched outer
-    core_outer = (not batched) and (a_shape == (3, 1)) and (b_shape == (1, 3))
     rewritten_out = rewrite_graph(out)
     assert rewritten_out.type.shape == out.type.shape
-    assert sum(
+    assert not any(
         isinstance(var.owner.op, (Blockwise | Dot))
         for var in ancestors([rewritten_out])
         if var.owner
-    ) == (1 if core_outer else 0)
+    )
 
     a_test = np.random.normal(size=a.type.shape).astype(a.type.dtype)
     b_test = np.random.normal(size=b.type.shape).astype(b.type.dtype)
@@ -5268,6 +5619,16 @@ def test_sign_reciprocal():
     assert_equal_computations([rewritten], [expected])
 
 
+def test_sign_complex_reciprocal():
+    x = pt.zvector()
+    out = sign(reciprocal(x))
+    result = RewriteTester(
+        [x], [out], include=["canonicalize", "stabilize", "specialize"]
+    )
+    result.assert_graph(out)
+    result.assert_eval(np.array([1 + 2j, 2j]))
+
+
 @pytest.mark.parametrize(
     "build, expected_fn",
     [
@@ -5336,3 +5697,66 @@ def test_sign_div_non_constant_not_rewritten():
     assert any(
         isinstance(getattr(node.op, "scalar_op", None), ps.TrueDiv) for node in nodes
     )
+
+
+def test_useless_sign():
+    X = pt.dmatrix("X")
+    diag_L = pt.diagonal(pt.linalg.cholesky(X))
+    out = pt.sign(pt.sqr(diag_L))
+    result = RewriteTester([X], [out])
+    result.assert_graph(pt.fill(pt.sqr(diag_L), pt.constant([1.0], dtype=X.dtype)))
+
+
+def test_useless_sign_of_failed_cholesky():
+    X = pt.dmatrix("X")
+    L = pt.linalg.cholesky(X, on_error="nan")
+    f = function([X], [pt.sign(pt.diagonal(L)), L], mode="FAST_RUN")
+    sign_diag, L_val = f(np.array([[1.0, 2.0], [2.0, 1.0]]))
+    assert np.isnan(L_val).all()
+    np.testing.assert_array_equal(sign_diag, [1.0, 1.0])
+
+
+@pytest.mark.parametrize(
+    "build, expected_fn",
+    [
+        (
+            lambda x: pt.sign(pt.prod(x)),
+            lambda x: pt.prod(pt.sign(x)),
+        ),
+        (
+            lambda x: pt.sign(pt.expand_dims(pt.prod(x, axis=1), 1)),
+            lambda x: pt.expand_dims(pt.prod(pt.sign(x), axis=1), 1),
+        ),
+    ],
+    ids=["all_axes", "through_expand_dims"],
+)
+def test_sign_prod(build, expected_fn):
+    x = pt.dmatrix("x")
+    result = RewriteTester(
+        [x], [build(x)], include=["canonicalize", "stabilize", "specialize"]
+    )
+    result.assert_graph(expected_fn(x))
+
+
+@pytest.mark.parametrize(
+    "dtype, prod_dtype, acc_dtype",
+    [
+        ("int32", None, None),
+        ("int32", "float64", None),
+        ("complex128", "float64", None),
+        ("bool", "float64", "float64"),
+    ],
+    ids=[
+        "integer_product",
+        "integer_accumulator",
+        "complex_projection",
+        "boolean_sign",
+    ],
+)
+def test_sign_prod_unsafe_dtype(dtype, prod_dtype, acc_dtype):
+    x = pt.matrix("x", dtype=dtype)
+    out = pt.sign(pt.prod(x, dtype=prod_dtype, acc_dtype=acc_dtype))
+    result = RewriteTester(
+        [x], [out], include=["canonicalize", "stabilize", "specialize"]
+    )
+    result.assert_graph(out)

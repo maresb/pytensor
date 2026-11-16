@@ -41,7 +41,7 @@ def test_jax_Subtensor_constant():
 
     # Advanced indexing
     out_pt = pt_subtensor.advanced_subtensor1(x_pt, [1, 2])
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedSubtensor1)
+    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedSubtensor)
 
     compare_jax_and_py([x_pt], [out_pt], [x_np])
 
@@ -223,6 +223,26 @@ def test_jax_IncSubtensor():
     assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedIncSubtensor)
 
     compare_jax_and_py([], [out_pt], [])
+
+
+@pytest.mark.parametrize(
+    "func", (pt_subtensor.advanced_inc_subtensor1, pt_subtensor.advanced_set_subtensor1)
+)
+def test_jax_AdvancedIncSubtensor1_scalar_y(func):
+    """A 0d update must not trip the runtime-broadcast check.
+
+    The check is written against array values, but ``jax_typify`` turns a 0d array into a
+    Python scalar, which has no ``.shape``.
+    """
+    from pytensor import function
+
+    x = pt.zeros((5,))
+    out = func(x, 1.0, np.array([1, 3]))
+
+    res = function([], out, mode="JAX")()
+    expected = np.zeros(5)
+    expected[[1, 3]] = 1.0
+    np.testing.assert_allclose(res, expected)
 
 
 @pytest.mark.parametrize(

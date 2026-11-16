@@ -56,7 +56,12 @@ from pytensor.tensor.math import all as pt_all
 from pytensor.tensor.math import pow as pt_pow
 from pytensor.tensor.math import round as pt_round
 from pytensor.tensor.math import sum as pt_sum
-from pytensor.tensor.rewriting.elemwise import FusionOptimizer, local_dimshuffle_lift
+from pytensor.tensor.rewriting.elemwise import (
+    FusionOptimizer,
+    apply_local_dimshuffle_merge,
+    local_dimshuffle_lift,
+    local_dimshuffle_merge,
+)
 from pytensor.tensor.rewriting.shape import (
     local_fuse_squeeze_reshape,
     local_useless_expand_dims_in_reshape,
@@ -186,6 +191,41 @@ class TestDimshuffleLift:
         assert not local_dimshuffle_lift.transform(g, g.outputs[0].owner)
 
 
+def test_eager_dimshuffle_merge():
+    x = matrix("x")
+    out = x.dimshuffle(0, "x", 1).dimshuffle(2, 0, "x", 1).dimshuffle(1, 0)
+    fgraph = FunctionGraph([x], [out], clone=False)
+    assert apply_local_dimshuffle_merge(fgraph, out) is x
+
+    # A DimShuffle that drops a single-element MakeVector is replaced by its scalar
+    s = scalar("s")
+    out = MakeVector(s.type.dtype)(s).dimshuffle("x", "x").squeeze()
+    fgraph = FunctionGraph([s], [out], clone=False)
+    assert apply_local_dimshuffle_merge(fgraph, out) is s
+
+
+def test_dimshuffle_merge():
+    x = matrix("x")
+    out = x.dimshuffle(1, "x", 0).dimshuffle(2, 0, "x", 1)
+    result = utt.RewriteTester(
+        [x], [out], include=None, custom_rewrite=local_dimshuffle_merge
+    )
+    result.assert_graph(x.dimshuffle(0, 1, "x", "x"))
+    result.assert_eval(np.arange(6, dtype=config.floatX).reshape(2, 3))
+    assert check_stack_trace(result.rewr_fg, ops_to_check="all")
+
+
+def test_dimshuffle_merge_stops_at_elemwise():
+    x = matrix("x")
+    inp = exp(x[None])
+    out = inp.dimshuffle(0, 2, 1).squeeze(0)
+    result = utt.RewriteTester(
+        [x], [out], include=None, custom_rewrite=local_dimshuffle_merge
+    )
+    result.assert_graph(inp.dimshuffle(2, 1))
+    result.assert_eval(np.arange(6, dtype=config.floatX).reshape(2, 3))
+
+
 def test_local_useless_expand_dims_in_reshape():
     vec = TensorType(dtype="float64", shape=(None,))("vector")
     mat = TensorType(dtype="float64", shape=(None, None))("mat")
@@ -249,7 +289,11 @@ class TestFusion:
             "add_mul_fusion",
             "inplace",
         ],
-        exclude=["cxx_only", "BlasOpt"],
+        # Exclude both careduce-fusion paths so reductions stay unfused here:
+        # cxx_only covers local_careduce_fusion (C backend); the indexed/reduce
+        # fusion is the Numba-specific equivalent. This class tests the generic
+        # Composite fusion, independent of the active backend.
+        exclude=["cxx_only", "BlasOpt", "fuse_indexed_into_elemwise"],
     )
     mode = Mode(get_default_mode().linker, rewrites)
     _shared = staticmethod(shared)
@@ -479,7 +523,7 @@ class TestFusion:
             ),  # 15
             # test with constant
             (
-                (fw + fx) + (fy + fz) + 2.0,
+                (fw + fx) + (fy + fz) + np.float32(2.0),
                 (fw, fx, fy, fz),
                 (fwv, fxv, fyv, fzv),
                 1,
@@ -487,7 +531,7 @@ class TestFusion:
                 "float32",
             ),
             (
-                ((fw + fx) + 2.0 + fy) + fz,
+                ((fw + fx) + np.float32(2.0) + fy) + fz,
                 (fw, fx, fy, fz),
                 (fwv, fxv, fyv, fzv),
                 1,
@@ -495,7 +539,7 @@ class TestFusion:
                 "float32",
             ),
             (
-                (fw + (fx + 2.0 + fy)) + fz,
+                (fw + (fx + np.float32(2.0) + fy)) + fz,
                 (fw, fx, fy, fz),
                 (fwv, fxv, fyv, fzv),
                 1,
@@ -503,7 +547,7 @@ class TestFusion:
                 "float32",
             ),
             (
-                (fw + (fx + fy) + 2 + fz),
+                (fw + (fx + fy) + np.float32(2.0) + fz),
                 (fw, fx, fy, fz),
                 (fwv, fxv, fyv, fzv),
                 1,
@@ -511,7 +555,7 @@ class TestFusion:
                 "float32",
             ),
             (
-                fw + (fx + (fy + fz) + 2.0),
+                fw + (fx + (fy + fz) + np.float32(2.0)),
                 (fw, fx, fy, fz),
                 (fwv, fxv, fyv, fzv),
                 1,
@@ -519,7 +563,7 @@ class TestFusion:
                 "float32",
             ),  # 20
             (
-                2 + (fw + fx) + (fy + fz),
+                np.float32(2.0) + (fw + fx) + (fy + fz),
                 (fw, fx, fy, fz),
                 (fwv, fxv, fyv, fzv),
                 1,
@@ -658,7 +702,7 @@ class TestFusion:
                 "float32",
             ),
             (
-                fx - true_div(fy, 2),
+                fx - true_div(fy, np.float32(2.0)),
                 (fx, fy),
                 (fxv, fyv),
                 1,
@@ -685,7 +729,14 @@ class TestFusion:
                     "numpy": "float64",
                 },
             ),  # 40
-            (fx - (fy / 2), (fx, fy), (fxv, fyv), 1, fxv - (fyv / 2), "float32"),
+            (
+                fx - (fy / np.float32(2.0)),
+                (fx, fy),
+                (fxv, fyv),
+                1,
+                fxv - (fyv / 2),
+                "float32",
+            ),
             (
                 fx - (fy % fz),
                 (fx, fy, fz),
@@ -964,7 +1015,10 @@ class TestFusion:
                     np.sum(-((fxv - fyv) ** 2) / 2),
                     -(fxv - fyv),
                 ),
-                ("float32", "float32"),
+                {
+                    "custom": ("float32", "float32"),
+                    "numpy+floatX": (config.floatX, "float32"),
+                },
             ),
             # Two Composite graphs that share the same input, but are split by
             # a non-elemwise operation (Assert)
@@ -1002,7 +1056,10 @@ class TestFusion:
                 (fxv,),
                 4,
                 (np.sum(fxv + 5) * np.exp(fxv) / (fxv + 5),),
-                ("float32",),
+                {
+                    "custom": ("float32",),
+                    "numpy+floatX": (config.floatX,),
+                },
             ),
             (
                 (sin(exp(fx)), exp(sin(fx))),
@@ -1453,6 +1510,60 @@ class TestFusion:
             r = m.sum(axis=0, keepdims=True)
         fgraph = FunctionGraph([x_row, x_mat], [m])
         FusionOptimizer().apply(fgraph)
+
+    def test_fuse_across_symbolic_op(self):
+        # A SymbolicOp with no backend dispatch is a fusion barrier: its body is
+        # compiled on its own, so the ops around it cannot join the ops inside it.
+        # Inlining it at the start of the fusion pass lets the whole chain fuse --
+        # the subtraction from the log_softmax body ends up in the same Composite
+        # as the surrounding exp and add.
+        rng = np.random.default_rng(75)
+        x = pt.tensor("x", shape=(5, 4))
+        out = exp(pt.special.log_softmax(x * 2.0, axis=-1)) + 1.0
+
+        def output_scalar_ops(fn):
+            scalar_op = fn.maker.fgraph.outputs[0].owner.op.scalar_op
+            assert isinstance(scalar_op, Composite)
+            return {node.op for node in scalar_op.fgraph.apply_nodes}
+
+        fn = function([x], out, mode=self.mode)
+        assert output_scalar_ops(fn) == {ps.add, ps.exp, ps.sub}
+
+        # Without the inlining the body stays sealed off, so only the outer ops fuse
+        barrier_fn = function(
+            [x], out, mode=self.mode.excluding("inline_symbolic_for_fusion")
+        )
+        assert output_scalar_ops(barrier_fn) == {ps.add, ps.exp}
+
+        x_val = rng.normal(size=(5, 4)).astype(config.floatX)
+        np.testing.assert_allclose(fn(x_val), barrier_fn(x_val), rtol=1e-6)
+
+    def test_merge_inlined_symbolic_ops(self):
+        # Each SymbolicOp is inlined from its own inner graph, so a Softmax and a
+        # LogSoftmax over the same logits come out with distinct copies of everything
+        # their bodies share. Merging them before fusion is what keeps the Composite
+        # from evaluating the exponential over each copy.
+        x = pt.tensor("x", shape=(5, 4))
+        outs = [pt.special.softmax(x, axis=-1), pt.special.log_softmax(x, axis=-1)]
+
+        def n_exp(fn):
+            scalar_ops = []
+            for node in fn.maker.fgraph.toposort():
+                scalar_op = getattr(node.op, "scalar_op", None)
+                if isinstance(scalar_op, Composite):
+                    scalar_ops.extend(n.op for n in scalar_op.fgraph.apply_nodes)
+                elif scalar_op is not None:
+                    scalar_ops.append(scalar_op)
+            return scalar_ops.count(ps.exp)
+
+        fn = function([x], outs, mode=self.mode)
+        assert n_exp(fn) == 1
+
+        # Without the merge the two copies survive into the Composite
+        unmerged_fn = function(
+            [x], outs, mode=self.mode.excluding("merge_inlined_symbolic")
+        )
+        assert n_exp(unmerged_fn) == 2
 
 
 class TimesN(ps.basic.UnaryScalarOp):

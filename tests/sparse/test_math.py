@@ -70,10 +70,10 @@ def eval_outputs(outputs):
 
 
 class TestAddMul:
-    def test_AddSS(self):
+    def test_AddSparseSparse(self):
         self._testSS(add)
 
-    def test_AddSD(self):
+    def test_AddSparseDense(self):
         self._testSD(add)
 
     def test_AddDS(self):
@@ -99,6 +99,20 @@ class TestAddMul:
             np.array([[1.0, 0], [3, 0], [0, 6]]),
             np.array([[1.0, 2], [3, 0], [0, 6]]),
         )
+
+    @pytest.mark.parametrize("format", ["csc", "csr"])
+    def test_MulSD_scalar_grad(self, format):
+        # Multiplying a sparse matrix by a scalar broadcasts the scalar over
+        # every entry, so the gradient wrt the scalar must be a scalar too.
+        array = np.array([[1.0, 0], [3, 0], [0, 6]])
+        x = as_sparse_variable(as_sparse_format(array, format))
+        y = scalar("y", dtype="float64")
+
+        gy = pytensor.grad(psm.sp_sum(multiply(x, y)), y)
+        assert gy.type.ndim == 0
+
+        f = pytensor.function([y], gy)
+        utt.assert_allclose(array.sum(), f(2.0))
 
     def _testSS(self, op, array1=None, array2=None):
         if array1 is None:
@@ -739,6 +753,36 @@ class TestDots(utt.InferShapeTester):
 
         utt.verify_grad(buildgraph_T, [mat])
 
+    def test_dot_matrix_sparse_operand_grad(self):
+        """Like `test_csr_dense_grad`, but also checks the gradient w.r.t. the sparse operand."""
+        spmat = scipy_sparse.csr_matrix(random_lil((4, 3), "float64", 3))
+        mat = np.asarray(np.random.standard_normal((2, 4)), "float64")
+        verify_grad_sparse(Dot(), [mat, spmat])
+
+    @pytest.mark.parametrize("format", ["csr", "csc"])
+    def test_dot_vector_operand_grad(self, format):
+        """Regression test for gh-2282 / gh-321: grad used to raise when one operand was a 1d vector."""
+        x = getattr(self, f"x_{format}")  # shape (10, 100)
+
+        # sparse (10, 100) @ dense vector (100,) -> vector (10,)
+        verify_grad_sparse(psm.dot, [x, self.v_100])
+
+        # dense vector (10,) @ sparse (10, 100) -> vector (100,)
+        verify_grad_sparse(psm.dot, [self.v_10, x])
+
+    @pytest.mark.parametrize("format", ["csr", "csc"])
+    def test_dot_vector_operand_grad_length_one(self, format):
+        """Edge case: a length-1 (broadcastable) dense vector operand (cf. gh-1461)."""
+        mtype = scipy_sparse.csr_matrix if format == "csr" else scipy_sparse.csc_matrix
+        x = mtype(random_lil((10, 1), pytensor.config.floatX, 4))
+        v1 = np.asarray(np.random.uniform(-1, 1, 1), dtype=pytensor.config.floatX)
+        v10 = np.asarray(np.random.uniform(-1, 1, 10), dtype=pytensor.config.floatX)
+
+        # sparse (10, 1) @ dense vector (1,) -> vector (10,)
+        verify_grad_sparse(psm.dot, [x, v1])
+        # dense vector (10,) @ sparse (10, 1) -> vector (1,)
+        verify_grad_sparse(psm.dot, [v10, x])
+
 
 class TestUsmm:
     def setup_method(self):
@@ -1084,7 +1128,7 @@ class TestMulSV:
                 utt.assert_allclose(spmat.toarray() * mat, out.toarray())
 
 
-class TestStructuredAddSV:
+class TestStructuredAddSparseDenseVector:
     def test_structured_add_s_v_grad(self):
         sp_types = {"csc": scipy_sparse.csc_matrix, "csr": scipy_sparse.csr_matrix}
         for format in ("csr", "csc"):
@@ -1112,13 +1156,13 @@ class TestStructuredAddSV:
                 )
 
 
-class TestAddSSData(utt.InferShapeTester):
+class TestAddSparseSparseData(utt.InferShapeTester):
     x = {}
     a = {}
 
     def setup_method(self):
         super().setup_method()
-        self.op_class = psm.AddSSData
+        self.op_class = psm.AddSparseSparseData
 
         for format in sparse_formats:
             variable = getattr(pytensor.sparse, format + "_matrix")
@@ -1516,8 +1560,8 @@ class TestVectorizeSparse:
     @pytest.mark.parametrize(
         "build",
         [
-            pytest.param(lambda a, d: add(a, d), id="AddSD"),
-            pytest.param(lambda a, d: multiply(a, d), id="SparseDenseMultiply"),
+            pytest.param(lambda a, d: add(a, d), id="AddSparseDense"),
+            pytest.param(lambda a, d: multiply(a, d), id="MultiplySparseDense"),
         ],
     )
     def test_sparse_dense_ops_batched_dense_raises(self, build):

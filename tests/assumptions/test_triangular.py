@@ -23,7 +23,7 @@ from tests.assumptions.conftest import make_fgraph
     ],
 )
 def test_alloc_diag_offset_triangular(offset, lower, upper, diagonal):
-    v = pt.vector("v", shape=(5,))
+    v = pt.ones(5)
     d = alloc_diag(v, offset=offset, axis1=0, axis2=1)
     _, af = make_fgraph(d)
     assert af.get(d, LOWER_TRIANGULAR) == lower
@@ -225,3 +225,12 @@ class TestMatrixTransposeFlipsTriangle:
         y = x_tagged.T.T
         _, af = make_fgraph(y)
         assert af.check(y, key)
+
+
+def test_lu_solve_factor_is_unknown_triangular():
+    # solve_triangular reads one triangle of the packed LU factor, so it promises nothing
+    a, b = pt.matrix("a"), pt.matrix("b")
+    lu, pivots = pt.linalg.lu_factor(a)
+    _, af = make_fgraph(pt.linalg.lu_solve((lu, pivots), b))
+    assert af.get(lu, LOWER_TRIANGULAR) == FactState.UNKNOWN
+    assert af.get(lu, UPPER_TRIANGULAR) == FactState.UNKNOWN

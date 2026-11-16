@@ -454,6 +454,18 @@ def test_config_options_fastmath():
         assert fn_nofast.targetoptions["fastmath"] is False
 
 
+@pytest.mark.parametrize("fastmath", [True, False])
+def test_config_options_fastmath_vectorized(fastmath):
+    # The loop of a fused reduction is an overload compiled with `_jit_options`
+    x = pt.matrix("x")
+    with config.change_flags(numba__fastmath=fastmath, numba__cache=False):
+        fn = function([x], pt.exp(x).sum(axis=0), mode="NUMBA")
+        fn(np.ones((2, 3), dtype=config.floatX))
+    [llvm_ir] = fn.vm.jit_fn.inspect_llvm().values()
+    reassoc_lines = [line for line in llvm_ir.splitlines() if "reassoc" in line]
+    assert bool(reassoc_lines) == fastmath
+
+
 def test_config_options_cached():
     with config.change_flags(numba__cache=True):
 
@@ -723,6 +735,36 @@ def test_funcify_dispatch_interop():
         outs[2].owner.op, outs[2].owner
     )
     assert numba.njit(lambda x: fn2_def_cached(x))(test_x) == 2
+
+
+@pytest.mark.parametrize("beyond_limit", [False, True])
+def test_numba_many_inputs(beyond_limit):
+    n_inputs = 1001 if beyond_limit else 2
+
+    class FirstInput(Op):
+        __props__ = ()
+
+        def make_node(self, *inputs):
+            return Apply(self, list(inputs), [inputs[0].type()])
+
+        def perform(self, node, inputs, outputs):
+            outputs[0][0] = inputs[0]
+
+    @numba_basic.register_funcify_default_op_cache_key(FirstInput)
+    def funcify_first_input(op, node, **kwargs):
+        names = ", ".join(f"x{i}" for i in range(len(node.inputs)))
+        py_func = numba_cache.compile_numba_function_src(
+            f"def first_input({names}): return x0", "first_input"
+        )
+        return numba_basic.numba_njit(py_func)
+
+    # Native scalars and a trivial body isolate the argument limit without
+    # the compilation cost of building a large vector.
+    x = ps.float64("x")
+    out = FirstInput()(*([x] * n_inputs))
+    with config.change_flags(numba__cache=True):
+        fn = function([x], out, mode=numba_mode)
+        assert fn(0.5) == 0.5
 
 
 class TestFgraphCacheKey:

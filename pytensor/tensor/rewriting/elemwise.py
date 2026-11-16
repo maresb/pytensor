@@ -120,6 +120,7 @@ class InplaceGraphOptimizer(GraphRewriter):
         if not candidate_pairs:
             return node
 
+        failed_pattern = None
         # Try in-placing all outputs at once
         tried_inputs = set()
         inplace_pattern = {}
@@ -134,7 +135,7 @@ class InplaceGraphOptimizer(GraphRewriter):
             try:
                 fgraph.replace_all_validate(replacements, reason=reason)
             except InconsistencyError:
-                pass
+                failed_pattern = inplace_pattern
             else:
                 copy_stack_trace(node.outputs, inplace_node.outputs)
                 return inplace_node
@@ -147,6 +148,11 @@ class InplaceGraphOptimizer(GraphRewriter):
             if o not in inplace_pattern and i not in tried_inputs:
                 inplace_pattern[o] = [i]
                 tried_inputs.add(i)
+
+                if node is original_node and inplace_pattern == failed_pattern:
+                    inplace_pattern.pop(o)
+                    tried_inputs.discard(i)
+                    continue
 
                 inplace_node = self.create_inplace_node(node, inplace_pattern)
                 if inplace_node.op.destroy_map != inplace_pattern:
@@ -366,6 +372,22 @@ def apply_local_dimshuffle_lift(fgraph, var):
     return var
 
 
+def apply_local_dimshuffle_merge(fgraph, var):
+    """Clean up DimShuffles without lifting through other Ops.
+
+    A DimShuffle that drops a single-element `MakeVector` is replaced by its scalar.
+    """
+    if var.owner is None:
+        return var
+    if new := local_dimshuffle_merge.transform(fgraph, var.owner):
+        [var] = new
+    if isinstance(var.owner_op, DimShuffle) and (
+        new := local_useless_dimshuffle_makevector.transform(fgraph, var.owner)
+    ):
+        [var] = new
+    return var
+
+
 def is_dimshuffle_useless(new_order, input):
     """
     Checks for two types of useless dimshuffles:
@@ -390,6 +412,25 @@ def is_dimshuffle_useless(new_order, input):
     else:
         is_useless = False
     return is_useless
+
+
+@node_rewriter([DimShuffle])
+def local_dimshuffle_merge(fgraph, node):
+    """Merge consecutive DimShuffles and remove useless ones without lifting."""
+    inp = node.inputs[0]
+    new_order = node.op.new_order
+
+    while isinstance(inp.owner_op, DimShuffle):
+        inner_node = inp.owner
+        new_order = [
+            "x" if dim == "x" else inner_node.op.new_order[dim] for dim in new_order
+        ]
+        inp = inner_node.inputs[0]
+
+    if is_dimshuffle_useless(new_order, inp):
+        return [inp]
+    if inp is not node.inputs[0]:
+        return [copy_stack_trace(node.outputs[0], inp.dimshuffle(new_order))]
 
 
 @register_canonicalize

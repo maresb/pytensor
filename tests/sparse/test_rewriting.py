@@ -7,10 +7,17 @@ import pytensor.sparse.math as smath
 from pytensor import sparse
 from pytensor.compile.mode import Mode, get_default_mode
 from pytensor.configdefaults import config
+from pytensor.graph.rewriting.basic import in2out
 from pytensor.link.numba import NumbaLinker
-from pytensor.sparse.rewriting import SamplingDotCSR, sd_csc
+from pytensor.sparse.rewriting import (
+    SamplingDotCSR,
+    local_sampling_dot_csr,
+    sampling_dot_csr,
+    sd_csc,
+)
 from pytensor.tensor.basic import as_tensor_variable
 from pytensor.tensor.math import sum as pt_sum
+from pytensor.tensor.shape import shape, specify_shape
 from pytensor.tensor.type import ivector, matrix, vector
 from tests import unittest_tools as utt
 from tests.sparse.test_basic import random_lil
@@ -80,7 +87,7 @@ def test_local_mul_s_d():
         f = pytensor.function(inputs, smath.mul_s_d(*inputs), mode="CVM")
 
         assert not any(
-            isinstance(node.op, smath.SparseDenseMultiply)
+            isinstance(node.op, smath.MultiplySparseDense)
             for node in f.maker.fgraph.toposort()
         )
 
@@ -102,7 +109,7 @@ def test_local_mul_s_v():
         f = pytensor.function(inputs, smath.mul_s_v(*inputs), mode="CVM")
 
         assert not any(
-            isinstance(node.op, smath.SparseDenseVectorMultiply)
+            isinstance(node.op, smath.MultiplySparseDenseVector)
             for node in f.maker.fgraph.toposort()
         )
 
@@ -121,7 +128,7 @@ def test_local_structured_add_s_v():
         f = pytensor.function(inputs, smath.structured_add_s_v(*inputs), mode="CVM")
 
         assert not any(
-            isinstance(node.op, smath.StructuredAddSV)
+            isinstance(node.op, smath.StructuredAddSparseDenseVector)
             for node in f.maker.fgraph.toposort()
         )
 
@@ -155,6 +162,27 @@ def test_local_sampling_dot_csr():
                 isinstance(node.op, SamplingDotCSR)
                 for node in f.maker.fgraph.toposort()
             )
+
+
+@config.change_flags(blas__ldflags="-lblas")
+def test_sampling_dot_csr_uses_pattern_shape():
+    x, y = matrix("x"), matrix("y")
+    p = sparse.csr_matrix("p", shape=(None, 3))
+    result = utt.RewriteTester(
+        [x, y, p],
+        [smath.sampling_dot(x, y, p)],
+        include=None,
+        custom_rewrite=in2out(local_sampling_dot_csr, ignore_newtrees=True),
+    )
+    p_data, p_ind, p_ptr, p_shape = sparse.csm_properties(p)
+    result.assert_graph(
+        specify_shape(
+            sparse.CSR(
+                *sampling_dot_csr(x, y, p_data, p_ind, p_ptr, p_shape[1]), p_shape
+            ),
+            shape(p),
+        )
+    )
 
 
 def test_local_dense_from_sparse_sparse_from_dense():

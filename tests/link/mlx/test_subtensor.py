@@ -1,12 +1,13 @@
 import numpy as np
 import pytest
 
+import pytensor
 import pytensor.tensor as pt
 from pytensor import function
 from pytensor.compile.mode import Mode
 from pytensor.tensor import subtensor as pt_subtensor
 from pytensor.tensor import tensor
-from tests.link.mlx.test_basic import compare_mlx_and_py
+from tests.link.mlx.test_basic import compare_mlx_and_py, mlx_mode, py_mode
 
 
 mx = pytest.importorskip("mlx.core")
@@ -60,7 +61,7 @@ def test_mlx_AdvancedSubtensor():
 
     # Advanced indexing with array indices
     out_pt = pt_subtensor.advanced_subtensor1(x_pt, [1, 2])
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedSubtensor1)
+    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedSubtensor)
     compare_mlx_and_py([x_pt], [out_pt], [x_np])
 
     # Multi-dimensional advanced indexing
@@ -74,6 +75,10 @@ def test_mlx_AdvancedSubtensor():
     compare_mlx_and_py([x_pt], [out_pt], [x_np])
 
     out_pt = x_pt[[1, 2], :, [3, 4]]
+    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedSubtensor)
+    compare_mlx_and_py([x_pt], [out_pt], [x_np])
+
+    out_pt = x_pt[1:3, [2, 3]]
     assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedSubtensor)
     compare_mlx_and_py([x_pt], [out_pt], [x_np])
 
@@ -168,7 +173,7 @@ def test_mlx_AdvancedIncSubtensor1_operations():
 
     # Create AdvancedIncSubtensor1 manually for set operation
     out_pt = pt_subtensor.advanced_set_subtensor1(x_pt, st_pt, indices)
-    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedIncSubtensor1)
+    assert isinstance(out_pt.owner.op, pt_subtensor.AdvancedIncSubtensor)
     assert out_pt.owner.op.set_instead_of_inc
     compare_mlx_and_py([], [out_pt], [])
 
@@ -241,7 +246,7 @@ def test_mlx_AdvancedIncSubtensor1_runtime_broadcast(func):
     x = pt.zeros((10, 5))
     idxs = np.repeat(np.arange(10), 2)  # 20 indices
     out = func(x, y, idxs)
-    assert isinstance(out.owner.op, pt_subtensor.AdvancedIncSubtensor1)
+    assert isinstance(out.owner.op, pt_subtensor.AdvancedIncSubtensor)
 
     f = function([y], out, mode=Mode(linker="mlx", optimizer=None))
     f(np.ones((20, 5), dtype=np.float32))  # correctly sized y works
@@ -265,18 +270,21 @@ def test_mlx_IncSubtensor_slice_grad():
         compare_mlx_and_py([x_pt], [g], [x_np])
 
 
-@pytest.mark.xfail(
-    reason="Upstream mx.compile bug (ml-explore/mlx#3716): assigning an "
-    "elementwise expression to a negative-strided slice returns wrong values "
-    "under mx.compile (correct when eager / use_compile=False).",
-    strict=True,
-)
 def test_mlx_IncSubtensor_negative_step_slice_grad():
+    # Correctness is asserted on the CPU stream only: assigning an elementwise
+    # expression to a negative-strided slice returns wrong values on the GPU
+    # stream under mx.compile (ml-explore/mlx#3716).
     x_pt = pt.vector("x", dtype="float32")
     x_np = np.arange(6, dtype=np.float32)
     g = pt.grad((x_pt[::-1] ** 2).sum(), x_pt)
     assert isinstance(g.owner.op, pt_subtensor.IncSubtensor)
-    compare_mlx_and_py([x_pt], [g], [x_np])
+
+    expected = pytensor.function([x_pt], g, mode=py_mode)(x_np)
+    mlx_fn = pytensor.function([x_pt], g, mode=mlx_mode)
+    with mx.stream(mx.cpu):
+        result = np.asarray(mlx_fn(x_np))
+
+    np.testing.assert_allclose(result, expected, rtol=1e-4)
 
 
 @pytest.mark.parametrize(
@@ -295,7 +303,7 @@ def test_mlx_AdvancedIncSubtensor1_duplicate_indices(func):
     y = pt.vector("y", dtype="float32")
     idxs = np.array([0, 0, 0, 1], dtype=np.int64)
     out = func(x, y, idxs)
-    assert isinstance(out.owner.op, pt_subtensor.AdvancedIncSubtensor1)
+    assert isinstance(out.owner.op, pt_subtensor.AdvancedIncSubtensor)
 
     x_np = np.zeros(3, dtype=np.float32)
     y_np = np.ones(4, dtype=np.float32)
@@ -308,7 +316,7 @@ def test_mlx_AdvancedIncSubtensor1_duplicate_indices_edge_cases():
     y = pt.scalar("y", dtype="int32")
     idxs = np.array([-1, -1, 0, -1], dtype=np.int64)
     out = pt_subtensor.advanced_inc_subtensor1(x, y, idxs)
-    assert isinstance(out.owner.op, pt_subtensor.AdvancedIncSubtensor1)
+    assert isinstance(out.owner.op, pt_subtensor.AdvancedIncSubtensor)
 
     compare_mlx_and_py([x, y], [out], [np.zeros(3, dtype=np.int32), np.int32(2)])
 
@@ -343,3 +351,29 @@ def test_mlx_AdvancedIncSubtensor_ignore_duplicates():
     assert out.owner.op.ignore_duplicates
 
     compare_mlx_and_py([x], [out], [np.zeros(3, dtype=np.float32)])
+
+
+@pytest.mark.parametrize(
+    "func",
+    (pt_subtensor.inc_subtensor, pt_subtensor.set_subtensor),
+    ids=("inc", "set"),
+)
+@pytest.mark.parametrize(
+    "index",
+    [
+        (slice(None), [0, 2]),
+        (Ellipsis, [0, 2], [0, 2]),
+        ([0, 2], slice(None)),
+        (slice(1, 4), [0, 2]),
+    ],
+    ids=("leading_slice", "leading_ellipsis", "trailing_slice", "bounded_slice"),
+)
+def test_mlx_AdvancedIncSubtensor_index_forms(func, index):
+    x = tensor("x", shape=(5, 3, 3), dtype="float32")
+    x_np = np.arange(45, dtype=np.float32).reshape(5, 3, 3)
+    y_np = -np.arange(x_np[index].size, dtype=np.float32).reshape(x_np[index].shape)
+    y = tensor("y", shape=y_np.shape, dtype="float32")
+    out = func(x[index], y)
+    assert isinstance(out.owner.op, pt_subtensor.AdvancedIncSubtensor)
+
+    compare_mlx_and_py([x, y], [out], [x_np, y_np])

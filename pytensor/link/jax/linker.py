@@ -21,8 +21,8 @@ class JAXLinker(JITLinker):
         # JAX does it his own inplace optimization
         "inplace",
         # There are specific variants for the LU decompositions supported by JAX
-        "reuse_lu_decomposition_multiple_solves",
-        "scan_split_non_sequence_lu_decomposition_solve",
+        "reuse_decomposition_multiple_solves",
+        "scan_split_non_sequence_decomposition_and_solve",
     )
 
     scalar_shape_inputs: tuple[int, ...]
@@ -135,7 +135,7 @@ class JAXLinker(JITLinker):
         for n in self.fgraph.inputs:
             sinput = storage_map[n]
             if isinstance(sinput[0], Generator):
-                # Neet to convert Generator into JAX PRNGkey
+                # Need to convert Generator into JAX PRNGkey
                 sinput[0] = jax_typify(sinput[0])
             thunk_inputs.append(sinput)
 

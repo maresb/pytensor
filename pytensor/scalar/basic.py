@@ -91,14 +91,6 @@ def upcast(dtype, *dtypes) -> str:
     return rval
 
 
-def as_common_dtype(*vars):
-    """
-    For for pytensor.scalar.ScalarType and TensorVariable.
-    """
-    dtype = upcast(*[v.dtype for v in vars])
-    return (v.astype(dtype) for v in vars)
-
-
 class NumpyAutocaster:
     """
     This class is used to cast python ints and floats to numpy arrays.
@@ -139,9 +131,7 @@ class NumpyAutocaster:
             isinstance(x, np.ndarray) and x.ndim == 0
         )
 
-        if config.cast_policy == "numpy":
-            return np.asarray(x)
-        elif config.cast_policy == "numpy+floatX":
+        if config.cast_policy == "numpy+floatX":
             rval = np.asarray(x)
             if (
                 not hasattr(x, "dtype")
@@ -208,10 +198,12 @@ class autocast_float_as:
 
     Examples
     --------
+    >>> from pytensor import config
     >>> from pytensor.tensor import fvector
-    >>> with autocast_float_as("float32"):
-    ...     assert (fvector() + 1.1).dtype == "float32"  # temporary downcasting
-    >>> assert (fvector() + 1.1).dtype == "float64"  # back to default behaviour
+    >>> with config.change_flags(cast_policy="custom"):
+    ...     with autocast_float_as("float32"):
+    ...         assert (fvector() + 1.1).dtype == "float32"  # temporary downcasting
+    ...     assert (fvector() + 1.1).dtype == "float64"  # default 'custom' behaviour
 
     """
 
@@ -1140,53 +1132,6 @@ def same_out_nocomplex(type):
     return (type,)
 
 
-def int_out_nocomplex(*types):
-    for type in types:
-        if type in complex_types:
-            raise TypeError("complex argument not supported")
-    return (int64,)
-
-
-def float_out_nocomplex(*types):
-    for type in types:
-        if type in complex_types:
-            raise TypeError("complex argument not supported")
-    return (float64,)
-
-
-class unary_out_lookup(MetaObject):
-    """
-    Get a output_types_preference object by passing a dictionary:
-
-    unary_out_lookup({int8:int32, float32:complex128})
-
-    The result is an op that maps in8 to int32 and float32 to
-    complex128 and other input types lead to a TypeError.
-
-    """
-
-    def __init__(self, type_table):
-        self.tbl = type_table
-
-    def __call__(self, *types):
-        if len(types) == 1:
-            types = types[0]
-        try:
-            rval = self.tbl[types]
-        except Exception:
-            raise TypeError(types)
-        if isinstance(types, list | tuple):
-            return rval
-        else:
-            return [rval]
-
-    def __eq__(self, other):
-        return type(self) is type(other) and self.tbl == other.tbl
-
-    def __hash__(self):
-        return hash(type(self))  # ignore hash of table
-
-
 def real_out(type):
     if type == complex64:
         return (float32,)
@@ -1352,6 +1297,11 @@ class UnaryScalarOp(ScalarOp):
     preserves_zero = False
     monotonic_increasing = False
     monotonic_decreasing = False
+
+    # Set only when the output is >= 0 for every real input, including the sign of zero
+    # (`sqrt` returns -0.0 for -0.0, so it does not qualify). Consumers must still check
+    # the dtype: signed integers wrap on overflow and complex values are unordered.
+    non_negative = False
 
     def c_code_contiguous(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -1829,9 +1779,9 @@ class Maximum(BinaryScalarOp):
                 x.zeros_like(dtype=config.floatX),
                 y.zeros_like(dtype=config.floatX),
             ]
-        # This form handle the case when both value are the same.
-        # In that case, gx will be gz, gy will be 0.
-        e = eq(outputs[0], x)
+        # maximum returns x when x >= y, ties included; testing eq(outputs[0], x)
+        # would need x recomputed bit-for-bit, which fastmath reassoc can break.
+        e = ge(x, y)
         gx = e * gz
         gy = (constant(1, dtype=gz.dtype) - e) * gz
         return (gx, gy)
@@ -1874,9 +1824,9 @@ class Minimum(BinaryScalarOp):
                 x.zeros_like(dtype=config.floatX),
                 y.zeros_like(dtype=config.floatX),
             ]
-        # This form handle the case when both value are the same.
-        # In that case, gx will be gz, gy will be 0.
-        e = eq(outputs[0], x)
+        # minimum returns x when x <= y, ties included; testing eq(outputs[0], x)
+        # would need x recomputed bit-for-bit, which fastmath reassoc can break.
+        e = le(x, y)
         gx = e * gz
         gy = (constant(1, dtype=gz.dtype) - e) * gz
         return (gx, gy)
@@ -2500,11 +2450,6 @@ class Cast(UnaryScalarOp):
     def __str__(self):
         return f"{self.__class__.__name__}{{{self.o_type.dtype}}}"
 
-    def clone_float32(self):
-        if self.o_type == float16:
-            return convert_to_float32
-        return self
-
     def impl(self, input):
         return self.ctor(input)
 
@@ -2585,6 +2530,7 @@ def cast(x, dtype):
 
 class Abs(UnaryScalarOp):
     preserves_zero = True
+    non_negative = True
     nfunc_spec = ("abs", 1, 1)
 
     def make_node(self, x):
@@ -2644,7 +2590,7 @@ class Sign(UnaryScalarOp):
     def _output_types_preference(x):
         if x == bool:
             raise TypeError(x)
-        return same_out_nocomplex(x)
+        return same_out(x)
 
     def impl(self, x):
         # casting to output type is handled by filter
@@ -2672,12 +2618,44 @@ class Sign(UnaryScalarOp):
             )
         if type in int_types:
             return f"{z} = ({x} >= 0) ? ({x} == 0) ? 0 : 1 : -1;"
-        raise ComplexError("complex has no sign")
+        if type in complex_types:
+            real_type = real_out(type)[0].dtype_specs()[1]
+            hypot = "hypotf" if type == complex64 else "hypot"
+            # Scoped so that fused Composites with several Signs don't redeclare locals
+            return f"""
+            {{
+                {real_type} real = get_real({x});
+                {real_type} imag = get_imag({x});
+                {real_type} magnitude = {hypot}(real, imag);
+                if (isnan(magnitude)) {{
+                    set_real(&{z}, NAN);
+                    set_imag(&{z}, NAN);
+                }} else if (isinf(magnitude)) {{
+                    if (isinf(real) && isinf(imag)) {{
+                        set_real(&{z}, NAN);
+                        set_imag(&{z}, NAN);
+                    }} else if (isinf(real)) {{
+                        set_real(&{z}, real > 0 ? 1. : -1.);
+                        set_imag(&{z}, 0.);
+                    }} else {{
+                        set_real(&{z}, 0.);
+                        set_imag(&{z}, imag > 0 ? 1. : -1.);
+                    }}
+                }} else if (magnitude == 0) {{
+                    set_real(&{z}, 0.);
+                    set_imag(&{z}, 0.);
+                }} else {{
+                    set_real(&{z}, real / magnitude);
+                    set_imag(&{z}, imag / magnitude);
+                }}
+            }}
+            """
+        raise NotImplementedError("type not supported", type)
 
     def c_code_cache_version(self):
         s = super().c_code_cache_version()
         if s:
-            return (4, *s)
+            return (5, *s)
         else:  # if parent is unversioned, we are too
             return s
 
@@ -3146,6 +3124,7 @@ log1p = Log1p(upgrade_to_float, name="log1p")
 
 class Exp(UnaryScalarOp):
     monotonic_increasing = True
+    non_negative = True
     nfunc_spec = ("exp", 1, 1)
     amd_float32 = "amd_vrsa_expf"
     amd_float64 = "amd_vrda_exp"
@@ -3185,6 +3164,7 @@ exp = Exp(upgrade_to_float, name="exp")
 
 class Exp2(UnaryScalarOp):
     monotonic_increasing = True
+    non_negative = True
     nfunc_spec = ("exp2", 1, 1)
 
     def impl(self, x):
@@ -3263,6 +3243,7 @@ expm1 = Expm1(upgrade_to_float, name="expm1")
 
 class Sqr(UnaryScalarOp):
     preserves_zero = True
+    non_negative = True
     nfunc_spec = ("square", 1, 1)
 
     def impl(self, x):
@@ -3327,82 +3308,6 @@ class Sqrt(UnaryScalarOp):
 
 
 sqrt = Sqrt(upgrade_to_float, name="sqrt")
-
-
-class Deg2Rad(UnaryScalarOp):
-    preserves_zero = True
-    monotonic_increasing = True
-
-    nfunc_spec = ("deg2rad", 1, 1)
-
-    def impl(self, x):
-        # If x is an int8 or uint8, numpy.deg2rad will compute the result in
-        # half-precision (float16), where we want float32.
-        x_dtype = str(getattr(x, "dtype", ""))
-        if x_dtype in ("int8", "uint8"):
-            return np.deg2rad(x, dtype=np.float32)
-        return np.deg2rad(x)
-
-    def pullback(self, inputs, outputs, gout):
-        (x,) = inputs
-        (gz,) = gout
-        if gz.type in complex_types:
-            raise NotImplementedError()
-        if outputs[0].type in discrete_types:
-            if x.type in discrete_types:
-                return [x.zeros_like(dtype=config.floatX)]
-            else:
-                return [x.zeros_like()]
-
-        return (gz * np.array(np.pi / 180, dtype=gz.dtype),)
-
-    def c_code(self, node, name, inputs, outputs, sub):
-        (x,) = inputs
-        (z,) = outputs
-        if node.inputs[0].type in complex_types:
-            raise NotImplementedError("type not supported", type)
-        return f"{z} = {x} * (M_PI / 180.0);"
-
-
-deg2rad = Deg2Rad(upgrade_to_float, name="deg2rad")
-
-
-class Rad2Deg(UnaryScalarOp):
-    preserves_zero = True
-    monotonic_increasing = True
-
-    nfunc_spec = ("rad2deg", 1, 1)
-
-    def impl(self, x):
-        # If x is an int8 or uint8, numpy.rad2deg will compute the result in
-        # half-precision (float16), where we want float32.
-        x_dtype = str(getattr(x, "dtype", ""))
-        if x_dtype in ("int8", "uint8"):
-            return np.rad2deg(x, dtype=np.float32)
-        return np.rad2deg(x)
-
-    def pullback(self, inputs, outputs, gout):
-        (x,) = inputs
-        (gz,) = gout
-        if gz.type in complex_types:
-            raise NotImplementedError()
-        if outputs[0].type in discrete_types:
-            if x.type in discrete_types:
-                return [x.zeros_like(dtype=config.floatX)]
-            else:
-                return [x.zeros_like()]
-
-        return (gz * np.array(180.0 / np.pi, dtype=gz.dtype),)
-
-    def c_code(self, node, name, inputs, outputs, sub):
-        (x,) = inputs
-        (z,) = outputs
-        if node.inputs[0].type in complex_types:
-            raise NotImplementedError("type not supported", type)
-        return f"{z} = {x} * (180.0 / M_PI);"
-
-
-rad2deg = Rad2Deg(upgrade_to_float, name="rad2deg")
 
 
 class Cos(UnaryScalarOp):
@@ -3684,6 +3589,8 @@ class Cosh(UnaryScalarOp):
 
     """
 
+    non_negative = True
+
     nfunc_spec = ("cosh", 1, 1)
 
     def impl(self, x):
@@ -3932,9 +3839,14 @@ class Real(UnaryScalarOp):
         return np.real(x)
 
     def pullback(self, inputs, outputs, gout):
-        (_x,) = inputs
+        (x,) = inputs
         (gz,) = gout
-        return [complex(gz, 0)]
+        if x.type in complex_types:
+            return [complex(gz, 0)]
+        elif x.type in float_types:
+            return [gz]
+        else:
+            return [x.zeros_like(dtype=config.floatX)]
 
     def c_code(self, *args, **kwargs):
         raise NotImplementedError()
@@ -3965,46 +3877,6 @@ class Imag(UnaryScalarOp):
 
 
 imag = Imag(real_out, name="imag")
-
-
-class Angle(UnaryScalarOp):
-    nfunc_spec = ("angle", 1, 1)
-
-    def impl(self, x):
-        return np.angle(x)
-
-    def pullback(self, inputs, outputs, gout):
-        # y = x.imag
-        # r = sqrt(y**2 + x.real**2)
-        # g = y/r
-        # if x == 0 and y == 0:
-        #     theta = 0
-        # elif x >= 0:
-        #     theta = numpy.arcsin(g)
-        # else:
-        #     theta = -numpy.arcsin(g)+numpy.pi
-
-        (c,) = inputs
-        (gtheta,) = gout
-        x = real(c)
-        y = imag(c)
-        r = _abs(c)
-
-        gr = -gtheta * y / (r**2 * sqrt(1 - (y / r) ** 2))
-        gx = gr * x / r
-        gy = gr * y / r
-        if c in complex_types:
-            return [cast(complex(gx, gy), x.type.dtype)]
-        elif c in float_types:
-            return [cast(second(x, 0), x.type.dtype)]
-        else:
-            return [c.zeros_like(dtype=config.floatX)]
-
-    def c_code(self, *args, **kwargs):
-        raise NotImplementedError()
-
-
-angle = Angle(specific_out(float64), name="angle")
 
 
 class Complex(BinaryScalarOp):
@@ -4055,35 +3927,6 @@ class Conj(UnaryScalarOp):
 conj = Conj(same_out_min8, name="conj")
 
 
-class ComplexFromPolar(BinaryScalarOp):
-    @staticmethod
-    def output_types_preference(x, y):
-        return Complex.output_types_preference(x, y)
-
-    def impl(self, r, theta):
-        if r < 0:
-            raise ValueError("polar radius must be non-negative", r)
-        x = r * np.cos(theta)
-        y = r * np.sin(theta)
-        if x.dtype == "float32":
-            return np.complex64(builtins.complex(x, y))
-        else:
-            return np.complex128(builtins.complex(x, y))
-
-    def pullback(self, inputs, outputs, gout):
-        (r, theta) = inputs
-        (gz,) = gout
-        gr = gz * complex_from_polar(1, theta)
-        gtheta = gz * complex_from_polar(r, -theta)
-        return [gr, gtheta]
-
-    def c_code(self, *args, **kwargs):
-        raise NotImplementedError()
-
-
-complex_from_polar = ComplexFromPolar(name="complex_from_polar")
-
-
 class ScalarInnerGraphOp(ScalarOp, HasInnerGraph):
     """Includes boilerplate code for Python and C-implementation of Scalar Ops with inner graph."""
 
@@ -4101,18 +3944,6 @@ class ScalarInnerGraphOp(ScalarOp, HasInnerGraph):
                     f"The fgraph of {self.__class__.__name__} must be exclusively "
                     "composed of scalar operations."
                 )
-
-    @property
-    def fn(self):
-        return None
-
-    @property
-    def inner_inputs(self):
-        return self.fgraph.inputs
-
-    @property
-    def inner_outputs(self):
-        return self.fgraph.outputs
 
     @property
     def py_perform_fn(self):
@@ -4273,24 +4104,37 @@ class Composite(ScalarInnerGraphOp):
         return self.outputs_type
 
     def make_node(self, *inputs):
-        if self.inputs_type == tuple(i.type for i in inputs):
+        inputs = [
+            inp if isinstance(inp, ScalarVariable) else as_scalar(inp) for inp in inputs
+        ]
+
+        if self.inputs_type == tuple(inp.type for inp in inputs):
             return super().make_node(*inputs)
+
+        if len(inputs) != self.nin:
+            raise ValueError("Number of inputs does not match expected")
+
+        # First try to coerce each input to its inner-graph input type.
+        try:
+            filtered_inputs = [
+                inner_inp.type.filter_variable(inp)
+                for inp, inner_inp in zip(inputs, self.inputs)
+            ]
+        except TypeError:
+            pass
         else:
-            # Make a new op whose inner graph is rebuilt on fresh inputs of the
-            # new types. The retype needs ``rebuild_strict=False`` (re-infers
-            # each node's output types), which in-place ``FunctionGraph``
-            # replacements cannot do, so thaw first and rebuild the mutable copy.
-            assert len(inputs) == self.nin
-            unfrozen_fgraph = self.fgraph.unfreeze()
-            new_inner_inputs = [i.type() for i in inputs]
-            new_outputs = clone_replace(
-                unfrozen_fgraph.outputs,
-                replace=dict(
-                    zip(unfrozen_fgraph.inputs, new_inner_inputs, strict=True)
-                ),
-                rebuild_strict=False,
-            )
-            return Composite(new_inner_inputs, new_outputs).make_node(*inputs)
+            return super().make_node(*filtered_inputs)
+
+        # The new input types are incompatible with the inner graph.
+        # Try to make a new inner graph with rebuild_strict=False.
+        unfrozen_fgraph = self.fgraph.unfreeze()
+        new_inner_inputs = [i.type() for i in inputs]
+        new_outputs = clone_replace(
+            unfrozen_fgraph.outputs,
+            replace=dict(zip(unfrozen_fgraph.inputs, new_inner_inputs)),
+            rebuild_strict=False,
+        )
+        return Composite(new_inner_inputs, new_outputs).make_node(*inputs)
 
     def perform(self, node, inputs, output_storage):
         outputs = self.py_perform_fn(*inputs)

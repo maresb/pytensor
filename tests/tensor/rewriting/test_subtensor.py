@@ -13,19 +13,20 @@ from pytensor.configdefaults import config
 from pytensor.graph import FunctionGraph, rewrite_graph, vectorize_graph
 from pytensor.graph.basic import Constant, Variable, equal_computations
 from pytensor.graph.rewriting.basic import check_stack_trace, in2out, out2in
-from pytensor.graph.traversal import ancestors
-from pytensor.tensor import as_tensor
 from pytensor.tensor.basic import Alloc, ExtractDiag, _convert_to_int8
 from pytensor.tensor.blockwise import Blockwise
 from pytensor.tensor.elemwise import Elemwise
 from pytensor.tensor.math import Dot, dot, exp, sqr
+from pytensor.tensor.rewriting.fused_elemwise import FusedElemwise
 from pytensor.tensor.rewriting.subtensor import (
+    _index_provably_unique,
     _slice_to_arange,
     local_add_of_sparse_write,
     local_adv_idx_to_slice,
     local_blockwise_inc_subtensor,
-    local_replace_AdvancedSubtensor,
+    local_read_of_write_same_indices,
     local_useless_slice,
+    local_write_of_write_same_indices,
 )
 from pytensor.tensor.shape import (
     SpecifyShape,
@@ -33,9 +34,7 @@ from pytensor.tensor.shape import (
 )
 from pytensor.tensor.subtensor import (
     AdvancedIncSubtensor,
-    AdvancedIncSubtensor1,
     AdvancedSubtensor,
-    AdvancedSubtensor1,
     IncSubtensor,
     Subtensor,
     advanced_inc_subtensor1,
@@ -49,6 +48,7 @@ from pytensor.tensor.type import (
     fmatrix,
     iscalar,
     ivector,
+    lvector,
     matrix,
     scalar,
     tensor,
@@ -63,68 +63,6 @@ mode_opt = config.mode
 if mode_opt == "FAST_COMPILE":
     mode_opt = "FAST_RUN"
 mode_opt = get_mode(mode_opt)
-
-
-@pytest.mark.parametrize(
-    ("indexer", "is_none"),
-    [
-        (lambda X, y, z: X[:, y, y], True),
-        (lambda X, y, z: X[y, y, :], True),
-        (lambda X, y, z: X[y], False),
-        (lambda X, y, z: X[:, y], False),
-        (lambda X, y, z: X[y, :], False),
-        (lambda X, y, z: X[:, y, :], False),
-        (lambda X, y, z: X[:, z, :], False),
-        (lambda X, y, z: X[:, z], False),
-        (lambda X, y, z: X[z, :], False),
-        (lambda X, y, z: X[:, z, :], False),
-    ],
-)
-def test_local_replace_AdvancedSubtensor(indexer, is_none):
-    rng = np.random.default_rng()
-    y_val = rng.integers(0, 4, size=(2,))
-    z_val = rng.integers(0, 4, size=(2, 2))
-    y = as_tensor(y_val).type()
-    z = as_tensor(z_val).type()
-
-    X_val = np.random.normal(size=(4, 4, 4))
-    X = tensor(dtype=np.float64, shape=(None, None, None), name="X")
-
-    Y = indexer(X, y, z)
-
-    res_pt = local_replace_AdvancedSubtensor.transform(None, Y.owner)
-
-    if is_none:
-        assert res_pt is None
-    else:
-        (res_pt,) = res_pt
-
-        assert not any(
-            isinstance(v.owner.op, AdvancedSubtensor)
-            for v in ancestors([res_pt])
-            if v.owner
-        )
-
-        inputs = [X, y, z]
-
-        res_fn = function(
-            inputs, res_pt, mode=Mode("py", None, None), on_unused_input="ignore"
-        )
-        exp_res_fn = function(
-            inputs, Y, mode=Mode("py", None, None), on_unused_input="ignore"
-        )
-
-        # Make sure that the expected result graph has an `AdvancedSubtensor`
-        assert any(
-            isinstance(v.owner.op, AdvancedSubtensor)
-            for v in exp_res_fn.maker.fgraph.variables
-            if v.owner
-        )
-
-        res_val = res_fn(X_val, y_val, z_val)
-        exp_res_val = exp_res_fn(X_val, y_val, z_val)
-
-        assert np.array_equal(res_val, exp_res_val)
 
 
 @pytest.mark.parametrize("s", [slice(None), slice(None, None, -1)])
@@ -283,10 +221,30 @@ def test_local_add_of_sparse_write():
         [rewritten_basic], [x[s].inc(v[0])], strict_dtype=False
     )
 
+    # set-into-zeros with jointly-unique advanced indices (neither axis unique on
+    # its own) is rewritten via the joint-uniqueness check on the set path.
+    X = matrix("X")
+    rows = pt.constant(np.array([0, 1, 1], dtype="int32"))
+    cols = pt.constant(np.array([0, 0, 1], dtype="int32"))
+    out_joint = X + pt.zeros(X.shape)[rows, cols].set(v)
+    rewritten_joint = rewrite_graph(
+        out_joint, include=[], custom_rewrite=sparse_rewriter
+    )
+    utt.assert_equal_computations([rewritten_joint], [X[rows, cols].inc(v)])
+
+    # set-into-zeros with a jointly-duplicated advanced index is left alone (the
+    # (1, 1) coordinate repeats), since a dense set there is last-wins.
+    dup_rows = pt.constant(np.array([0, 1, 1], dtype="int32"))
+    dup_cols = pt.constant(np.array([0, 1, 1], dtype="int32"))
+    out_joint_dup = X + pt.zeros(X.shape)[dup_rows, dup_cols].set(v)
+    rewritten_joint_dup = rewrite_graph(
+        out_joint_dup, include=[], custom_rewrite=sparse_rewriter
+    )
+    utt.assert_equal_computations([rewritten_joint_dup], [out_joint_dup])
+
     # A bounded slice flattens its (symbolic) bounds into the index variables;
     # those must not be mistaken for advanced indices. With a leading slice and a
     # unique advanced index the sparse write still collapses.
-    X = matrix("X")
     w = matrix("w")
     u = pt.constant(np.array([0, 2], dtype="int32"))
     lo, hi = iscalar("lo"), iscalar("hi")
@@ -299,12 +257,162 @@ def test_local_add_of_sparse_write():
     )
 
 
+def test_local_add_of_sparse_write_broadcast():
+    """A broadcast ``x`` is alloc'd up to the base it replaces; a broadcast write,
+    in any of its spellings, is left alone.
+    """
+    sparse_rewriter = in2out(local_add_of_sparse_write, name="add_of_sparse_write")
+
+    def rewrite(inputs, out):
+        return utt.RewriteTester(
+            inputs, [out], include=[], custom_rewrite=sparse_rewriter
+        )
+
+    # ``x`` is the broadcast side: it must be alloc'd before it can be written into.
+    y = vector("y", shape=(1,))
+    v = vector("v", shape=(3,))
+    idx3 = np.array([0, 2, 4])
+    zeros = pt.zeros((7,))
+    result = rewrite([y, v], y + zeros[idx3].inc(v))
+    result.assert_graph(pt.alloc(y, 7)[idx3].inc(v))
+    result.assert_eval(
+        np.array([10.0], dtype=config.floatX),
+        np.array([1.0, 2.0, 3.0], dtype=config.floatX),
+    )
+
+    # The write is the broadcast side, whether the add gives it a new dim or
+    # stretches a size-1 one it already has.
+    idx = np.array([0, 2])
+    m = matrix("m", shape=(3, 4))
+    w = vector("w", shape=(2,))
+    ws = matrix("ws", shape=(2, 1))
+    for inputs, write in (
+        ([m, w], pt.zeros((4,))[idx].set(w)),
+        ([m, ws], pt.zeros((3, 1))[idx].set(ws)),
+        ([m, w], pt.zeros((3, 1))[idx, 0].set(w)),
+    ):
+        out = m + write
+        rewrite(inputs, out).assert_graph(out)
+
+
+def test_local_add_of_sparse_write_dtype():
+    """Neither the write's cast of ``v`` to the base dtype nor the add's own output
+    dtype may be dropped when the write collapses into ``x``.
+    """
+    sparse_rewriter = in2out(local_add_of_sparse_write, name="add_of_sparse_write")
+
+    def rewrite(inputs, out):
+        return utt.RewriteTester(
+            inputs, [out], include=[], custom_rewrite=sparse_rewriter
+        )
+
+    idx = np.array([0, 2, 4])
+    v = vector("v", dtype="float64", shape=(3,))
+
+    # A base narrower than the add truncates ``v`` before the add ever sees it.
+    x = vector("x", dtype="float64", shape=(7,))
+    result = rewrite([x, v], x + pt.zeros((7,), dtype="int64")[idx].set(v))
+    result.assert_graph(x[idx].inc(v.astype("int64")))
+    result.assert_eval(np.zeros(7), np.array([1.7, 2.3, 3.9]))
+
+    # An ``x`` narrower than the add is cast up, so the write can land in it.
+    xi = vector("xi", dtype="int32", shape=(7,))
+    result = rewrite([xi, v], xi + pt.zeros((7,), dtype="float64")[idx].set(v))
+    result.assert_graph(xi.astype("float64")[idx].inc(v))
+    result.assert_eval(np.arange(7, dtype="int32"), np.array([1.5, 2.5, 3.5]))
+
+
+class TestIndexProvablyUniqueArange:
+    """An ``arange`` index is duplicate-free when its entries don't wrap around
+    zero, i.e. they all share a sign. ``_index_provably_unique`` proves this for
+    non-negative ascending ranges (symbolic-friendly) and, with constant bounds,
+    for any single-signed range regardless of step direction."""
+
+    def test_arange(self):
+        k = iscalar("k")
+        n = vector("v").shape[0]
+
+        def unique(arange):
+            return _index_provably_unique(arange, None)
+
+        # Non-negative, symbolic-friendly (proved without constant bounds).
+        assert unique(pt.arange(k)) is True
+        assert unique(pt.arange(n)) is True  # n = shape, provably >= 0
+        assert unique(pt.arange(2, k)) is True
+        assert unique(pt.arange(n, 0, -1)) is True  # reverse range, both bounds >= 0
+
+        # Descending into a non-negative stop: entries > stop >= 0, any start.
+        assert unique(pt.arange(k, 0, -1)) is True
+        assert unique(pt.arange(k, 5, -1)) is True
+
+        # Descending from a negative start: entries <= start < 0, any stop.
+        assert unique(pt.arange(-1, k, -1)) is True
+
+        # Constant single-signed ranges, either step direction.
+        assert unique(pt.arange(2, 6)) is True
+        assert unique(pt.arange(-6, -2)) is True  # all negative
+        assert unique(pt.arange(5, -1, -1)) is True  # descending, [5..0]
+        assert (
+            unique(pt.arange(6, -2, -2)) is True
+        )  # descending, [6,4,2,0], overshoots stop
+        assert (
+            unique(pt.arange(-5, 1, 3)) is True
+        )  # ascending, [-5,-2], overshoots stop
+        assert unique(pt.arange(-1, -6, -1)) is True  # descending, all negative
+
+        # Straddling zero -> may wrap -> not provably unique.
+        assert unique(pt.arange(-2, 2)) is False
+        assert unique(pt.arange(0, -5, -1)) is False  # 0 with negatives
+
+    def test_shifted_arange(self):
+        """A constant shift slides the whole range, so folding it into the bounds
+        decides uniqueness -- a shift can rescue a straddling range or ruin a
+        single-signed one."""
+        k = iscalar("k")
+
+        def unique(arange):
+            return _index_provably_unique(arange, None)
+
+        # Shifted clear of zero: unique even though the unshifted range is not.
+        assert unique(pt.arange(-5, 5) + 5) is True
+        assert unique(pt.arange(-5, 5) + 6) is True
+        assert unique(pt.arange(5) - 10) is True  # shifted to all-negative
+
+        # Still straddling after the shift.
+        assert unique(pt.arange(-5, 5) + 1) is False
+        assert unique(pt.arange(5) - 2) is False
+
+        # Symbolic stop: a non-negative start and positive step still suffice.
+        assert unique(pt.arange(k) + 2) is True
+        assert unique(2 + pt.arange(k)) is True
+        assert unique(pt.arange(k) - 2) is False  # start -2, may straddle
+
+        # Descending and negative ranges shift the same way: the entry count depends
+        # only on ``stop - start`` and the step, both of which a shift preserves.
+        assert unique(pt.arange(10, 0, -1) + 5) is True  # [15..6]
+        assert unique(pt.arange(10, 0, -1) - 5) is False  # [5..-4] straddles
+        assert unique(pt.arange(-1, -9, -2) - 1) is True  # [-2,-4,-6,-8]
+        assert unique(pt.arange(-1, -9, -2) + 1) is False  # [0,-2,-4,-6] straddles
+
+        # The shifted bound can outgrow the dtype the original bounds were stored in
+        # (``arange(5)`` carries int8 bounds).
+        assert unique(pt.arange(5) + 200) is True
+        assert unique(pt.arange(5) - 200) is True
+
+        # A symbolic shift leaves the range's position unknown.
+        assert unique(pt.arange(k) + lvector("i")) is False
+        assert unique(pt.arange(k) + pt.arange(k)) is False
+
+        # Sign not statically known.
+        assert unique(pt.arange(5, k, -1)) is False  # unknown stop sign
+        assert unique(pt.arange(k, 5)) is False  # unknown start sign
+        assert unique(pt.arange(k, -5, -1)) is False  # unknown start, neg stop
+
+
 class TestLocalUselessSubtensor:
     x = matrix("x")
     s = ps.int32("s")
-    mode = mode_opt.including(
-        "local_useless_subtensor", "local_useless_AdvancedSubtensor1"
-    )
+    mode = mode_opt.including("local_useless_subtensor", "local_adv_idx_to_slice")
 
     @pytest.mark.parametrize(
         "idx",
@@ -506,12 +614,10 @@ class TestLocalUselessSubtensor:
             assert len(prog) == 2
         else:
             # Arange-with-offset indices get rewritten to a Subtensor slice;
-            # other advanced indices stay as AdvancedSubtensor1 (or get
-            # absorbed into IndexedElemwise by FuseIndexedElemwise).
-            from pytensor.tensor.rewriting.indexed_elemwise import IndexedElemwise
-
+            # other advanced indices stay as AdvancedSubtensor (or get
+            # absorbed into FusedElemwise by FuseElemwise).
             assert any(
-                isinstance(node.op, AdvancedSubtensor1 | Subtensor | IndexedElemwise)
+                isinstance(node.op, AdvancedSubtensor | Subtensor | FusedElemwise)
                 for node in prog
             )
 
@@ -547,13 +653,7 @@ def test_local_subtensor_remove_broadcastable_index():
     f = function([x], [z1, z2, z3, z4, z5, z6, z7, z8], mode=mode)
     for elem in f.maker.fgraph.toposort():
         assert not isinstance(
-            elem.op,
-            Subtensor
-            | AdvancedSubtensor
-            | AdvancedSubtensor1
-            | IncSubtensor
-            | AdvancedIncSubtensor
-            | AdvancedIncSubtensor1,
+            elem.op, Subtensor | AdvancedSubtensor | IncSubtensor | AdvancedIncSubtensor
         )
     rng = np.random.default_rng(seed=utt.fetch_seed())
     xn = rng.random((5, 5))
@@ -616,15 +716,13 @@ class TestSubtensorIncSubtensor:
         cls.rng = np.random.default_rng(utt.fetch_seed())
         cls.mode = get_default_mode().including(
             "local_read_of_write_same_indices",
-            "local_AdvancedIncSubtensor_to_AdvancedIncSubtensor1",
-            "local_replace_AdvancedSubtensor",
         )
 
     @pytest.mark.parametrize(
         "val, indices, optype",
         [
             (vector(), (iscalar(),), IncSubtensor),
-            (vector(), (ivector(),), AdvancedIncSubtensor1),
+            (vector(), (ivector(),), AdvancedIncSubtensor),
             (vector(), (ivector(), ivector()), AdvancedIncSubtensor),
         ],
     )
@@ -639,6 +737,31 @@ class TestSubtensorIncSubtensor:
         )
         assert isinstance(f.maker.fgraph.outputs[0].owner.op, optype)
         assert f.maker.fgraph.outputs[0].owner.op.inplace is True
+
+    def test_inplace_shared_zeros_alloc(self):
+        # When multiple IncSubtensor clients share the same Alloc of zeros,
+        # the Alloc is duplicated so that every client can operate inplace
+        idx = np.array([0, 1, 2, 0, 1, 2])
+        y1 = vector("y1", shape=(6,))
+        y2 = vector("y2", shape=(6,))
+        x = pt.zeros(3)
+        f = function(
+            [y1, y2],
+            [x[idx].inc(y1), x[idx].inc(y2)],
+            mode=self.mode.including("inplace"),
+        )
+        inc_ops = [
+            node.op
+            for node in f.maker.fgraph.apply_nodes
+            if isinstance(node.op, AdvancedIncSubtensor)
+        ]
+        assert len(inc_ops) == 2
+        assert all(op.inplace for op in inc_ops)
+        y1v = np.arange(6).astype(y1.type.dtype)
+        y2v = 10 * y1v
+        res1, res2 = f(y1v, y2v)
+        np.testing.assert_allclose(res1, np.bincount(idx, y1v))
+        np.testing.assert_allclose(res2, np.bincount(idx, y2v))
 
     def test_basic(self):
         # basic test
@@ -1320,8 +1443,6 @@ class TestReadOfWriteSameIndices:
     def setup_method(self):
         mode = get_default_mode()
         self.mode = mode.including(
-            "local_replace_AdvancedSubtensor",
-            "local_AdvancedIncSubtensor_to_AdvancedIncSubtensor1",
             "local_read_of_write_same_indices",
         ).excluding("fusion", "fuse_indexed_into_elemwise")
 
@@ -1351,9 +1472,36 @@ class TestReadOfWriteSameIndices:
         res = f(dx, dy, didx)
         np.testing.assert_allclose(dy, res)
         topo = f.maker.fgraph.toposort()
-        assert not any(
-            isinstance(n.op, AdvancedIncSubtensor | AdvancedIncSubtensor1) for n in topo
+        assert not any(isinstance(n.op, AdvancedIncSubtensor) for n in topo)
+
+    def test_set_read_same_slice_broadcasts_value(self):
+        x = tensor3("x")
+        v = matrix("v")
+        start = ps.int64("start")
+        result = utt.RewriteTester(
+            [x, v, start],
+            [x[:, start:, :].set(v)[:, start:, :]],
+            include=None,
+            custom_rewrite=in2out(
+                local_read_of_write_same_indices, ignore_newtrees=True
+            ),
         )
+        result.assert_graph(pt.alloc(v, *x[:, start:, :].shape))
+
+    def test_inc_narrower_buffer(self):
+        """``x[slice] += v`` sums in the promoted dtype and rounds on store, so a
+        buffer narrower than ``v`` must keep that rounding as an explicit cast.
+        """
+        x = vector("x", dtype="float32")
+        v = vector("v", dtype="float64")
+        stop = iscalar("stop")
+
+        out = x[:stop].inc(v)[:stop]
+        result = utt.RewriteTester(
+            [x, v, stop], [out], include=("canonicalize", "specialize")
+        )
+        result.assert_graph((x[:stop] + v).astype("float32"))
+        result.assert_eval(np.arange(7, dtype="float32"), np.array([1.7, 2.3, 3.9]), 3)
 
     def test_inc_unique_constant_idx(self):
         x = matrix(dtype="float64")
@@ -1371,10 +1519,81 @@ class TestReadOfWriteSameIndices:
         np.add.at(expected, [0, 2, 3], dy)
         np.testing.assert_allclose(expected[[0, 2, 3]], f(dx, dy))
         topo = f.maker.fgraph.toposort()
-        assert not any(
-            isinstance(n.op, AdvancedIncSubtensor | AdvancedIncSubtensor1) for n in topo
+        assert not any(isinstance(n.op, AdvancedIncSubtensor) for n in topo)
+        assert check_stack_trace(f, ops_to_check=(AdvancedSubtensor, Elemwise))
+
+    def test_inc_jointly_unique_constant_idx(self):
+        """Multiple advanced indices that are jointly (not per-axis) duplicate-free
+        are recognized via the joint check, so inc read-of-write simplifies even
+        though neither ``rows`` nor ``cols`` is unique on its own."""
+        x = matrix(dtype="float64")
+        y = vector(dtype="float64")
+        rows = pt.constant(np.array([0, 1, 1], dtype="int32"))
+        cols = pt.constant(np.array([0, 0, 1], dtype="int32"))
+
+        o = inc_subtensor(x[rows, cols], y)[rows, cols]
+        result = utt.RewriteTester(
+            [x, y], [o], include=[], custom_rewrite=local_read_of_write_same_indices
         )
-        assert check_stack_trace(f, ops_to_check=(AdvancedSubtensor1, Elemwise))
+        result.assert_graph(x[rows, cols] + y)
+
+    def test_inc_tril_indices_nonzero(self):
+        """``tril_indices`` coordinates come from a single ``Nonzero``, distinct by
+        construction, so the inc read-of-write simplifies even though the indices
+        are symbolic and neither axis is unique on its own."""
+        n = iscalar("n")
+        x = matrix(dtype="float64")
+        y = vector(dtype="float64")
+        rows, cols = pt.tril_indices(n)
+
+        o = inc_subtensor(x[rows, cols], y)[rows, cols]
+        result = utt.RewriteTester(
+            [x, y, n], [o], include=[], custom_rewrite=local_read_of_write_same_indices
+        )
+        result.assert_graph(x[rows, cols] + y)
+
+    def test_inc_symbolic_bool_mask(self):
+        """A boolean mask selects each position at most once, so it is duplicate-free
+        even when symbolic; the inc read-of-write simplifies to ``x[mask] + v``."""
+        x = vector(dtype="float64")
+        v = vector(dtype="float64")
+        mask = vector("mask", dtype="bool")
+
+        o = inc_subtensor(x[mask], v)[mask]
+        result = utt.RewriteTester(
+            [x, v, mask],
+            [o],
+            include=[],
+            custom_rewrite=local_read_of_write_same_indices,
+        )
+        result.assert_graph(x[mask] + v)
+
+    def test_inc_symbolic_arange(self):
+        """An ``arange`` is strictly monotonic, so its entries are distinct even
+        when symbolic; the inc read-of-write simplifies to ``x[idx] + v``. A
+        negative-start arange may wrap around (``arange(-2, k)`` aliases positions
+        on a small axis), so it is not duplicate-free and inc must not be
+        rewritten."""
+        k = iscalar("k")
+        x = vector(dtype="float64")
+        v = vector(dtype="float64")
+
+        idx = pt.arange(k)
+        o = inc_subtensor(x[idx], v)[idx]
+        result = utt.RewriteTester(
+            [x, v, k], [o], include=[], custom_rewrite=local_read_of_write_same_indices
+        )
+        result.assert_graph(x[idx] + v)
+
+        mixed = pt.arange(-2, k)
+        o_mixed = inc_subtensor(x[mixed], v)[mixed]
+        result_mixed = utt.RewriteTester(
+            [x, v, k],
+            [o_mixed],
+            include=[],
+            custom_rewrite=local_read_of_write_same_indices,
+        )
+        result_mixed.assert_graph(o_mixed)
 
     @pytest.mark.parametrize(
         "cidx_values, n_rows",
@@ -1402,9 +1621,7 @@ class TestReadOfWriteSameIndices:
         np.add.at(expected, cidx_values, dy)
         np.testing.assert_allclose(expected[cidx_values], f(dx, dy))
         topo = f.maker.fgraph.toposort()
-        assert any(
-            isinstance(n.op, AdvancedIncSubtensor | AdvancedIncSubtensor1) for n in topo
-        )
+        assert any(isinstance(n.op, AdvancedIncSubtensor) for n in topo)
 
     def test_inc_symbolic_idx_not_rewritten(self):
         """Non-constant indices cannot be checked, so inc must not be rewritten."""
@@ -1424,9 +1641,7 @@ class TestReadOfWriteSameIndices:
         np.add.at(expected, didx, dy)
         np.testing.assert_allclose(expected[didx], f(dx, dy, didx))
         topo = f.maker.fgraph.toposort()
-        assert any(
-            isinstance(n.op, AdvancedIncSubtensor | AdvancedIncSubtensor1) for n in topo
-        )
+        assert any(isinstance(n.op, AdvancedIncSubtensor) for n in topo)
 
     def test_inc_asserted_unique_idx_rewritten(self):
         """A symbolic index asserted unique_indices is duplicate-free, so inc is rewritten."""
@@ -1445,7 +1660,6 @@ class TestReadOfWriteSameIndices:
                 "fusion",
                 "fuse_indexed_into_elemwise",
                 "inplace",
-                "local_replace_AdvancedSubtensor",
             ),
         )
         result.assert_graph(x[idx] + y)
@@ -1463,9 +1677,7 @@ class TestReadOfWriteSameIndices:
         f = function([x, y, idx], o, mode)
 
         topo = f.maker.fgraph.toposort()
-        assert any(
-            isinstance(n.op, AdvancedIncSubtensor1 | AdvancedIncSubtensor) for n in topo
-        )
+        assert any(isinstance(n.op, AdvancedIncSubtensor) for n in topo)
 
         dx = np.random.random((4, 5)).astype(config.floatX)
         dy = np.random.random((2, 5)).astype(config.floatX)
@@ -1520,7 +1732,6 @@ def test_slice_to_arange_roundtrip(sl):
 def test_slice_read_of_write():
     rw_kw = dict(
         include=("canonicalize", "specialize"),
-        exclude=("local_AdvancedIncSubtensor_to_AdvancedIncSubtensor1",),
     )
     buf = pt.vector("buf", shape=(5,))
 
@@ -1553,6 +1764,12 @@ def test_slice_read_of_write():
     rewritten = rewrite_graph(out, **rw_kw)
     utt.assert_equal_computations([rewritten], [out])
 
+    # This could simplify to buf2[:2, :2], but the delegated rewrite only
+    # supports 1D indices, not the Cartesian indices needed for both slices.
+    out = buf2[[2, 3], [2, 3]].set(1)[:2, :2]
+    rewritten = rewrite_graph(out, **rw_kw)
+    utt.assert_equal_computations([rewritten], [out])
+
 
 class TestReadOfWriteConstantIndices:
     def setup_method(self):
@@ -1564,8 +1781,6 @@ class TestReadOfWriteConstantIndices:
         # FAST_RUN ``local_slice_read_of_write`` would convert the basic
         # Subtensor back in specialize, but FAST_COMPILE skips that.
         self.mode = mode.including(
-            "local_replace_AdvancedSubtensor",
-            "local_AdvancedIncSubtensor_to_AdvancedIncSubtensor1",
             "local_advanced_read_of_write_constant_indices",
         ).excluding("fusion", "local_adv_idx_to_slice")
 
@@ -1581,9 +1796,7 @@ class TestReadOfWriteConstantIndices:
         f = function([x, v], out, self.mode)
 
         topo = f.maker.fgraph.toposort()
-        assert not any(
-            isinstance(n.op, AdvancedIncSubtensor | AdvancedIncSubtensor1) for n in topo
-        )
+        assert not any(isinstance(n.op, AdvancedIncSubtensor) for n in topo)
 
         dx = np.random.random((4, 5))
         dv = np.random.random((3,))
@@ -1614,10 +1827,7 @@ class TestReadOfWriteConstantIndices:
             out = op(x[:, ca, cb], v)[:, ca, cb]
             f = function([x, v], out, self.mode)
             topo = f.maker.fgraph.toposort()
-            assert not any(
-                isinstance(n.op, AdvancedIncSubtensor | AdvancedIncSubtensor1)
-                for n in topo
-            )
+            assert not any(isinstance(n.op, AdvancedIncSubtensor) for n in topo)
             np.testing.assert_allclose(f(dx, dv), expected_fn(dx, dv))
 
         # Non-consecutive: numpy hoists adv to axis 0 → result shape (2, 4)
@@ -1629,10 +1839,7 @@ class TestReadOfWriteConstantIndices:
             out = op(x[ca, :, cb], v)[ca, :, cb]
             f = function([x, v], out, self.mode)
             topo = f.maker.fgraph.toposort()
-            assert not any(
-                isinstance(n.op, AdvancedIncSubtensor | AdvancedIncSubtensor1)
-                for n in topo
-            )
+            assert not any(isinstance(n.op, AdvancedIncSubtensor) for n in topo)
             np.testing.assert_allclose(f(dx, dv2), expected_fn(dx, dv2))
 
     def test_partial_coverage_set(self):
@@ -1658,7 +1865,7 @@ class TestReadOfWriteConstantIndices:
         out_zeros = set_subtensor(pt.zeros((4, 4))[write_a, write_b], v)[read_a, read_b]
         f_zeros = function([v], out_zeros, self.mode)
         assert not any(
-            isinstance(n.op, AdvancedIncSubtensor)
+            isinstance(n.op, AdvancedIncSubtensor) and len(n.op.idx_list) > 1
             for n in f_zeros.maker.fgraph.toposort()
         )
         np.testing.assert_allclose(f_zeros(dv), [10.0, 0.0, 30.0])
@@ -1668,7 +1875,8 @@ class TestReadOfWriteConstantIndices:
         out_x = set_subtensor(x[write_a, write_b], v)[read_a, read_b]
         f_x = function([x, v], out_x, self.mode)
         assert not any(
-            isinstance(n.op, AdvancedIncSubtensor) for n in f_x.maker.fgraph.toposort()
+            isinstance(n.op, AdvancedIncSubtensor) and len(n.op.idx_list) > 1
+            for n in f_x.maker.fgraph.toposort()
         )
         np.random.seed(0)
         dx = np.random.random((4, 4))
@@ -1692,7 +1900,10 @@ class TestReadOfWriteConstantIndices:
         f = function([x, v], out, self.mode)
 
         topo = f.maker.fgraph.toposort()
-        assert not any(isinstance(n.op, AdvancedIncSubtensor) for n in topo)
+        assert not any(
+            isinstance(n.op, AdvancedIncSubtensor) and len(n.op.idx_list) > 1
+            for n in topo
+        )
 
         np.random.seed(0)
         dx = np.random.random((4, 4))
@@ -1721,8 +1932,7 @@ class TestReadOfWriteConstantIndices:
         out = set_subtensor(x[pt.constant(write_idx)], v)[pt.constant(read_idx)]
         f = function([x, v], out, self.mode)
         assert not any(
-            isinstance(n.op, AdvancedIncSubtensor | AdvancedIncSubtensor1)
-            for n in f.maker.fgraph.toposort()
+            isinstance(n.op, AdvancedIncSubtensor) for n in f.maker.fgraph.toposort()
         )
         dx = np.arange(5.0)
         dv = np.array([10.0, 20.0, 30.0])
@@ -1776,6 +1986,43 @@ class TestWriteOfWriteSameIndices:
         rewritten = rewrite_graph(out, include=("canonicalize", "specialize"))
         utt.assert_equal_computations([rewritten], [inc_subtensor(zeros[:stop], a + b)])
 
+    def test_inc_of_set_advanced_jointly_unique(self):
+        """Inc-of-set fires when advanced indices are jointly duplicate-free, even
+        though neither axis is unique on its own: ``tril_indices`` coordinates come
+        from a single ``Nonzero`` and collapse to ``x[idx].set(a + b)``. A leading
+        slice flattens its (symbolic) bounds into the index variables; those must
+        not be mistaken for advanced indices that block the joint check, so the
+        collapse still fires with a leading slice."""
+        n = iscalar("n")
+        rows, cols = pt.tril_indices(n)
+
+        x = matrix("x", dtype="float64")
+        a = vector("a", dtype="float64")
+        b = vector("b", dtype="float64")
+        out = inc_subtensor(set_subtensor(x[rows, cols], a)[rows, cols], b)
+        result = utt.RewriteTester(
+            [x, a, b, n],
+            [out],
+            include=[],
+            custom_rewrite=local_write_of_write_same_indices,
+        )
+        result.assert_graph(set_subtensor(x[rows, cols], a + b))
+
+        xs = tensor3("x", dtype="float64")
+        a2 = matrix("a", dtype="float64")
+        b2 = matrix("b", dtype="float64")
+        lo, hi = iscalar("lo"), iscalar("hi")
+        out_slice = inc_subtensor(
+            set_subtensor(xs[lo:hi, rows, cols], a2)[lo:hi, rows, cols], b2
+        )
+        result_slice = utt.RewriteTester(
+            [xs, a2, b2, lo, hi, n],
+            [out_slice],
+            include=[],
+            custom_rewrite=local_write_of_write_same_indices,
+        )
+        result_slice.assert_graph(set_subtensor(xs[lo:hi, rows, cols], a2 + b2))
+
     def test_inc_of_set_advanced_with_slice_rewritten(self):
         """A bounded slice flattens its (symbolic) bounds into the index
         variables; those must not be mistaken for advanced indices and block the
@@ -1806,14 +2053,7 @@ class TestWriteOfWriteSameIndices:
 
         topo = f.maker.fgraph.toposort()
         # Both writes must remain; rewrite can't prove uniqueness.
-        assert (
-            sum(
-                1
-                for n in topo
-                if isinstance(n.op, AdvancedIncSubtensor | AdvancedIncSubtensor1)
-            )
-            == 2
-        )
+        assert sum(1 for n in topo if isinstance(n.op, AdvancedIncSubtensor)) == 2
 
 
 class TestSubtensorAllocRewrites:
@@ -1936,7 +2176,7 @@ class TestSubtensorAllocRewrites:
         z = inc_subtensor(x[[0, 1, 2, 3]], y0)
         f = function([x, y], z, mode=self.mode)
         assert all(
-            not isinstance(n.op, AdvancedIncSubtensor1)
+            not isinstance(n.op, AdvancedIncSubtensor)
             for n in f.maker.fgraph.toposort()
         )
 
@@ -1947,7 +2187,7 @@ class TestSubtensorAllocRewrites:
         z = inc_subtensor(x[[0, 1, 2, 3]], y0.T)
         f = function([x, y], z, mode=mode_opt)
         assert all(
-            not isinstance(n.op, AdvancedIncSubtensor1)
+            not isinstance(n.op, AdvancedIncSubtensor)
             for n in f.maker.fgraph.toposort()
         )
 
@@ -1957,7 +2197,7 @@ class TestSubtensorAllocRewrites:
         z = inc_subtensor(x[[0, 1, 2, 3]], y0)
         f = function([x], z, mode=self.mode)
         assert all(
-            not isinstance(n.op, AdvancedIncSubtensor1)
+            not isinstance(n.op, AdvancedIncSubtensor)
             for n in f.maker.fgraph.toposort()
         )
 
@@ -2054,7 +2294,7 @@ def test_local_IncSubtensor_serialize():
             inp.owner
             and isinstance(
                 inp.owner.op,
-                IncSubtensor | AdvancedIncSubtensor | AdvancedIncSubtensor1,
+                IncSubtensor | AdvancedIncSubtensor,
             )
             for inp in a.inputs
         )
@@ -2067,7 +2307,6 @@ def test_local_IncSubtensor_serialize():
         ops_to_check=[
             IncSubtensor,
             AdvancedIncSubtensor,
-            AdvancedIncSubtensor1,
         ],
     )
 
@@ -2080,25 +2319,18 @@ def test_local_set_to_inc_subtensor():
     g = s + 3
     r = set_subtensor(s, g)
 
-    mode = (
-        get_default_mode()
-        .including(
-            "local_replace_AdvancedSubtensor",
-            "local_AdvancedIncSubtensor_to_AdvancedIncSubtensor1",
-        )
-        .excluding("fuse_indexed_into_elemwise")
-    )
+    mode = get_default_mode().excluding("fuse_indexed_into_elemwise")
     moder = mode.excluding("local_set_to_inc_subtensor")
     modet = mode.including("local_set_to_inc_subtensor")
     f1 = function([v], r, mode=moder)
     f2 = function([v], r, mode=modet)
 
     advi1 = [
-        n for n in f1.maker.fgraph.toposort() if isinstance(n.op, AdvancedIncSubtensor1)
+        n for n in f1.maker.fgraph.toposort() if isinstance(n.op, AdvancedIncSubtensor)
     ]
 
     advi2 = [
-        n for n in f2.maker.fgraph.toposort() if isinstance(n.op, AdvancedIncSubtensor1)
+        n for n in f2.maker.fgraph.toposort() if isinstance(n.op, AdvancedIncSubtensor)
     ]
 
     # We only have SetSubtensor in f1
@@ -2115,7 +2347,7 @@ def test_local_set_to_inc_subtensor():
 
     # Finally, test that the stack trace is copied over properly,
     # before and after optimization.
-    assert check_stack_trace(f1, ops_to_check=AdvancedIncSubtensor1)
+    assert check_stack_trace(f1, ops_to_check=AdvancedIncSubtensor)
     assert check_stack_trace(f2, ops_to_check="all")
 
 
@@ -2131,21 +2363,14 @@ def test_local_set_to_inc_subtensor_duplicate_indices():
 
     out = set_subtensor(v[idx], v[idx] + other)
 
-    mode = (
-        get_default_mode()
-        .including(
-            "local_replace_AdvancedSubtensor",
-            "local_AdvancedIncSubtensor_to_AdvancedIncSubtensor1",
-        )
-        .excluding("fuse_indexed_into_elemwise")
-    )
+    mode = get_default_mode().excluding("fuse_indexed_into_elemwise")
     f = function([v, other, idx], out, mode=mode)
 
     # The symbolic index is not provably unique, so the set survives.
     assert all(
         n.op.set_instead_of_inc
         for n in f.maker.fgraph.toposort()
-        if isinstance(n.op, AdvancedIncSubtensor1)
+        if isinstance(n.op, AdvancedIncSubtensor)
     )
 
     # Soundness pinned against a no-rewrite reference at a duplicated index.
@@ -2161,8 +2386,65 @@ def test_local_set_to_inc_subtensor_duplicate_indices():
     assert all(
         n.op.set_instead_of_inc
         for n in f_const.maker.fgraph.toposort()
-        if isinstance(n.op, AdvancedIncSubtensor1)
+        if isinstance(n.op, AdvancedIncSubtensor)
     )
+
+
+def test_local_set_to_inc_subtensor_indexed_axis():
+    """The collapsed inc must keep indexing the axis the set wrote to. ``idx_list``
+    is what pins an index to its axis, so a read of ``x[:, i]`` matching a write to
+    ``x[i]`` would transpose the update."""
+    x = matrix("x", shape=(3, 3))
+    other = matrix("other", shape=(3, 3))
+    i = pt.constant(np.array([2, 0, 1]))
+
+    result = utt.RewriteTester([x, other], [x[:, i].set(x[:, i] + other)])
+    result.assert_graph(x[:, i].inc(other))
+    result.assert_eval(np.zeros((3, 3)), np.arange(9.0).reshape(3, 3))
+
+
+@pytest.mark.parametrize(
+    "rows, cols, collapses",
+    [
+        # No axis is duplicate-free on its own, but the joint pairs (0,2), (1,2)
+        # are distinct, so accumulating is safe.
+        ([0, 1], [2, 2], True),
+        # The joint pairs (1,2), (1,2) repeat: an inc would double-count.
+        ([1, 1], [2, 2], False),
+    ],
+)
+def test_local_set_to_inc_subtensor_multiple_indices(rows, cols, collapses):
+    """With several advanced indices the written positions are the broadcast tuples
+    of the entries, so joint uniqueness governs the collapse. The indices also have
+    to survive it: rebuilding with only the first would write the wrong positions."""
+    x = matrix("x", shape=(3, 3))
+    other = vector("other", shape=(2,))
+    rows = pt.constant(np.array(rows))
+    cols = pt.constant(np.array(cols))
+
+    out = x[rows, cols].set(x[rows, cols] + other)
+    result = utt.RewriteTester([x, other], [out])
+    if collapses:
+        result.assert_graph(x[rows, cols].inc(other))
+    else:
+        result.assert_graph(out)
+    result.assert_eval(np.arange(9.0).reshape(3, 3), np.array([100.0, 200.0]))
+
+
+def test_local_adv_idx_to_slice_boolean_mask():
+    """A boolean mask is a single index on the leading axis just like an integer
+    vector, but selects where it is True rather than by position, so the arange
+    reasoning must not be applied to it."""
+    x = matrix("x", shape=(5, 2))
+    mask = np.zeros((5, 2), dtype=bool)
+    mask[2, 0] = True
+    mask[3, 1] = True
+
+    # `o3` rather than the default `canonicalize`: the rewrites that read a
+    # leading-axis index only run once the shape feature is in place.
+    result = utt.RewriteTester([x], [x[mask]], include="o3")
+    result.assert_graph(x[mask])
+    result.assert_eval(np.arange(10.0).reshape(5, 2))
 
 
 @pytest.mark.parametrize(
@@ -2348,7 +2630,7 @@ def test_local_uint_constant_indices():
     z_fn = pytensor.function([x], z, mode=mode)
 
     subtensor_node = z_fn.maker.fgraph.outputs[0].owner
-    assert isinstance(subtensor_node.op, AdvancedSubtensor1)
+    assert isinstance(subtensor_node.op, AdvancedSubtensor)
     new_index = subtensor_node.inputs[1]
     assert isinstance(new_index, Constant)
     assert new_index.type.dtype == "uint8"
@@ -2402,7 +2684,7 @@ def test_local_uint_constant_indices():
     z_fn = pytensor.function([x, y], z, mode=mode)
 
     subtensor_node = z_fn.maker.fgraph.outputs[0].owner
-    assert isinstance(subtensor_node.op, AdvancedIncSubtensor1)
+    assert isinstance(subtensor_node.op, AdvancedIncSubtensor)
     new_index = subtensor_node.inputs[2]
     assert isinstance(new_index, Constant)
     assert new_index.type.dtype == "uint8"
@@ -2415,7 +2697,7 @@ def test_local_uint_constant_indices():
     z_fn = pytensor.function([x], z, mode=mode)
 
     subtensor_node = z_fn.maker.fgraph.outputs[0].owner
-    assert isinstance(subtensor_node.op, (AdvancedSubtensor, AdvancedSubtensor1))
+    assert isinstance(subtensor_node.op, AdvancedSubtensor)
     new_index = subtensor_node.inputs[1]
     assert isinstance(new_index, Constant)
     assert new_index.type.dtype == "uint8"
@@ -2705,7 +2987,9 @@ class TestUselessSlice:
 
         y = x[0:3:step, -1:-6:-step, ::]
         # Need this rewrite when `FAST_COMPILE` otherwise step = -1 * step instead of neg(step)
-        mode = get_default_mode().including("local_mul_specialize")
+        mode = (
+            get_default_mode().including("local_mul_specialize").excluding("scalarize")
+        )
         f = pytensor.function([x, step], y, mode=mode)
 
         # Get the DeepCopy input and assert that the Op is a DeepCopy
@@ -2734,7 +3018,6 @@ class TestArangeRewrites:
 
     rewrite_kw = dict(
         include=("canonicalize", "specialize"),
-        exclude=("local_replace_AdvancedSubtensor",),
     )
 
     @pytest.mark.parametrize("offset", [0, 2])
@@ -2795,7 +3078,7 @@ class TestArangeRewrites:
 
         ar = pt.arange(n, dtype="int64")
         arange_form = x[ar + offset] if offset else x[ar]
-        assert isinstance(arange_form.owner.op, AdvancedSubtensor | AdvancedSubtensor1)
+        assert isinstance(arange_form.owner.op, AdvancedSubtensor)
 
         folded = rewrite_graph(
             arange_form,
@@ -2848,8 +3131,9 @@ def test_cholesky_unconstrain_grad(exp_before_materialize):
 
     packed = pt.vector("packed")
     if exp_before_materialize:
-        # We test the same optimized result regardless of whether
-        # the diagonals are updated before or after materialization
+        # Same ``L`` two ways: exponentiate the diagonal in the packed vector
+        # before scattering, or (else branch) scatter first and exponentiate the
+        # matrix diagonal. Equivalent, but optimize to different graphs under BlasOpt.
         packed_diag_indices = pt.arange(n + 1).cumsum()[1:] - 1
         log_diag = packed[packed_diag_indices]
         packed_update = packed[packed_diag_indices].set(pt.exp(log_diag))
@@ -2873,25 +3157,25 @@ def test_cholesky_unconstrain_grad(exp_before_materialize):
 
     mode = get_default_mode().excluding("fuse_indexed_into_elemwise")
     f = function([packed], [loss, grad], mode=mode)
-    f.dprint(print_shape=True)
 
     idx_types = (
         Subtensor,
-        AdvancedSubtensor1,
         AdvancedSubtensor,
         IncSubtensor,
-        AdvancedIncSubtensor1,
         AdvancedIncSubtensor,
         ExtractDiag,
     )
     n_idx = sum(1 for n in f.maker.fgraph.toposort() if isinstance(n.op, idx_types))
-    # The ``BlasOpt`` rewrites lower ``L @ L.T`` to ``Gemm``; the gradient then
-    # fuses the diagonal-gradient term into a ``Gemm`` operand, materializing one
-    # extra set-subtensor. A linker that cannot use them lists ``BlasOpt`` in
-    # ``incompatible_rewrites`` (e.g. the numba linker), keeping the plain ``Dot``
-    # lowering with that term as a vector. Both lowerings are correct.
+    # Post-materialization, the log-det gradient is a diagonal matrix added to
+    # ``L@L.T`` at the matrix level; BlasOpt's GemmOptimizer fuses ``add(dot, C)``
+    # into one Gemm, materializing that diagonal as one extra set-subtensor (7 ops).
+    # Pre-materialization keeps the term in the packed vector's index space, so
+    # there's no matrix-level add to fuse (6 ops). Without Gemm (BlasOpt in the
+    # linker's incompatible_rewrites, e.g. numba) the term never reaches the matrix
+    # and both collapse to 6. All lowerings are correct.
     blas_rewrites_run = "BlasOpt" not in f.maker.mode.linker.incompatible_rewrites
-    assert n_idx == (7 if blas_rewrites_run else 6)
+    expected_n_idx = 7 if (blas_rewrites_run and not exp_before_materialize) else 6
+    assert n_idx == expected_n_idx
 
     x = np.array([1.0, 0.5, 2.0, 0.3, 0.1, 1.5])
     # Expected values were computed once by running ``f(x)``.

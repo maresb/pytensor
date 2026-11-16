@@ -146,9 +146,45 @@ def test_multivariate_normal():
     )
 
 
+def test_mvnormal_float32():
+    """Regression test for Numba compilation failing with a float32 covariance."""
+    mean = np.array([0.2, -0.3], dtype="float32")
+    cov = np.array([[1.0, 0.4], [0.4, 0.8]], dtype="float32")
+    # Prevent the Numba rewrite from promoting the float32 parameters.
+    with pytensor.config.change_flags(floatX="float32", warn_float64="raise"):
+        _, draws = ptr.multivariate_normal(
+            mean,
+            cov,
+            size=(10_000,),
+            rng=shared(np.random.default_rng(123)),
+            return_next_rng=True,
+        )
+        fn = function([], draws, mode="NUMBA")
+
+    actual = fn()
+    assert actual.dtype == np.float32
+    np.testing.assert_allclose(actual.mean(axis=0), mean, atol=0.03)
+    np.testing.assert_allclose(np.cov(actual, rowvar=False), cov, atol=0.04)
+
+
 test_mvnormal_cov_decomposition_method = create_mvnormal_cov_decomposition_method_test(
     "NUMBA"
 )
+
+
+@pytest.mark.parametrize("method", ["cholesky", "svd", "eigh"])
+def test_multivariate_normal_non_finite_cov(method):
+    # A non-finite covariance gives a NaN draw instead of failing the whole batch
+    cov = pt.tensor3("cov")
+    x = pt.random.multivariate_normal(
+        np.zeros(2), cov, method=method, rng=shared(np.random.default_rng(0))
+    )
+    fn = function([cov], x, mode="NUMBA")
+
+    covs = np.stack([np.eye(2), np.full((2, 2), np.nan), np.eye(2)])
+    draws = fn(covs)
+    assert np.isnan(draws[1]).all()
+    assert np.isfinite(draws[[0, 2]]).all()
 
 
 @pytest.mark.parametrize(
@@ -569,7 +605,7 @@ def test_aligned_RandomVariable(rv_op, dist_args, size):
                 ),
                 (
                     pt.dscalar(),
-                    np.array(1.0, dtype=np.float64),
+                    np.array(3.0, dtype=np.float64),
                 ),
             ],
             (2,),
@@ -585,7 +621,7 @@ def test_aligned_RandomVariable(rv_op, dist_args, size):
                 ),
                 (
                     pt.dscalar(),
-                    np.array(1.0, dtype=np.float64),
+                    np.array(4.0, dtype=np.float64),
                 ),
             ],
             (2,),
@@ -732,6 +768,14 @@ def test_unnatural_batched_dims(batch_dims_tester):
     batch_dims_tester(mode="NUMBA")
 
 
+@pytest.mark.parametrize("a", [20, np.arange(20)])
+def test_choice_without_replacement_uses_full_population(a):
+    rng = shared(np.random.default_rng(532))
+    _, draws = ptr.choice(a, size=5, replace=False, rng=rng, return_next_rng=True)
+    fn = function([], draws, mode=numba_mode)
+    assert np.any(fn() >= 5)
+
+
 def test_repeated_args():
     v = pt.scalar()
     x = ptr.beta(v, v)
@@ -819,13 +863,12 @@ def test_rv_float_params_cast_to_float64(floatX):
     with pytensor.config.change_flags(floatX=floatX):
         rng = shared(np.random.default_rng(123))
 
-        # Opt-in: the int8 literals 0, 1 become float64 regardless of floatX.
+        # Opt-in: the integer literals 0, 1 become float64 regardless of floatX.
         assert _compiled_rv_dist_param_dtypes(
             pt.random.normal(0, 1, size=(5,), rng=rng)
         ) == ["float64", "float64"]
 
-        # Opt-in, and required: numba's np.dot rejects a float32 covariance, so MvNormal
-        # only compiles once mean/cov are float64.
+        # Opt-in: this rewrite still promotes MvNormal's mean and covariance.
         assert _compiled_rv_dist_param_dtypes(
             pt.random.multivariate_normal(
                 np.zeros(3, dtype="float32"), np.eye(3, dtype="float32"), rng=rng
@@ -847,9 +890,10 @@ def test_rv_float_params_cast_to_float64(floatX):
 
 def test_rv_float_params_cast_respects_warn_float64():
     # When the user asked to be warned/raised on float64, the rewrite must not silently
-    # introduce it; the int8 params are left as-is.
+    # introduce it; the integer params are left as-is.
+    int_dtype = "int8" if pytensor.config.cast_policy == "custom" else "int64"
     with pytensor.config.change_flags(floatX="float32", warn_float64="raise"):
         rng = shared(np.random.default_rng(123))
         assert _compiled_rv_dist_param_dtypes(
             pt.random.normal(0, 1, size=(5,), rng=rng)
-        ) == ["int8", "int8"]
+        ) == [int_dtype, int_dtype]

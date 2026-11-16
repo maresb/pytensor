@@ -1,4 +1,5 @@
 import contextlib
+from math import comb
 
 import numpy as np
 import pytest
@@ -8,10 +9,13 @@ import pytensor.tensor as pt
 import pytensor.tensor.math as ptm
 from pytensor import config, function
 from pytensor.compile import get_mode
+from pytensor.compile.mode import Mode
 from pytensor.compile.ops import deep_copy_op
 from pytensor.gradient import grad
+from pytensor.link.numba.dispatch.elemwise import MAX_CAREDUCE_LOOPS
 from pytensor.scalar import Composite, and_, float64, or_, xor
 from pytensor.scalar import add as scalar_add
+from pytensor.scalar import mul as scalar_mul
 from pytensor.tensor import blas, matrix, tensor3
 from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise
 from pytensor.tensor.math import All, Any, Max, Min, Prod, ProdWithoutZeros, Sum
@@ -355,6 +359,22 @@ def test_CAReduce(careduce_fn, axis, v):
     assert isinstance(node.op, CAReduce)
 
 
+@pytest.mark.parametrize(
+    "careduce_fn, numpy_fn", [(pt.prod, np.prod), (pt.max, np.max), (pt.min, np.min)]
+)
+def test_CAReduce_many_position_patterns(careduce_fn, numpy_fn):
+    # One layout per generic nest: innermost axis in stride order reduced / kept
+    axis = (0, 2)
+    x = pt.tensor("x", shape=(None,) * 6)
+    assert comb(x.ndim, len(axis)) * x.ndim > MAX_CAREDUCE_LOOPS
+    test_x = np.random.default_rng(5).normal(size=(2, 3, 4, 2, 3, 4))
+    test_x[0, 0, 0, 0, 0, 0] = np.nan
+    inner_reduced = np.asfortranarray(np.repeat(test_x, 2, axis=0))[::2]
+    inner_kept = np.repeat(test_x, 2, axis=-1)[..., ::2]
+    fn, _ = compare_numba_and_py([x], careduce_fn(x, axis=axis), [inner_reduced])
+    np.testing.assert_allclose(fn(inner_kept), numpy_fn(test_x, axis=axis))
+
+
 @pytest.mark.parametrize("axis", (-1, (0, -1), None))
 def test_CAReduce_respects_acc_dtype(axis):
     x = tensor3("x", dtype="int8")
@@ -404,6 +424,13 @@ def test_CAReduce_discrete_infinity_identity(axis):
     compare_numba_and_py(
         [x], [out], [rng.integers(-127, 127, size=(6, 6, 6)).astype("int8")]
     )
+
+
+@pytest.mark.parametrize("dtype", ["int8", "bool"])
+def test_CAReduce_discrete_empty_initial(dtype):
+    x = pt.matrix("x", dtype=dtype)
+    outs = [x.max(axis=0, initial=-np.inf), x.min(axis=0, initial=np.inf)]
+    compare_numba_and_py([x], outs, [np.zeros((0, 3), dtype=dtype)])
 
 
 def test_scalar_Elemwise_Clip():
@@ -610,6 +637,75 @@ def test_elemwise_multiple_inplace_outs():
     np.testing.assert_allclose(out2, [5, 6, 7])
 
 
+@pytest.mark.parametrize(
+    "op, x_range, y_range",
+    [
+        # x*y < 1, so the product is the smaller operand and `minimum` picks it
+        (pt.minimum, (0.02, 0.06), (0.2, 0.9)),
+        # x*y > 1, so the product is the larger operand and `maximum` picks it
+        (pt.maximum, (1.5, 3.0), (2.0, 4.0)),
+    ],
+    ids=["minimum", "maximum"],
+)
+def test_minimum_maximum_grad_ignores_operand_rounding(op, x_range, y_range):
+    # The mask must be decided by the inputs: an `eq(outputs[0], x)` mask needs x
+    # recomputed bit-for-bit, which fastmath reassoc breaks. `z * x * y` and
+    # `x * y * z` are the same product, but the operand order makes LLVM group
+    # them differently, so the forward value stops matching the rebuilt operand.
+    # `L_op` is called the way scan's gradient calls it: forward value from the
+    # loop, operand rebuilt outside it.
+    x = pt.vector("x")
+    y = pt.vector("y")
+    z = pt.vector("z")
+    out = op(z * x * y, z)
+    gx, gy = op.L_op([x * y * z, z], [out], [pt.ones_like(out)])
+
+    n = 10_000
+    x_test = rng.uniform(*x_range, n)
+    y_test = rng.uniform(*y_range, n)
+    z_test = rng.uniform(1e7, 4e7, n)
+
+    # the product wins by 20-250x, so the gradient belongs entirely to it
+    fn = function([x, y, z], [gx, gy], mode=Mode(linker="numba", optimizer=None))
+    gx_val, gy_val = fn(x_test, y_test, z_test)
+    np.testing.assert_array_equal(gx_val, np.ones(n))
+    np.testing.assert_array_equal(gy_val, np.zeros(n))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="fastmath reassoc groups a Composite's products by argument "
+    "position, so two Composites over one expression disagree "
+    "(pymc-devs/pytensor#2187)",
+)
+def test_composite_product_independent_of_argument_order():
+    # LLVM ranks values by argument position and left-associates commutative
+    # chains, so signature (z, x, y) evaluates x*y*z as (x*z)*y while (x, y, z)
+    # gives (x*y)*z. Fusion assigns those signatures per Composite, so any two
+    # Composites over a shared subexpression can silently disagree.
+    x_ = float64("x")
+    y_ = float64("y")
+    z_ = float64("z")
+    prod = scalar_mul(x_, y_, z_)
+    op_zxy = Elemwise(Composite([z_, x_, y_], [prod]))
+    op_xyz = Elemwise(Composite([x_, y_, z_], [prod]))
+
+    x = pt.vector("x")
+    y = pt.vector("y")
+    z = pt.vector("z")
+    fn = function(
+        [x, y, z],
+        [op_zxy(z, x, y), op_xyz(x, y, z)],
+        mode=Mode(linker="numba", optimizer=None),
+    )
+
+    n = 10_000
+    x_test = rng.uniform(0.02, 0.06, n)
+    y_test = rng.uniform(0.2, 0.9, n)
+    z_test = rng.uniform(1e7, 4e7, n)
+    np.testing.assert_array_equal(*fn(x_test, y_test, z_test))
+
+
 def test_scalar_loop():
     a_scalar = float64("a")
     const_scalar = float64("const")
@@ -693,6 +789,30 @@ def test_gammainc_wrt_k_grad():
                 rng.random(size=(4, 3, 2)).view("complex128").squeeze(-1),
             ),
         ),
+        # Column slice and transpose, read through the leading dimension
+        (
+            (pt.dmatrix(), rng.random(size=(3, 8))[:, :4]),
+            (pt.dmatrix(), rng.random(size=(5, 4)).T),
+        ),
+        # Empty contraction, where gemm must zero the output without reading it
+        (
+            (pt.dmatrix(), np.empty((3, 0))),
+            (pt.dmatrix(), np.empty((0, 4))),
+        ),
+        # Empty contraction into a single column, which must still zero the output
+        (
+            (pt.dmatrix(), np.empty((3, 0))),
+            (pt.tensor(dtype="float64", shape=(None, 1)), np.empty((0, 1))),
+        ),
+        # A single output column or row takes the gemv branches of gemm
+        (
+            (pt.dmatrix(), rng.random(size=(3, 4))),
+            (pt.dmatrix(), rng.random(size=(4, 1))),
+        ),
+        (
+            (pt.dmatrix(), rng.random(size=(1, 4))),
+            (pt.dmatrix(), rng.random(size=(4, 3))),
+        ),
     ],
 )
 def test_Dot(x, y):
@@ -731,6 +851,20 @@ def test_Dot(x, y):
                 pt.ltensor3(),
                 rng.poisson(size=(2, 3, 3)).astype("int64"),
             ),
+            None,
+        ),
+        # A single output column or row takes the gemv branches of gemm
+        (
+            (pt.dtensor3(), rng.random(size=(2, 3, 4))),
+            (
+                pt.tensor(dtype="float64", shape=(None, None, 1)),
+                rng.random(size=(2, 4, 1)),
+            ),
+            None,
+        ),
+        (
+            (pt.dtensor3(), rng.random(size=(2, 1, 4))),
+            (pt.dtensor3(), rng.random(size=(2, 4, 3))),
             None,
         ),
     ],

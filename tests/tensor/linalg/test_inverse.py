@@ -19,6 +19,9 @@ from tests import unittest_tools as utt
 from tests.test_rop import break_op
 
 
+pytestmark = pytest.mark.filterwarnings("error:matrix_dot is deprecated:FutureWarning")
+
+
 def test_pseudoinverse_correctness():
     rng = np.random.default_rng(utt.fetch_seed())
     d1 = rng.integers(4) + 2
@@ -179,6 +182,13 @@ class TestTensorInv(utt.InferShapeTester):
             [self.a],  # value to substitute
             TensorInv,
         )
+
+    def test_static_shape(self):
+        # `tensorinv` rotates the axes, so the input's shape must not leak
+        # unrotated into the output's static shape.
+        A = tensor4("A", shape=(4, 6, 8, 3))
+        assert tensorinv(A, ind=2).type.shape == (8, 3, 4, 6)
+        assert tensorinv(A, ind=1).type.shape == (6, 8, 3, 4)
 
     def test_eval(self):
         A = self.A

@@ -2,9 +2,12 @@ import pytest
 
 from pytensor import shared
 from pytensor import tensor as pt
+from pytensor.compile.builders import OpFromGraph
+from pytensor.conditional.op import LazyIfElse
 from pytensor.graph import Apply, ancestors, graph_inputs
 from pytensor.graph.basic import Variable
 from pytensor.graph.traversal import (
+    apply_ancestors,
     apply_depends_on,
     explicit_graph_inputs,
     general_toposort,
@@ -186,6 +189,21 @@ def test_ancestors():
     res = ancestors([o2], blockers=[o1])
     res_list = list(res)
     assert res_list == [o2, o1, r3]
+
+
+def test_apply_ancestors():
+    """Blockers are yielded by `ancestors`, but their owners do not contribute."""
+    r1, r2, r3 = MyVariable(1), MyVariable(2), MyVariable(3)
+    o1 = MyOp(r1, r2)
+    o1.name = "o1"
+    o2 = MyOp(r3, o1)
+    o2.name = "o2"
+
+    res_list = list(apply_ancestors([o2], blockers=None))
+    assert res_list == [o2.owner, o1.owner]
+
+    res_list = list(apply_ancestors([o2], blockers=[o1]))
+    assert res_list == [o2.owner]
 
 
 def test_graph_inputs():
@@ -403,3 +421,13 @@ def test_get_var_by_name():
 
     exp_res = igo.fgraph.outputs[0]
     assert res == exp_res
+
+
+def test_get_var_by_name_multiple_inner_graphs():
+    c, x = pt.iscalar("c"), pt.dvector("x")
+    branches = [OpFromGraph([x], [x * scale]) for scale in (2, 3)]
+    output = LazyIfElse(*branches, [x.type])(c, x)
+    # Each name lives in a different branch of the same outer Op.
+    for branch in branches:
+        inner_output = branch.fgraph.outputs[0]
+        assert get_var_by_name([output], inner_output.auto_name) == (inner_output,)

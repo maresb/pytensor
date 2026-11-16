@@ -30,7 +30,6 @@ from pytensor.scalar.basic import (
     constant,
     cos,
     cosh,
-    deg2rad,
     eq,
     exp,
     exp2,
@@ -51,7 +50,6 @@ from pytensor.scalar.basic import (
     neg,
     neq,
     pow,
-    rad2deg,
     reciprocal,
     sin,
     sinh,
@@ -307,8 +305,6 @@ class TestUpgradeToFloat:
         (exp, list(range(-127, 89))),
         (exp2, list(range(-127, 89))),
         (expm1, list(range(-127, 89))),
-        (deg2rad, list(range(-127, 128))),
-        (rad2deg, list(range(-127, 128))),
         (cos, list(range(-127, 128))),
         (arccos, list(range(-1, 2))),
         (cosh, list(range(-89, 90))),
@@ -467,7 +463,8 @@ def test_grad_abs():
 def test_constant():
     c = constant(2, name="a")
     assert c.name == "a"
-    assert c.dtype == "int8"
+    expected = "int8" if pytensor.config.cast_policy == "custom" else "int64"
+    assert c.dtype == expected
     c = constant(2, dtype="float32")
     assert c.name is None
     assert c.dtype == "float32"

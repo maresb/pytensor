@@ -70,13 +70,12 @@ Environment Variables
 
         [global]
         floatX = float32
-        device = cuda0
 
     Configuration attributes that are available directly in ``config``
     (e.g. ``config.mode``) should be defined in the ``[global]`` section.
     Attributes from a subsection of ``config``
-    (e.g. ``config.dnn__conv__algo_fwd``) should be defined in their
-    corresponding section (e.g. ``[dnn.conv]``).
+    (e.g. ``config.compile__timeout``) should be defined in their
+    corresponding section (e.g. ``[compile]``).
 
     Multiple configuration files can be specified by separating them with ``':'``
     characters (as in ``$PATH``).  Multiple configuration files will be merged,
@@ -98,18 +97,6 @@ import ``pytensor`` and print the config variable, as in:
 .. code-block:: bash
 
     python -c 'import pytensor; print(pytensor.config)' | less
-
-.. attribute:: device
-
-    String value: either ``'cpu'``
-
-.. attribute:: print_active_device
-
-    Bool value: either ``True`` or ``False``
-
-    Default: ``True``
-
-    Print the active device when the device is initialized.
 
 .. attribute:: floatX
 
@@ -234,33 +221,12 @@ import ``pytensor`` and print the config variable, as in:
 
     At the moment it behaves differently from NumPy in the following situations:
 
-    * Depending on the value of :attr:`config.int_division`, the resulting dtype
-      of a division of integers with the ``/`` operator may not match
-      that of NumPy.
     * On mixed scalar and array operations, NumPy tries to prevent the scalar
       from upcasting the array's type unless it is of a fundamentally
       different type. PyTensor does not attempt to do the same at this point,
       so users should be careful, since scalars may upcast arrays when they
       otherwise wouldn't in NumPy. This behavior should change in the near
       future.
-
-.. attribute:: int_division
-
-    String value: either ``'int'``, ``'floatX'``, or ``'raise'``
-
-    Default: ``'int'``
-
-    Specifies what to do when one tries to compute ``x / y``, where both ``x`` and
-    ``y`` are of integer types (possibly unsigned). ``'int'`` means an integer is
-    returned (as in Python 2.X). This behavior is deprecated.
-
-    ``'floatX'`` returns a number of with the dtype given by ``config.floatX``.
-
-    ``'raise'`` is the safest choice (and will become default in a future
-    release of PyTensor).  It raises an error when one tries to perform such an
-    operation, enforcing the use of the integer division operator (``//``). If a
-    float result is desired, either cast one of the arguments to a float, or use
-    ``x.__truediv__(y)``.
 
 .. attribute:: mode
 
@@ -405,31 +371,6 @@ import ``pytensor`` and print the config variable, as in:
     raise the exception (i.e. ``'raise'``).
 
 
-.. attribute:: config.warn__ignore_bug_before
-
-    String value: ``'None'``, ``'all'``, ``'0.3'``, ``'0.4'``, ``'0.4.1'``,
-    ``'0.5'``, ``'0.6'``, ``'0.7'``, ``'0.8'``, ``'0.8.1'``, ``'0.8.2'``,
-    ``'0.9'``, ``'0.10'``, ``'1.0'``, ``'1.0.1'``, ``'1.0.2'``, ``'1.0.3'``,
-    ``'1.0.4'``,``'1.0.5'``
-
-    Default: ``'0.9'``
-
-    When we an PyTensor bug that generated a bad result is fixed, we also make
-    PyTensor raise a warning when it encounters the same circumstances again. This
-    helps users determine whether or not said bug has affected past runs, since
-    one only needs to perform the same runs again with the new version, and one
-    does not have to understand the PyTensor internals that triggered the bug.
-
-    This flag lets users ignore warnings about old bugs that were
-    fixed before their first checkout of PyTensor.
-    You can set its value to the first version of PyTensor
-    that you used (probably 0.3 or higher)
-
-    ``'None'`` means that all warnings will be displayed.
-    ``'all'`` means all warnings will be ignored.
-
-    This flag's value cannot be modified during program execution.
-
 .. attribute:: base_compiledir
 
     Default: On Windows: ``$LOCALAPPDATA\\PyTensor`` if ``$LOCALAPPDATA`` is defined,
@@ -459,6 +400,22 @@ import ``pytensor`` and print the config variable, as in:
 
     This flag's value cannot be modified during program execution.
 
+.. attribute:: generated_src_dir
+
+    Default: ``""``
+
+    Directory for the generated Python source of compiled functions (for
+    example by the Numba backend). The source is kept on disk because tracebacks
+    and Numba read it back.
+
+    If empty, each function gets its own file in the system temporary
+    directory, and PyTensor never removes it. If set, the same source reuses one
+    file in this directory, and files not used for
+    ``config.cmodule__age_thresh_use`` plus 7 days are removed when the
+    interpreter exits. ``pytensor-cache clear`` and ``pytensor-cache purge``
+    remove all of them. Only files that PyTensor generated are removed, so the
+    directory can be shared.
+
 .. attribute:: config.blas__ldflags
 
     Default: ``'-lblas'``
@@ -466,35 +423,6 @@ import ``pytensor`` and print the config variable, as in:
     Link argument to link against a (Fortran) level-3 blas implementation.
     PyTensor will test if ``'-lblas'`` works by default. If not, it will disable C
     code for BLAS.
-
-.. attribute:: config.experimental__local_alloc_elemwise_assert
-
-    Bool value: either ``True`` or ``False``
-
-    Default: ``True``
-
-    When ``True``, add asserts that highlight shape errors.
-
-    Without such asserts, the underlying rewrite could hide errors in user
-    code.  PyTensor adds the asserts only if it cannot infer that the shapes are
-    equivalent.  When it can determine equivalence, this rewrite does not
-    introduce an assert.
-
-    Removing these asserts can speed up execution.
-
-.. attribute:: config.conv__assert_shape
-
-    If ``True``, ``AbstractConv*`` :class:`Op`\s will verify that user-provided shapes
-    match the run-time shapes. This is a debugging option, and may slow down
-    compilation.
-
-.. attribute:: config.ctc__root
-
-    Default: ``''``
-
-    Location of the warp-ctc folder. The folder should contain either a build,
-    lib or lib64 subfolder with the shared library (e.g. ``libwarpctc.so``), and another
-    subfolder called include, with the CTC library header.
 
 .. attribute:: config.gcc__cxxflags
 
@@ -735,10 +663,142 @@ import ``pytensor`` and print the config variable, as in:
     compilation. When this value is greater than zero, it will make PyTensor keep
     internal stack traces.
 
-.. attribute:: config.metaopt__verbose
+.. attribute:: check_input
 
-    Int value, default: 0
+    Bool value, default: ``True``
 
-    The verbosity level of the meta-rewriter: ``0`` for silent, ``1`` to only
-    warn when PyTensor cannot meta-rewrite an :class:`Op`, ``2`` for full output (e.g.
-    timings and the rewrites selected).
+    Enable input type checks in generated C code. Disabling these checks can
+    reduce compilation time, runtime overhead, and the number of generated files.
+
+.. attribute:: on_unused_input
+
+    String value: ``'raise'``, ``'warn'``, or ``'ignore'``. Default: ``'raise'``.
+
+    Control what happens when an input to ``pytensor.function`` is unused.
+
+.. attribute:: print_global_stats
+
+    Bool value, default: ``False``
+
+    Print global timing statistics when the process exits.
+
+.. attribute:: unpickle_function
+
+    Bool value, default: ``True``
+
+    Restore compiled functions when unpickling. If ``False``, replace them with
+    ``None``, which can help load old graphs that unnecessarily included functions.
+
+.. attribute:: vm__lazy
+
+    Value: ``None``, ``True``, or ``False``. Default: ``None``.
+
+    Control lazy evaluation in VM linkers. ``None`` selects it automatically.
+    Without the C VM, ``True`` selects the Stack VM and ``False`` the Loop VM.
+
+.. attribute:: optimizer_verbose_ignore
+
+    String value, default: ``''``
+
+    Comma-separated rewrite names to omit when :attr:`optimizer_verbose` is enabled.
+
+.. attribute:: blas__check_openmp
+
+    Bool value, default: ``True``
+
+    Check for conflicting OpenMP libraries. Disabling this check can allow
+    incorrect results in BLAS operations.
+
+.. attribute:: numba__cache
+
+    Bool value, default: ``True``
+
+    Enable Numba's file-based compilation cache.
+
+.. attribute:: numba__fastmath
+
+    Bool value, default: ``True``
+
+    Enable the Numba backend's fastmath optimizations.
+
+.. attribute:: tensor__cmp_sloppy
+
+    Int value: ``0``, ``1``, or ``2``. Default: ``0``.
+
+    Relax the tolerance of ``pytensor.tensor.math._allclose``: ``0`` leaves it
+    unchanged, ``1`` relaxes it slightly, and ``2`` relaxes it further.
+
+.. attribute:: tensor__insert_inplace_optimizer_validate_nb
+
+    Int value, default: ``-1``
+
+    Number of inplace rewrites between graph validations. ``-1`` selects ``1``
+    for graphs with fewer than 500 nodes and ``10`` for larger graphs.
+
+.. attribute:: optdb__position_cutoff
+
+    Float value, default: ``inf``
+
+    Stop graph rewriting before rewrites at or beyond this database position.
+
+.. attribute:: optdb__max_use_ratio
+
+    Float value, default: ``8``
+
+    Limit rewrite applications relative to graph size to detect infinite loops
+    in ``EquilibriumGraphRewriter``.
+
+.. attribute:: profiling__time_thunks
+
+    Bool value, default: ``True``
+
+    Time individual thunks when profiling.
+
+.. attribute:: profiling__output_line_width
+
+    Int value, default: ``512``
+
+    Maximum line width of profiling output.
+
+.. attribute:: NanGuardMode__action
+
+    String value: ``'raise'``, ``'warn'``, or ``'pdb'``. Default: ``'raise'``.
+
+    Action to take when ``NanGuardMode`` finds a problem.
+
+.. attribute:: DebugMode__check_c
+
+    Bool value, default: ``True`` when a C++ compiler is configured, otherwise ``False``.
+
+    Run available C implementations when checking computations in ``DebugMode``.
+
+.. attribute:: DebugMode__check_py
+
+    Bool value, default: ``True``
+
+    Run available Python implementations in ``DebugMode``.
+
+.. attribute:: DebugMode__check_finite
+
+    Bool value, default: ``True``
+
+    Report NaN and infinite results in ``DebugMode``.
+
+.. attribute:: DebugMode__check_strides
+
+    Int value: ``0``, ``1``, or ``2``. Default: ``0``.
+
+    Compare strides of Python and C results. ``0`` ignores differences, ``1``
+    warns, and ``2`` raises an error.
+
+.. attribute:: DebugMode__patience
+
+    Positive int value, default: ``10``
+
+    Number of times ``DebugMode`` optimizes a graph to detect inconsistent rewrites.
+
+.. attribute:: gcc_version_str
+
+    String value, determined by the configured C++ compiler.
+
+    Read-only compiler version banner used to identify compiled modules.

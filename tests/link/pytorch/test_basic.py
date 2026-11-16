@@ -10,12 +10,12 @@ from pytensor.compile.builders import OpFromGraph
 from pytensor.compile.maker import function
 from pytensor.compile.mode import PYTORCH, Mode
 from pytensor.compile.sharedvalue import shared
+from pytensor.conditional.op import ifelse
 from pytensor.configdefaults import config
 from pytensor.graph import RewriteDatabaseQuery
 from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
-from pytensor.ifelse import ifelse
 from pytensor.link.pytorch.linker import PytorchLinker
 from pytensor.raise_op import CheckAndRaise
 from pytensor.scalar import float64, int64
@@ -83,6 +83,14 @@ def compare_pytorch_and_py(
         assert_fn(pytorch_res, py_res)
 
     return pytensor_torch_fn, pytorch_res
+
+
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+def test_complex_sign(dtype):
+    x = vector(dtype=dtype)
+    compare_pytorch_and_py(
+        [x], pt.sign(x), [np.array([0, 3 + 4j, -2j, -1], dtype=dtype)]
+    )
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -379,6 +387,16 @@ def test_pytorch_link_references():
     assert "inner_fn" not in dir(m), "function call reference leaked"
 
 
+@pytest.mark.filterwarnings("error")
+def test_read_only_constant_does_not_warn():
+    # https://github.com/pymc-devs/pytensor/issues/2365
+    x = vector("x")
+    # The gradient graph contains a constant backed by a read-only array
+    out = pt.grad((x**2).sum(), x)
+    f = function([x], out, mode="PYTORCH")
+    np.testing.assert_allclose(f(np.ones(3)), 2)
+
+
 def test_pytorch_scipy():
     x = vector("a", shape=(3,))
     out = expit(x)
@@ -426,7 +444,7 @@ def test_ScalarLoop_while():
 def test_ScalarLoop_Elemwise_single_carries():
     n_steps = int64("n_steps")
     x0 = float64("x0")
-    x = x0 * 2
+    x = x0 * np.int8(2)
     until = x >= 10
 
     scalarop = ScalarLoop(init=[x0], update=[x], until=until)
@@ -452,8 +470,8 @@ def test_ScalarLoop_Elemwise_multi_carries():
     n_steps = int64("n_steps")
     x0 = float64("x0")
     x1 = float64("x1")
-    x = x0 * 2
-    x1_n = x1 * 3
+    x = x0 * np.int8(2)
+    x1_n = x1 * np.int8(3)
     until = x >= 10
 
     scalarop = ScalarLoop(init=[x0, x1], update=[x, x1_n], until=until)

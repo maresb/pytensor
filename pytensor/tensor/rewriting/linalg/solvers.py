@@ -2,7 +2,6 @@ from collections.abc import Container
 
 from pytensor import tensor as pt
 from pytensor.assumptions import DIAGONAL, ORTHOGONAL, check_assumption
-from pytensor.assumptions.positive_definite import POSITIVE_DEFINITE
 from pytensor.compile import optdb
 from pytensor.graph import Constant, graph_inputs
 from pytensor.graph.fg import FunctionGraph
@@ -12,11 +11,12 @@ from pytensor.graph.rewriting.basic import (
     node_rewriter,
 )
 from pytensor.graph.rewriting.unify import OpPattern
+from pytensor.scalar.basic import Mul
 from pytensor.scan.op import Scan
 from pytensor.scan.rewriting import scan_seqopt1
 from pytensor.tensor.basic import atleast_Nd, split
 from pytensor.tensor.blockwise import Blockwise
-from pytensor.tensor.elemwise import DimShuffle
+from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.linalg.constructors import BlockDiagonal
 from pytensor.tensor.linalg.decomposition.cholesky import Cholesky, cholesky
 from pytensor.tensor.linalg.decomposition.lu import lu_factor
@@ -34,34 +34,18 @@ from pytensor.tensor.linalg.solvers.tridiagonal import (
     tridiagonal_lu_factor,
     tridiagonal_lu_solve,
 )
+from pytensor.tensor.math import Dot, Sum
 from pytensor.tensor.rewriting.basic import (
     register_canonicalize,
     register_specialize,
     register_stabilize,
 )
 from pytensor.tensor.rewriting.blockwise import blockwise_of
-from pytensor.tensor.rewriting.linalg.utils import get_assume_a
-from pytensor.tensor.variable import TensorVariable
-
-
-@register_stabilize
-@register_canonicalize
-@node_rewriter([blockwise_of(OpPattern(Solve, assume_a="gen"))])
-def generic_solve_to_solve_triangular(fgraph, node):
-    """
-    If any solve() is applied to the output of a cholesky op, then
-    replace it with a triangular solve.
-
-    """
-    b_ndim = node.op.core_op.b_ndim
-    A, b = node.inputs  # result is the solution to Ax=b
-    match A.owner_op_and_inputs:
-        case (Blockwise(Cholesky(lower=lower)), _):
-            return [solve_triangular(A, b, lower=lower, b_ndim=b_ndim)]
-        case (DimShuffle(is_left_expanded_matrix_transpose=True), A_T):
-            match A_T.owner_op:
-                case Blockwise(Cholesky(lower=lower)):
-                    return [solve_triangular(A, b, lower=not lower, b_ndim=b_ndim)]
+from pytensor.tensor.rewriting.linalg.utils import (
+    clients_through_expand_dims,
+    get_assume_a,
+    strip_left_expand_dims_and_transpose,
+)
 
 
 @register_specialize
@@ -111,20 +95,15 @@ def batched_vector_b_solve_to_matrix_b_solve(fgraph, node):
 
 
 @register_stabilize
-@node_rewriter([blockwise_of(OpPattern(Solve, b_ndim=2))])
+@node_rewriter([blockwise_of(OpPattern(Solve, assume_a="pos"))])
 def psd_solve_to_chol_solve(fgraph, node):
-    """Rewrite solve(A, b) → triangular solves via Cholesky when A is positive-definite."""
-    assume_a = node.op.core_op.assume_a
+    """Rewrite solve(A, b, assume_a='pos') -> triangular solves via Cholesky."""
+    b_ndim = node.op.core_op.b_ndim
     A, b = node.inputs
-    if (
-        assume_a == "pos"
-        or getattr(A.tag, "psd", None) is True
-        or check_assumption(fgraph, A, POSITIVE_DEFINITE)
-    ):
-        L = cholesky(A)
-        Li_b = solve_triangular(L, b, lower=True, b_ndim=2)
-        x = solve_triangular((L.mT), Li_b, lower=False, b_ndim=2)
-        return [x]
+    L = cholesky(A)
+    Li_b = solve_triangular(L, b, lower=True, b_ndim=b_ndim)
+    x = solve_triangular(L.mT, Li_b, lower=False, b_ndim=b_ndim)
+    return [x]
 
 
 @register_specialize
@@ -143,11 +122,9 @@ def paired_triangular_solves_to_cho_solve(fgraph, node):
     L_T, inner_result = node.inputs
 
     # Check L.T is a matrix transpose of a Cholesky factor
-    match L_T.owner_op_and_inputs:
-        case (DimShuffle(is_left_expanded_matrix_transpose=True), L):
-            pass
-        case _:
-            return None
+    L, transposed = strip_left_expand_dims_and_transpose(L_T)
+    if not transposed:
+        return None
 
     # L must be output of a Cholesky(lower=True)
     match L.owner_op:
@@ -163,36 +140,220 @@ def paired_triangular_solves_to_cho_solve(fgraph, node):
         case _:
             return None
 
-    # inner_L must be the same Cholesky output as L
-    if inner_L is not L:
+    # inner_L must be the same Cholesky output as L, possibly behind expand_dims
+    inner_L_core, inner_transposed = strip_left_expand_dims_and_transpose(inner_L)
+    if inner_L_core is not L or inner_transposed:
         return None
 
     b_ndim = core_op.b_ndim
     new_out = cho_solve((L, True), b, b_ndim=b_ndim)
+    new_out = atleast_Nd(new_out, n=node.outputs[0].type.ndim)
     copy_stack_trace(node.outputs[0], new_out)
     return [new_out]
 
 
+def _inner_of_triangular_solve_pair(node):
+    """Return ``y`` if ``node`` is ``solve_triangular(M.mT, y)`` with
+    ``y = solve_triangular(M, b)``, else None.
+
+    The pair solves ``(M @ M.mT) x = b``, so ``b.T @ x == sum(y ** 2)`` for any
+    triangular ``M``.
+    """
+    core_op = node.op.core_op
+    outer_M, y = node.inputs
+    match y.owner_op_and_inputs:
+        case (Blockwise(SolveTriangular() as inner_op), inner_M, _):
+            pass
+        case _:
+            return None
+    if (
+        inner_op.lower == core_op.lower
+        or inner_op.unit_diagonal != core_op.unit_diagonal
+        or inner_op.b_ndim != core_op.b_ndim
+    ):
+        return None
+
+    outer_core, outer_transposed = strip_left_expand_dims_and_transpose(outer_M)
+    inner_core, inner_transposed = strip_left_expand_dims_and_transpose(inner_M)
+    if outer_core is not inner_core or not outer_transposed or inner_transposed:
+        return None
+    return y
+
+
+@register_stabilize
+@register_specialize
+@node_rewriter([blockwise_of(CholeskySolve), blockwise_of(SolveTriangular)])
+def cho_solve_quadratic_form_to_whitened(fgraph, node):
+    """Replace a Cholesky-solve quadratic form with one triangular solve.
+
+    Match multiply-and-sum or vector inner products, including batched Matmul.
+    Also handle the transposed matrix RHS used for batched vectors. The solve is
+    either a ``cho_solve`` or the pair of triangular solves it lowers to.
+    """
+    core_op = node.op.core_op
+    [x] = node.outputs
+
+    if isinstance(core_op, CholeskySolve):
+        factor, solve_b = node.inputs
+        # cho_solve reads A as factor @ factor.conj().mT, which the unconjugated
+        # b.T @ x only undoes into sum(whitened ** 2) for a real factor
+        if factor.type.dtype.startswith("complex"):
+            return None
+        whitened = None
+    else:
+        whitened = _inner_of_triangular_solve_pair(node)
+        if whitened is None:
+            return None
+        solve_b = whitened.owner.inputs[1]
+
+    # Exclusive consumers let the replacement remove the original solve.
+    match fgraph.clients[x]:
+        case [(client, target_idx)]:
+            pass
+        case _:
+            return None
+    target = x
+    x_shuffle = None
+    if isinstance(client.op, DimShuffle):
+        x_shuffle = client.op
+        [target] = client.outputs
+        match fgraph.clients[target]:
+            case [(client, target_idx)]:
+                pass
+            case _:
+                return None
+
+    if len(client.inputs) != 2:
+        return None
+    other = client.inputs[1 - target_idx]
+    transpose = False
+    output_order = None
+
+    match client.op:
+        case Dot() | Blockwise(Dot()):
+            if other.type.shape[-2 if target_idx == 1 else -1] != 1:
+                return None
+
+            vector_axis = x.ndim - core_op.b_ndim
+            x_order = x_shuffle.new_order if x_shuffle else tuple(range(x.ndim))
+            if x_order[-1 if target_idx == 0 else -2] != vector_axis:
+                return None
+
+            def dimshuffle_view(var, order):
+                while isinstance(var.owner_op, DimShuffle):
+                    op, var = var.owner_op_and_inputs
+                    order = tuple(
+                        "x" if axis == "x" else op.new_order[axis] for axis in order
+                    )
+                return var, tuple(
+                    "x" if axis == "x" or var.type.shape[axis] == 1 else axis
+                    for axis in order
+                )
+
+            # Compare both vector and batch-axis mappings, allowing singleton views.
+            rhs_base, rhs_order = dimshuffle_view(
+                solve_b, (*x_order[:-2], x_order[-1], x_order[-2])
+            )
+            other_base, other_order = dimshuffle_view(other, range(other.ndim))
+            if rhs_base is not other_base or rhs_order != other_order:
+                return None
+
+            sum_op = Sum(axis=(vector_axis,))
+            # Replace the contracted vector axis by its singleton Matmul slot.
+            reduced_order = tuple(
+                "x"
+                if axis == "x" or axis == vector_axis
+                else axis - (axis > vector_axis)
+                for axis in x_order
+            )
+            match fgraph.clients[client.out]:
+                case [(squeeze_client, _)] if isinstance(squeeze_client.op, DimShuffle):
+                    old_out = squeeze_client.out
+                    output_order = tuple(
+                        "x" if axis == "x" else reduced_order[axis]
+                        for axis in squeeze_client.op.new_order
+                    )
+                case _:
+                    old_out = client.out
+                    output_order = reduced_order
+
+        case Elemwise(scalar_op=Mul()):
+            reduction_axis = x.ndim - core_op.b_ndim
+            if x_shuffle is None:
+                expected_b = solve_b
+            else:
+                if (
+                    core_op.b_ndim != 2
+                    or x.ndim != 2
+                    or not x_shuffle.is_matrix_transpose
+                ):
+                    return None
+                match solve_b.owner_op_and_inputs:
+                    case (DimShuffle(is_matrix_transpose=True), expected_b):
+                        transpose = True
+                        reduction_axis = target.ndim - 1
+                    case _:
+                        return None
+            if other is not expected_b:
+                return None
+            match fgraph.clients[client.out]:
+                case [(sum_client, _)] if isinstance(sum_client.op, Sum):
+                    sum_op = sum_client.op
+                    old_out = sum_client.out
+                case _:
+                    return None
+            if sum_op.axis is not None and reduction_axis not in sum_op.axis:
+                return None
+
+        case _:
+            return None
+
+    if whitened is None:
+        # A = c @ c.mT when lower, c.mT @ c when upper; trans=1 whitens the upper case
+        c = node.inputs[0]
+        whitened = solve_triangular(
+            c,
+            solve_b,
+            lower=core_op.lower,
+            trans=0 if core_op.lower else 1,
+            b_ndim=core_op.b_ndim,
+        )
+    if transpose:
+        whitened = whitened.mT
+
+    # Reuse the matched Sum's axes, dtype and acc_dtype.
+    new_out = sum_op(whitened**2)
+    if output_order is not None:
+        new_out = new_out.dimshuffle(output_order)
+    copy_stack_trace(old_out, new_out)
+    return {old_out: new_out}
+
+
 @register_stabilize
 @register_canonicalize
-@node_rewriter([blockwise_of(OpPattern(Solve, assume_a="gen"))])
+@node_rewriter([blockwise_of(Solve)])
 def generic_solve_to_structured_form(fgraph, node):
-    """Upgrade solve(A, b, assume_a='gen') based on known structure of A.
+    """Upgrade a gen, sym or her solve(A, b) based on known structure of A.
 
     Priority order (most specialized first):
+    - TRIDIAGONAL -> solve(assume_a='tridiagonal')
     - LOWER_TRIANGULAR -> solve_triangular(lower=True)
     - UPPER_TRIANGULAR -> solve_triangular(lower=False)
     - POSITIVE_DEFINITE -> solve(assume_a='pos')
-    - SYMMETRIC → solve(assume_a='sym')
+    - SYMMETRIC -> solve(assume_a='sym')
     """
-    b_ndim = node.op.core_op.b_ndim
-    A, b = node.inputs
-
-    assume_a = get_assume_a(fgraph, A)
-    if assume_a == "gen":
+    core_op = node.op.core_op
+    declared = core_op.assume_a
+    if declared not in ("gen", "sym", "her"):
         return None
 
-    return [solve(A, b, assume_a=assume_a, b_ndim=b_ndim)]
+    A, b = node.inputs
+    assume_a = get_assume_a(fgraph, A)
+    # sym and her solves cost the same, so a symmetric fact only refines gen
+    if assume_a == "gen" or (assume_a == "sym" and declared != "gen"):
+        return None
+
+    return [solve(A, b, assume_a=assume_a, b_ndim=core_op.b_ndim)]
 
 
 @register_stabilize
@@ -245,11 +406,22 @@ def solve_of_inv_to_matmul(fgraph, node):
     i.e., inv(X) @ x = b, so x = X @ b.
     """
     A, b = node.inputs
+    [old_out] = node.outputs
 
-    match A.owner_op_and_inputs:
+    A_core, transposed = strip_left_expand_dims_and_transpose(A)
+    match A_core.owner_op_and_inputs:
         case (Blockwise(MatrixInverse()), X):
-            new_out = X @ b
-            copy_stack_trace(node.outputs[0], new_out)
+            if transposed:
+                X = X.mT
+            # X @ b misbroadcasts when b is a batched stack of vectors
+            if node.op.core_op.b_ndim == 1:
+                new_out = pt.matvec(X, b)
+            else:
+                new_out = X @ b
+            new_out = atleast_Nd(new_out, n=old_out.type.ndim).astype(
+                old_out.type.dtype
+            )
+            copy_stack_trace(old_out, new_out)
             return [new_out]
 
 
@@ -317,7 +489,10 @@ def block_diag_solve_to_block_diag_solves(fgraph, node):
     """
     A, b = node.inputs
 
-    match A.owner_op_and_inputs:
+    A_core, transposed = strip_left_expand_dims_and_transpose(A)
+    if transposed:
+        return None
+    match A_core.owner_op_and_inputs:
         case (Blockwise(BlockDiagonal()), *blocks):
             pass
         case _:
@@ -355,6 +530,8 @@ def block_diag_solve_to_block_diag_solves(fgraph, node):
             for sol in per_block_solutions:
                 copy_stack_trace(node.outputs[0], sol)
             new_out = pt.linalg.block_diag(*per_block_solutions)
+            [out] = node.outputs
+            new_out = atleast_Nd(new_out, n=out.type.ndim).astype(out.type.dtype)
             copy_stack_trace(node.outputs[0], new_out)
             return [new_out]
 
@@ -370,6 +547,8 @@ def block_diag_solve_to_block_diag_solves(fgraph, node):
         per_block_solutions.append(sol)
 
     new_out = pt.concatenate(per_block_solutions, axis=split_axis)
+    [out] = node.outputs
+    new_out = atleast_Nd(new_out, n=out.type.ndim).astype(out.type.dtype)
     copy_stack_trace(node.outputs[0], new_out)
     return [new_out]
 
@@ -378,17 +557,18 @@ def block_diag_solve_to_block_diag_solves(fgraph, node):
 @register_stabilize
 @node_rewriter([blockwise_of(SolveBase)])
 def orthogonal_solve_to_transpose_matmul(fgraph, node):
-    """Replace solve(Q, b) with Q.T @ b when Q is orthogonal."""
+    """Replace solve(Q, b) with Q.conj().T @ b when Q is orthogonal (or unitary)."""
     A, b = node.inputs
 
     if not check_assumption(fgraph, A, ORTHOGONAL):
         return None
 
+    A_inv = A.conj().mT
     b_ndim = node.op.core_op.b_ndim
     if b_ndim == 1:
-        new_out = (A.mT @ b[..., :, None])[..., 0]
+        new_out = (A_inv @ b[..., :, None])[..., 0]
     else:
-        new_out = A.mT @ b
+        new_out = A_inv @ b
 
     old_out = node.outputs[0]
     copy_stack_trace(old_out, new_out)
@@ -469,32 +649,14 @@ def _split_decomp_and_solve_steps(
     if not isinstance(node.op.core_op, Solve):
         return None
 
-    def get_root_A(a: TensorVariable) -> tuple[TensorVariable, bool]:
-        # Find the root variable of the first input to Solve
-        # If `a` is a left expand_dims or matrix transpose (DimShuffle variants),
-        # the root variable is the pre-DimShuffled input.
-        # Otherwise, `a` is considered the root variable.
-        # We also return whether the root `a` is transposed.
-        root_a = a
-        transposed = False
-        match a.owner_op_and_inputs:
-            case (DimShuffle(is_left_expand_dims=True), root_a):  # type: ignore[misc]
-                transposed = False
-            case (DimShuffle(is_left_expanded_matrix_transpose=True), root_a):  # type: ignore[misc]
-                transposed = True  # type: ignore[unreachable, unused-ignore]
-
-        return root_a, transposed
-
     def find_solve_clients(var, assume_a):
         clients = []
-        for cl, idx in fgraph.clients[var]:
-            match (idx, cl.op, *cl.outputs):
-                case (0, Blockwise(Solve(assume_a=assume_a_var)), *_) if (
+        for cl, idx in clients_through_expand_dims(fgraph, var):
+            match (idx, cl.op):
+                case (0, Blockwise(Solve(assume_a=assume_a_var))) if (
                     assume_a_var == assume_a
                 ):
                     clients.append(cl)
-                case (0, DimShuffle(is_left_expand_dims=True), cl_out):
-                    clients.extend(find_solve_clients(cl_out, assume_a))
         return clients
 
     assume_a = node.op.core_op.assume_a
@@ -502,7 +664,7 @@ def _split_decomp_and_solve_steps(
     if assume_a not in allowed_assume_a:
         return None
 
-    A, _ = get_root_A(node.inputs[0])
+    A, _ = strip_left_expand_dims_and_transpose(node.inputs[0])
 
     # Find Solve using A (or left expand_dims of A)
     # TODO: We could handle arbitrary shuffle of the batch dimensions, just need to propagate
@@ -549,7 +711,7 @@ def _split_decomp_and_solve_steps(
             core_solve_op=client.op.core_op,
         )
         [old_x] = client.outputs
-        new_x = atleast_Nd(new_x, n=old_x.type.ndim).astype(old_x.type.dtype)
+        new_x = atleast_Nd(new_x, n=old_x.type.ndim)
         copy_stack_trace(old_x, new_x)
         replacements[old_x] = new_x
 
@@ -588,6 +750,26 @@ def _scan_split_non_sequence_decomposition_and_solve(
                             )
                             non_sequences = {equiv[v] for v in non_sequences}
                             inner_node = equiv[inner_node]
+
+                        # Factor with the most specific decomposition the inner
+                        # graph's assumptions allow, not the one the Solve declares
+                        inner_A, inner_b = inner_node.inputs
+                        known_assume_a = get_assume_a(new_scan_fgraph, inner_A)
+                        if (
+                            assume_a_var == "gen"
+                            and known_assume_a != "gen"
+                            and known_assume_a in allowed_assume_a
+                        ):
+                            core_op = inner_node.op.core_op
+                            upgraded = solve(
+                                inner_A,
+                                inner_b,
+                                assume_a=known_assume_a,
+                                lower=core_op.lower,
+                                b_ndim=core_op.b_ndim,
+                            )
+                            new_scan_fgraph.replace(inner_node.outputs[0], upgraded)
+                            break  # Start over so the upgraded Solve is split
 
                         replace_dict = _split_decomp_and_solve_steps(
                             new_scan_fgraph,

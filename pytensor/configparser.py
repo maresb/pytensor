@@ -101,7 +101,6 @@ class PyTensorConfigParser:
     traceback__limit: int
     traceback__compile_limit: int
     # add_error_and_warning_configvars
-    warn__ignore_bug_before: int
     exception_verbosity: str
     # add_testvalue_and_checking_configvars
     check_input: bool
@@ -138,8 +137,6 @@ class PyTensorConfigParser:
     optdb__max_use_ratio: float
     cycle_detection: str
     check_stack_trace: str
-    # add_metaopt_configvars
-    metaopt__verbose: int
     # add_vm_configvars
     profile: bool
     profile_optimizer: bool
@@ -155,6 +152,7 @@ class PyTensorConfigParser:
     compiledir_format: str
     base_compiledir: Path
     compiledir: Path
+    generated_src_dir: str
     # add_blas_configvars
     blas__ldflags: str
     blas__check_openmp: bool

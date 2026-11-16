@@ -20,14 +20,17 @@ from pytensor.link.numba.dispatch.basic import (
     register_funcify_and_cache_key,
 )
 from pytensor.link.numba.dispatch.compile_ops import numba_deepcopy
+from pytensor.link.numba.dispatch.linalg.decomposition.cholesky import _cholesky
+from pytensor.link.numba.dispatch.linalg.decomposition.eigen import _eigh
+from pytensor.link.numba.dispatch.linalg.decomposition.svd import _svd_gesdd_full
 from pytensor.link.numba.dispatch.vectorize_codegen import (
     NO_INDEXED_INPUTS,
     NO_INDEXED_OUTPUTS,
+    NO_REDUCE_OUTPUTS,
     NO_SIZE,
     _jit_options,
     _vectorized,
     encode_literals,
-    store_core_outputs,
 )
 from pytensor.link.utils import (
     compile_function_src,
@@ -136,7 +139,7 @@ def numba_core_HalfNormalRV(op, node):
 def numba_core_CauchyRV(op, node):
     @numba_basic.numba_njit
     def random(rng, loc, scale):
-        return (loc + rng.standard_cauchy()) / scale
+        return loc + scale * rng.standard_cauchy()
 
     return random
 
@@ -201,24 +204,26 @@ def core_MultinomialRV(op, node):
 def core_MvNormalRV(op, node):
     method = op.method
 
+    # The LAPACK-backed helpers return NaN for a non-finite covariance, where np.linalg raises
     @numba_basic.numba_njit
     def random_fn(rng, mean, cov):
         if method == "cholesky":
-            A = np.linalg.cholesky(cov)
+            A = _cholesky(cov, lower=True)
         elif method == "svd":
-            A, s, _ = np.linalg.svd(cov)
+            A, s, _ = _svd_gesdd_full(cov)
             A *= np.sqrt(s)[None, :]
         else:
-            w, A = np.linalg.eigh(cov)
+            w, A = _eigh(cov, np.int32(0))
             A *= np.sqrt(w)[None, :]
 
         out = rng.normal(size=cov.shape[-1])
         # out argument not working correctly: https://github.com/numba/numba/issues/9924
-        out[:] = np.dot(A, out)
+        # The generator returns float64 noise even for a float32 covariance.
+        out[:] = np.dot(np.asarray(A, dtype=out.dtype), out)
         out += mean
         return out
 
-    return random_fn
+    return random_fn, 2
 
 
 @numba_core_rv_funcify.register(ptr.DirichletRV)
@@ -377,31 +382,27 @@ def core_ChoiceWithoutReplacement(op: ptr.ChoiceWithoutReplacement, node):
             if implicit_arange:
                 return idx
             else:
-                # Numba doesn't support advanced indexing, so we ravel index and reshape
+                # Numba requires one-dimensional advanced indices.
                 return a[idx.ravel()].reshape(core_shape + a.shape[1:])
 
     else:
 
         @numba_basic.numba_njit
         def random_fn(rng, a, core_shape):
-            # Until Numba supports generator.choice we use a poor implementation
-            # that permutates the whole arange array and takes the first `size` elements
-            # This is widely inefficient when size << a.shape[0]
-            size = np.prod(core_shape)
-            core_shape = numba_ndarray.to_fixed_tuple(core_shape, core_shape_len)
-            idx = rng.permutation(size)[:size]
-
-            # Numba doesn't support advanced indexing so index on the flat dimension and reshape
-            # idx = idx.reshape(core_shape)
-            # if implicit_arange:
-            #     return idx
-            # else:
-            #     return a[idx]
+            n_draws = np.prod(core_shape)
+            sample_shape = numba_ndarray.to_fixed_tuple(core_shape, core_shape_len)
+            if implicit_arange:
+                pop_size = a
+            else:
+                pop_size = a.shape[0]
+            flat_idx = rng.permutation(pop_size)[:n_draws]
 
             if implicit_arange:
-                return idx.reshape(core_shape)
+                return flat_idx.reshape(sample_shape)
             else:
-                return a[idx].reshape(core_shape + a.shape[1:])
+                return a[flat_idx].reshape(sample_shape + a.shape[1:])
+
+        return random_fn, 1
 
     return random_fn
 
@@ -449,8 +450,8 @@ def numba_funcify_RandomVariable(op: RandomVariableWithCoreShape, node, **kwargs
     core_shape_len = get_vector_length(core_shape)
     inplace = rv_op.inplace
 
-    nin = 1 + len(dist_params)  # rng + params
-    core_op_fn = store_core_outputs(core_rv_fn, nin=nin, nout=1)
+    core_op_fn = core_rv_fn
+    core_handles_out = getattr(core_op_fn, "handles_out", False)
 
     batch_ndim = rv_op.batch_ndim(rv_node)
 
@@ -469,7 +470,7 @@ def numba_funcify_RandomVariable(op: RandomVariableWithCoreShape, node, **kwargs
             "Numba implementation of RandomVariable cannot be evaluated in Python (non-JIT) mode"
         )
 
-    @overload(random, jit_options=_jit_options)
+    @overload(random, jit_options=_jit_options())
     def ov_random(core_shape, rng, size, *dist_params):
         def impl(core_shape, rng, size, *dist_params):
             if not inplace:
@@ -490,6 +491,8 @@ def numba_funcify_RandomVariable(op: RandomVariableWithCoreShape, node, **kwargs
                 else numba_ndarray.to_fixed_tuple(size, size_len),
                 NO_INDEXED_INPUTS,
                 NO_INDEXED_OUTPUTS,
+                NO_REDUCE_OUTPUTS,
+                core_handles_out,
             )
             return rng, draws
 
@@ -499,9 +502,11 @@ def numba_funcify_RandomVariable(op: RandomVariableWithCoreShape, node, **kwargs
         # If the core RV can't be cached, then the whole RV can't be cached
         random_rv_key = None
     else:
+        random_rv_cache_version = 1
         random_rv_key_contents = (
             type(op),
             type(rv_op),
+            random_rv_cache_version,
             tuple(rv_op._props_dict().items()),  # type: ignore[attr-defined]
             size_len,
             core_shape_len,

@@ -375,6 +375,51 @@ def overload_sparse_copy(matrix):
     return copy
 
 
+@overload_attribute(CSMatrixType, "has_canonical_format")
+def overload_sparse_has_canonical_format(matrix):
+    def has_canonical_format(matrix):
+        indices = matrix.indices.view(np.uint32)
+        indptr = matrix.indptr.view(np.uint32)
+        for major in range(len(indptr) - 1):
+            start = indptr[major]
+            end = indptr[major + 1]
+            for ptr in range(start + np.uint64(1), end):
+                if indices[ptr - np.uint64(1)] >= indices[ptr]:
+                    return False
+        return True
+
+    return has_canonical_format
+
+
+@overload_method(CSMatrixType, "sort_indices")
+def overload_sparse_sort_indices(matrix):
+    def sort_indices(matrix):
+        data = matrix.data
+        indices = matrix.indices.view(np.uint32)
+        indptr = matrix.indptr.view(np.uint32)
+        for major in range(len(indptr) - 1):
+            start, end = indptr[major], indptr[major + 1]
+            # Despite branching, checking first is faster than always calling argsort.
+            for ptr in range(start + 1, end):
+                if indices[ptr - 1] > indices[ptr]:
+                    order = np.argsort(indices[start:end])
+                    data[start:end] = data[start:end][order]
+                    indices[start:end] = indices[start:end][order]
+                    break
+
+    return sort_indices
+
+
+@overload_method(CSMatrixType, "sorted_indices")
+def overload_sparse_sorted_indices(matrix):
+    def sorted_indices(matrix):
+        result = matrix.copy()
+        result.sort_indices()
+        return result
+
+    return sorted_indices
+
+
 @overload_method(CSMatrixType, "astype")
 def overload_sparse_astype(matrix, dtype):
     match matrix:
@@ -551,6 +596,8 @@ def overload_sum(matrix, axis):
 
         return sum_scalar
 
+    out_type = np.dtype(str(matrix.data.dtype)).type
+
     match matrix:
         case CSRMatrixType():
 
@@ -567,9 +614,12 @@ def overload_sum(matrix, axis):
                         col_sums[indices[i]] += data[i]
                     return col_sums
                 else:
-                    row_sums = np.zeros(n_row, dtype=data.dtype)
+                    row_sums = np.empty(n_row, dtype=data.dtype)
                     for i in range(n_row):
-                        row_sums[i] = np.sum(data[indptr[i] : indptr[i + 1]])
+                        acc = out_type(0)
+                        for k in range(indptr[i], indptr[i + 1]):
+                            acc += data[k]
+                        row_sums[i] = acc
                     return row_sums
 
             return sum_csr
@@ -583,9 +633,12 @@ def overload_sum(matrix, axis):
                 n_col = matrix.shape[1]
 
                 if axis == 0:
-                    col_sums = np.zeros(n_col, dtype=data.dtype)
+                    col_sums = np.empty(n_col, dtype=data.dtype)
                     for j in range(n_col):
-                        col_sums[j] = np.sum(data[indptr[j] : indptr[j + 1]])
+                        acc = out_type(0)
+                        for k in range(indptr[j], indptr[j + 1]):
+                            acc += data[k]
+                        col_sums[j] = acc
                     return col_sums
                 else:
                     row_sums = np.zeros(n_row, dtype=data.dtype)

@@ -37,13 +37,13 @@ def register_shape_c_code(type, code, version=()):
 
     Parameters
     ----------
-    typ : PyTensor type
+    type : type[Type]
         It must be the PyTensor class itself and not an instance of the class.
-    code : C code
-        Returns a vector representing the shape for the PyTensor type 'typ'.
+    code : str
+        Returns a vector representing the shape for the PyTensor type 'type'.
         Use %(iname)s and %(oname)s for the input and output C variable names
         respectively.
-    version
+    version : int, optional
         A number indicating the version of the code, for cache.
 
     """
@@ -353,13 +353,15 @@ def register_shape_i_c_code(typ, code, check_input, version=()):
 
     Parameters
     ----------
-    typ : PyTensor type
+    typ : type[Type]
         It must be the PyTensor class itself and not an instance of the class.
-    code : C code
+    code : str
         Gets the shape of dimensions %(i)s for the PyTensor type 'typ'.
         Use %(iname)s and %(oname)s for the input and output C variable names
         respectively.
-    version
+    check_input : str
+        C input validation code, using the same substitution keys as `code`.
+    version : int, optional
         A number indicating the version of the code, for cache.
 
     """
@@ -984,7 +986,7 @@ def specify_broadcastable(x, *axes):
     ----------
     x : tensor_like
         Input pytensor tensor.
-    axis : an int or an iterable object such as list or tuple of int values
+    axes : an int or an iterable object such as list or tuple of int values
         The dimension along which the tensor x should be broadcastable.
         If the length of x along these dimensions is not 1, a ValueError will
         be raised.

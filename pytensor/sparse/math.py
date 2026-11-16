@@ -376,7 +376,7 @@ def sp_sum(x, axis=None, sparse_grad=False):
     return SpSum(axis, sparse_grad)(x)
 
 
-class AddSS(Op):
+class AddSparseSparse(Op):
     # add(sparse, sparse).
     # see the doc of add() for more detail.
     __props__ = ()
@@ -410,10 +410,10 @@ class AddSS(Op):
         return [shapes[0]]
 
 
-add_s_s = AddSS()
+add_s_s = AddSparseSparse()
 
 
-class AddSSData(Op):
+class AddSparseSparseData(Op):
     """Add two sparse matrices assuming they have the same sparsity pattern.
 
     Notes
@@ -471,10 +471,10 @@ class AddSSData(Op):
         return [ins_shapes[0]]
 
 
-add_s_s_data = AddSSData()
+add_s_s_data = AddSparseSparseData()
 
 
-class AddSD(Op):
+class AddSparseDense(Op):
     # add(sparse, sparse).
     # see the doc of add() for more detail.
     __props__ = ()
@@ -513,10 +513,10 @@ class AddSD(Op):
         return [shapes[1]]
 
 
-add_s_d = AddSD()
+add_s_d = AddSparseDense()
 
 
-class StructuredAddSV(Op):
+class StructuredAddSparseDenseVector(Op):
     """Structured addition of a sparse matrix and a dense vector.
 
     The elements of the vector are only added to the corresponding
@@ -573,7 +573,7 @@ class StructuredAddSV(Op):
         return [ins_shapes[0]]
 
 
-structured_add_s_v = StructuredAddSV()
+structured_add_s_v = StructuredAddSparseDenseVector()
 
 
 def add(x, y):
@@ -668,7 +668,7 @@ def sub(x, y):
 sub.__doc__ = subtract.__doc__
 
 
-class SparseSparseMultiply(Op):
+class MultiplySparseSparse(Op):
     # mul(sparse, sparse)
     # See the doc of mul() for more detail
     __props__ = ()
@@ -703,10 +703,10 @@ class SparseSparseMultiply(Op):
         return [shapes[0]]
 
 
-mul_s_s = SparseSparseMultiply()
+mul_s_s = MultiplySparseSparse()
 
 
-class SparseDenseMultiply(Op):
+class MultiplySparseDense(Op):
     # mul(sparse, dense)
     # See the doc of mul() for more detail
     __props__ = ()
@@ -786,16 +786,23 @@ class SparseDenseMultiply(Op):
         (gz,) = gout
         assert psb._is_sparse_variable(x) and psb._is_dense_variable(y)
         assert psb._is_sparse_variable(gz)
-        return y * gz, psb.dense_from_sparse(x * gz)
+        if y.type.ndim == 0:
+            # y was broadcast against every entry of x, so its gradient is the
+            # sum of the contributions of all entries. Reduce on the sparse
+            # product directly instead of densifying it first.
+            gy = sp_sum(x * gz, sparse_grad=True)
+        else:
+            gy = psb.dense_from_sparse(x * gz)
+        return y * gz, gy
 
     def infer_shape(self, node, shapes):
         return [shapes[0]]
 
 
-mul_s_d = SparseDenseMultiply()
+mul_s_d = MultiplySparseDense()
 
 
-class SparseDenseVectorMultiply(Op):
+class MultiplySparseDenseVector(Op):
     """Element-wise multiplication of sparse matrix by a broadcasted dense vector element wise.
 
     Notes
@@ -804,7 +811,7 @@ class SparseDenseVectorMultiply(Op):
 
     """
 
-    # TODO: Merge with the SparseDenseMultiply Op
+    # TODO: Merge with the MultiplySparseDense Op
 
     __props__ = ()
 
@@ -875,7 +882,7 @@ class SparseDenseVectorMultiply(Op):
         return [ins_shapes[0]]
 
 
-mul_s_v = SparseDenseVectorMultiply()
+mul_s_v = MultiplySparseDenseVector()
 
 
 def multiply(x, y):
@@ -943,7 +950,7 @@ def mul(x, y):
 mul.__doc__ = multiply.__doc__
 
 
-class __ComparisonOpSS(Op):
+class __ComparisonOpSparseSparse(Op):
     """
     Used as a superclass for all comparisons between two sparses matrices.
 
@@ -993,7 +1000,7 @@ class __ComparisonOpSS(Op):
         return [ins_shapes[0]]
 
 
-class __ComparisonOpSD(Op):
+class __ComparisonOpSparseDense(Op):
     """
     Used as a superclass for all comparisons between sparse and dense matrix.
 
@@ -1089,100 +1096,100 @@ def __ComparisonSwitch(SS, SD, DS):
     return helper
 
 
-class EqualSS(__ComparisonOpSS):
+class EqualSparseSparse(__ComparisonOpSparseSparse):
     def comparison(self, x, y):
         return x == y
 
 
-equal_s_s = EqualSS()
+equal_s_s = EqualSparseSparse()
 
 
-class EqualSD(__ComparisonOpSD):
+class EqualSparseDense(__ComparisonOpSparseDense):
     def comparison(self, x, y):
         return x == y
 
 
-equal_s_d = EqualSD()
+equal_s_d = EqualSparseDense()
 
 
-class NotEqualSS(__ComparisonOpSS):
+class NotEqualSparseSparse(__ComparisonOpSparseSparse):
     def comparison(self, x, y):
         return x != y
 
 
-not_equal_s_s = NotEqualSS()
+not_equal_s_s = NotEqualSparseSparse()
 
 
-class NotEqualSD(__ComparisonOpSD):
+class NotEqualSparseDense(__ComparisonOpSparseDense):
     def comparison(self, x, y):
         return x != y
 
 
-not_equal_s_d = NotEqualSD()
+not_equal_s_d = NotEqualSparseDense()
 
 
-class LessThanSS(__ComparisonOpSS):
+class LessThanSparseSparse(__ComparisonOpSparseSparse):
     def comparison(self, x, y):
         return x < y
 
 
-less_than_s_s = LessThanSS()
+less_than_s_s = LessThanSparseSparse()
 
 
-class LessThanSD(__ComparisonOpSD):
+class LessThanSparseDense(__ComparisonOpSparseDense):
     def comparison(self, x, y):
         return x < y
 
 
-less_than_s_d = LessThanSD()
+less_than_s_d = LessThanSparseDense()
 
 
-class GreaterThanSS(__ComparisonOpSS):
+class GreaterThanSparseSparse(__ComparisonOpSparseSparse):
     def comparison(self, x, y):
         return x > y
 
 
-greater_than_s_s = GreaterThanSS()
+greater_than_s_s = GreaterThanSparseSparse()
 
 
-class GreaterThanSD(__ComparisonOpSD):
+class GreaterThanSparseDense(__ComparisonOpSparseDense):
     def comparison(self, x, y):
         return x > y
 
 
-greater_than_s_d = GreaterThanSD()
+greater_than_s_d = GreaterThanSparseDense()
 
 
-class LessEqualSS(__ComparisonOpSS):
+class LessEqualSparseSparse(__ComparisonOpSparseSparse):
     def comparison(self, x, y):
         return x <= y
 
 
-less_equal_s_s = LessEqualSS()
+less_equal_s_s = LessEqualSparseSparse()
 
 
-class LessEqualSD(__ComparisonOpSD):
+class LessEqualSparseDense(__ComparisonOpSparseDense):
     def comparison(self, x, y):
         return x <= y
 
 
-less_equal_s_d = LessEqualSD()
+less_equal_s_d = LessEqualSparseDense()
 
 
-class GreaterEqualSS(__ComparisonOpSS):
+class GreaterEqualSparseSparse(__ComparisonOpSparseSparse):
     def comparison(self, x, y):
         return x >= y
 
 
-greater_equal_s_s = GreaterEqualSS()
+greater_equal_s_s = GreaterEqualSparseSparse()
 
 
-class GreaterEqualSD(__ComparisonOpSD):
+class GreaterEqualSparseDense(__ComparisonOpSparseDense):
     def comparison(self, x, y):
         return x >= y
 
 
-greater_equal_s_d = GreaterEqualSD()
+greater_equal_s_d = GreaterEqualSparseDense()
 
 eq = __ComparisonSwitch(equal_s_s, equal_s_d, equal_s_d)
 
@@ -1422,21 +1429,21 @@ _structured_dot = StructuredDot()
 def structured_dot(x, y):
     """
     Structured Dot is like dot, except that only the gradient wrt non-zero elements of the sparse matrix
-    `a` are calculated and propagated.
+    `x` are calculated and propagated.
 
     The output is presumed to be a dense matrix, and is represented by a TensorType instance.
 
     Parameters
     ----------
-    a
+    x
         A sparse matrix.
-    b
+    y
         A sparse or dense matrix.
 
     Returns
     -------
     A sparse matrix
-        The dot product of `a` and `b`.
+        The dot product of `x` and `y`.
 
     Notes
     -----
@@ -1925,19 +1932,46 @@ class Dot(Op):
         out[0] = np.asarray(rval, dtype=node.outputs[0].dtype)
 
     def pullback(self, inputs, outputs, gout):
+        """Compute the gradient of ``x @ y`` with respect to `x` and `y`.
+
+        `x` and `y` may be 2d, or 1d if dense (a sparse operand is always
+        2d, so at most one of the two can be 1d here). A 1d operand is
+        promoted to a 2d row/column so the matrix-product formulas below
+        apply, `gz` is promoted the same way, and the added axis is
+        squeezed back out of the corresponding gradient term before it is
+        returned. Mirrors the promotion `dense_dot` does for the dense
+        `Dot` `Op`.
+        """
         (x, y) = inputs
         (gz,) = gout
         assert psb._is_sparse_variable(x) or psb._is_sparse_variable(y)
+
+        x_is_vector = x.type.ndim == 1
+        y_is_vector = y.type.ndim == 1
+        x2 = x[None] if x_is_vector else x
+        y2 = y[:, None] if y_is_vector else y
+        if x_is_vector:
+            gz2 = gz[None]
+        elif y_is_vector:
+            gz2 = gz[:, None]
+        else:
+            gz2 = gz
+
         rval = []
 
-        if psb._is_dense_variable(y):
-            rval.append(ptm.dot(gz, y.T))
+        if psb._is_dense_variable(y2):
+            rval.append(ptm.dot(gz2, y2.T))
         else:
-            rval.append(dot(gz, y.T))
-        if psb._is_dense_variable(x):
-            rval.append(ptm.dot(x.T, gz))
+            rval.append(dot(gz2, y2.T))
+        if psb._is_dense_variable(x2):
+            rval.append(ptm.dot(x2.T, gz2))
         else:
-            rval.append(dot(x.T, gz))
+            rval.append(dot(x2.T, gz2))
+
+        if x_is_vector:
+            rval[0] = rval[0].squeeze(0)
+        if y_is_vector:
+            rval[1] = rval[1].squeeze(-1)
 
         return rval
 
@@ -2113,5 +2147,5 @@ def _vectorize_sparse_unsupported(op, node, *batched_inputs):
     )
 
 
-for _op_cls in (AddSD, SparseDenseMultiply):
+for _op_cls in (AddSparseDense, MultiplySparseDense):
     _vectorize_node.register(_op_cls)(_vectorize_sparse_unsupported)

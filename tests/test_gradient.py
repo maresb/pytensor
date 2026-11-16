@@ -570,7 +570,7 @@ class TestGrad:
         # get upcasted to float64.
         # x has dtype float32, regardless of the value of floatX
         x = fscalar("x")
-        y = x * 2
+        y = x * np.float32(2)
         z = lscalar("z")
 
         c = y + z
@@ -1191,3 +1191,10 @@ def test_scalar_pullback():
     dout_dxtm1 = pullback(xt, wrt=xtm1, cotangents=dout_dxt)
     assert dout_dxtm1.type == dout_dxt.type
     assert dout_dxtm1.eval({xtm1: 3.0, dout_dxt: 1.5}) == 2 * 3.0 * 1.5
+
+
+def test_disconnected_type_filter_variable_raises():
+    # Regression: the override was misspelled (fiter_variable), so the base
+    # Type.filter_variable was used and assignment silently went unguarded.
+    with pytest.raises(AssertionError, match="DisconnectedType"):
+        DisconnectedType().filter_variable(vector("x"))

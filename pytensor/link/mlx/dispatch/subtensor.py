@@ -3,21 +3,32 @@ from copy import deepcopy
 from pytensor.link.mlx.dispatch.basic import mlx_funcify
 from pytensor.tensor.subtensor import (
     AdvancedIncSubtensor,
-    AdvancedIncSubtensor1,
     AdvancedSubtensor,
-    AdvancedSubtensor1,
     IncSubtensor,
     Subtensor,
     indices_from_subtensor,
 )
 
 
+def _with_int_slice_bounds(indices):
+    # Slice bounds arrive as 0-d arrays, which MLX slices reject.
+    return tuple(
+        slice(
+            *(
+                None if bound is None else int(bound)
+                for bound in (index.start, index.stop, index.step)
+            )
+        )
+        if isinstance(index, slice)
+        else index
+        for index in indices
+    )
+
+
 @mlx_funcify.register(Subtensor)
 def mlx_funcify_Subtensor(op, node, **kwargs):
     def subtensor(x, *ilists):
-        indices = indices_from_subtensor(
-            [int(element) for element in ilists], op.idx_list
-        )
+        indices = _with_int_slice_bounds(indices_from_subtensor(ilists, op.idx_list))
         if len(indices) == 1:
             indices = indices[0]
 
@@ -27,10 +38,9 @@ def mlx_funcify_Subtensor(op, node, **kwargs):
 
 
 @mlx_funcify.register(AdvancedSubtensor)
-@mlx_funcify.register(AdvancedSubtensor1)
 def mlx_funcify_AdvancedSubtensor(op, node, **kwargs):
     def advanced_subtensor(x, *ilists):
-        indices = indices_from_subtensor(ilists, op.idx_list)
+        indices = _with_int_slice_bounds(indices_from_subtensor(ilists, op.idx_list))
         if len(indices) == 1:
             indices = indices[0]
 
@@ -58,9 +68,7 @@ def mlx_funcify_IncSubtensor(op, node, **kwargs):
             return x
 
     def incsubtensor(x, y, *ilist, mlx_fn=mlx_fn, idx_list=op.idx_list):
-        # Coerce integer index inputs to Python ints (e.g. slice bounds), as
-        # MLX slices reject array-typed bounds. Mirrors mlx_funcify_Subtensor.
-        indices = indices_from_subtensor([int(element) for element in ilist], idx_list)
+        indices = _with_int_slice_bounds(indices_from_subtensor(ilist, idx_list))
         if len(indices) == 1:
             indices = indices[0]
 
@@ -70,7 +78,6 @@ def mlx_funcify_IncSubtensor(op, node, **kwargs):
 
 
 @mlx_funcify.register(AdvancedIncSubtensor)
-@mlx_funcify.register(AdvancedIncSubtensor1)
 def mlx_funcify_AdvancedIncSubtensor(op, node, **kwargs):
     if op.set_instead_of_inc:
 
@@ -95,15 +102,17 @@ def mlx_funcify_AdvancedIncSubtensor(op, node, **kwargs):
         # functional scatter-add, mirroring JAX's `x.at[indices].add(y)`.
         # Plain `x[indices] += y` writes each destination once, dropping
         # repeated-index contributions (e.g. gradients of embedding lookups).
-        # `AdvancedIncSubtensor1` has no `ignore_duplicates` flag and always
-        # accumulates, like its `np.add.at`-based `perform`.
+        # This is the `ignore_duplicates=False` branch of `AdvancedIncSubtensor`,
+        # which accumulates like its `np.add.at`-based `perform`.
         def mlx_fn(x, indices, y):
             return x.at[indices].add(y)
 
-    def advancedincsubtensor(x, y, *ilist, mlx_fn=mlx_fn):
-        if isinstance(op, AdvancedIncSubtensor1):
-            op._check_runtime_broadcasting(node, x, y, ilist[0])
+    def advancedincsubtensor(x, y, *ilist, mlx_fn=mlx_fn, idx_list=op.idx_list):
+        op._check_runtime_broadcast_of_vector_index(node, x, y, ilist[0])
 
-        return mlx_fn(x, ilist, y)
+        # mirrors AdvancedIncSubtensor.perform
+        indices = _with_int_slice_bounds(indices_from_subtensor(ilist, idx_list))
+
+        return mlx_fn(x, indices, y)
 
     return advancedincsubtensor

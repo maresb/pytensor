@@ -1,9 +1,13 @@
+from functools import partial
+
 import numpy as np
 import pytest
+from scipy.special import expit
 
-from pytensor import config
+from pytensor import config, function
 from pytensor.tensor.basic import switch
 from pytensor.tensor.math import (
+    ProdWithoutZeros,
     add,
     cos,
     eq,
@@ -33,8 +37,8 @@ from pytensor.tensor.math import max as pt_max
 from pytensor.tensor.math import min as pt_min
 from pytensor.tensor.math import sum as pt_sum
 from pytensor.tensor.special import log_softmax, softmax
-from pytensor.tensor.type import matrix, tensor, vector, vectors
-from tests.link.mlx.test_basic import compare_mlx_and_py
+from pytensor.tensor.type import matrix, scalar, tensor, vector, vectors
+from tests.link.mlx.test_basic import compare_mlx_and_py, mlx_mode
 
 
 mx = pytest.importorskip("mlx.core")
@@ -75,6 +79,13 @@ def test_mlx_CAReduce():
     x = pt_all(a_pt)
 
     compare_mlx_and_py([a_pt], [x], [np.c_[[1, 2, 3], [1, 2, 3]].astype(config.floatX)])
+
+
+def test_prod_without_zeros():
+    x = matrix("x")
+    outs = [ProdWithoutZeros(axis=None)(x), ProdWithoutZeros(axis=(1,))(x)]
+    x_test = np.array([[-1, 0, 3], [2, 4, 5], [0, 0, 0]], dtype=config.floatX)
+    compare_mlx_and_py([x], outs, [x_test])
 
 
 @pytest.mark.parametrize("axis", [None, 0, 1])
@@ -217,8 +228,6 @@ def test_erfc() -> None:
 
 def test_erfc_extreme_values() -> None:
     """Test erfc with extreme values"""
-    from functools import partial
-
     x = vector("x")
     out = erfc(x)
 
@@ -239,7 +248,10 @@ def test_erfcx() -> None:
     # Test with positive values where erfcx is most numerically stable
     x_test = mx.array([0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
 
-    compare_mlx_and_py([x], out, [x_test])
+    # MLX's erfcx sits close to the default 1e-4 tolerance; relax for headroom.
+    relaxed_assert = partial(np.testing.assert_allclose, rtol=1e-3)
+
+    compare_mlx_and_py([x], out, [x_test], assert_fn=relaxed_assert)
 
 
 def test_erfcx_small_values() -> None:
@@ -263,21 +275,40 @@ def test_softplus() -> None:
 
     compare_mlx_and_py([x], out, [x_test])
 
+    x = vector("x", dtype="uint8")
+    out = [softplus(x), sigmoid(x)]
+    compare_mlx_and_py([x], out, [np.array([0, 20, 255], dtype="uint8")])
+
 
 def test_softplus_extreme_values() -> None:
-    """Test softplus with extreme values to verify numerical stability"""
-    from functools import partial
-
+    """Test softplus and sigmoid with extreme values to verify numerical stability"""
     x = vector("x")
-    out = softplus(x)
+    out = [softplus(x), sigmoid(x)]
 
-    # Test with extreme values where different branches of the implementation are used
-    x_test = mx.array([-40.0, -50.0, 20.0, 30.0, 35.0, 50.0])
+    x_test = mx.array([-1e3, -40.0, -50.0, 20.0, 30.0, 35.0, 50.0, 1e3])
 
     # Use relaxed tolerance for extreme values due to numerical precision differences
     relaxed_assert = partial(np.testing.assert_allclose, rtol=1e-4, atol=1e-8)
 
     compare_mlx_and_py([x], out, [x_test], assert_fn=relaxed_assert)
+
+
+@pytest.mark.parametrize("op", [sigmoid, softplus])
+def test_sigmoid_softplus_mlx_autodiff(op):
+    # MLX autodiff of the lowered formulas, as with an MLX gradient backend
+    x = scalar("x", dtype="float32")
+    mlx_fn = function([x], op(x), mode=mlx_mode).vm.jit_fn
+    d1 = mx.grad(lambda v: mlx_fn(v)[0])
+    d2 = mx.grad(d1)
+    x_test = np.array([0.0, -0.0, 20.0, -20.0, 80.0, -80.0])
+    s, sm = expit(x_test), expit(-x_test)
+    expected = [s, s * sm] if op is softplus else [s * sm, s * sm * (sm - s)]
+    for d, expected_d in zip((d1, d2), expected):
+        np.testing.assert_allclose(
+            [d(mx.array(v, dtype=mx.float32)).item() for v in x_test],
+            expected_d,
+            rtol=1e-5,
+        )
 
 
 @pytest.mark.parametrize("op", [add, mul], ids=["add", "mul"])

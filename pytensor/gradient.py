@@ -139,7 +139,7 @@ class DisconnectedType(Type):
             " a symbolic placeholder."
         )
 
-    def fiter_variable(self, other):
+    def filter_variable(self, other):
         raise AssertionError(
             "If you're assigning to a DisconnectedType you're"
             " doing something wrong. It should only be used as"
@@ -1335,8 +1335,8 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
                     raise ValueError(
                         f"{node.op} returned the wrong number of gradient terms."
                     )
-            # We can not enforce this, as AdvancedSubtensor1 has an option to
-            # return the sparse grad for optimization reason.
+            # We can not enforce this, as sparse Ops have an option to return a
+            # structured grad for optimization reason.
 
             #            for ig, i in zip(input_grads, inputs):
             #                if (not isinstance(ig.type, (DisconnectedType, NullType)) and

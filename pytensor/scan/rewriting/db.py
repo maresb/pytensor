@@ -15,6 +15,7 @@ from pytensor.graph.rewriting.basic import (
 )
 from pytensor.graph.rewriting.db import EquilibriumDB, SequenceDB
 from pytensor.scan.op import Scan
+from pytensor.scan.rewriting.constant_folding import scan_constant_folding
 from pytensor.scan.rewriting.inner_graph import rewrite_scan_inner_graph
 from pytensor.scan.rewriting.inplace import ScanInplaceOptimizer
 from pytensor.scan.rewriting.io import (
@@ -181,6 +182,20 @@ scan_eqopt2.register(
     dfs_rewriter(constant_folding, ignore_newtrees=True),
     "fast_run",
     "scan",
+    "constant_folding",
+    "topo_constant_folding",
+)
+
+
+optdb.register(
+    "scan_constant_folding",
+    dfs_rewriter(scan_constant_folding, ignore_newtrees=True),
+    "fast_run",
+    "fast_compile",
+    "scan",
+    "constant_folding",
+    "topo_constant_folding",
+    position=2.9,
 )
 
 
@@ -250,6 +265,8 @@ scan_eqopt2.register(
 # Runs after the inplace passes (notably ``scan_make_inplace`` at 50.5): a tap may
 # only be destroyed in place when the outer Scan owns its buffer, so the inner graph
 # can only be baked correctly once the outer destroy/view permissions are final.
+# Runs before the backend lowerings at 100, which can hide a ``Scan`` inside a
+# backend-specific ``Blockwise``.
 @graph_rewriter
 def scan_inner_graph(fgraph):
     rewrite_inner_graph(
@@ -262,5 +279,5 @@ optdb.register(
     scan_inner_graph,
     "minimum_compile",
     "compile_inner_graph",
-    position=100,
+    position=99.9,
 )

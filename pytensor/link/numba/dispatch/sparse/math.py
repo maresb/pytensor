@@ -10,11 +10,17 @@ from pytensor.link.numba.dispatch.basic import (
     register_funcify_and_cache_key,
     register_funcify_default_op_cache_key,
 )
+from pytensor.link.numba.dispatch.sparse.basic import make_sum_duplicates
 from pytensor.sparse import (
+    AddSparseDense,
+    AddSparseSparse,
+    AddSparseSparseData,
     Dot,
-    SparseDenseMultiply,
-    SparseDenseVectorMultiply,
+    MultiplySparseDense,
+    MultiplySparseDenseVector,
+    MultiplySparseSparse,
     SpSum,
+    StructuredAddSparseDenseVector,
     StructuredDot,
     StructuredDotGradCSC,
     StructuredDotGradCSR,
@@ -24,23 +30,25 @@ from pytensor.sparse import (
 @register_funcify_default_op_cache_key(SpSum)
 def numba_funcify_SpSum(op, node, **kwargs):
     axis = op.axis
+    cache_version = 2
 
     @numba_basic.numba_njit
     def perform(x):
         return x.sum(axis)
 
-    return perform
+    return perform, cache_version
 
 
-@register_funcify_default_op_cache_key(SparseDenseMultiply)
-@register_funcify_default_op_cache_key(SparseDenseVectorMultiply)
-def numba_funcify_SparseDenseMultiply(op, node, **kwargs):
+@register_funcify_default_op_cache_key(MultiplySparseDense)
+@register_funcify_default_op_cache_key(MultiplySparseDenseVector)
+def numba_funcify_MultiplySparseDense(op, node, **kwargs):
     x, y = node.inputs
     [z] = node.outputs
     out_dtype = z.type.dtype
-    format = z.type.format
+    out_format = z.type.format
     same_dtype = x.type.dtype == out_dtype
 
+    cache_version = 2
     if y.ndim == 0:
 
         @numba_basic.numba_njit
@@ -55,7 +63,7 @@ def numba_funcify_SparseDenseMultiply(op, node, **kwargs):
             z_data *= y
             return z
 
-        return sparse_multiply_scalar
+        return sparse_multiply_scalar, cache_version
 
     elif y.ndim == 1:
 
@@ -68,10 +76,10 @@ def numba_funcify_SparseDenseMultiply(op, node, **kwargs):
                 z = x.astype(out_dtype)
 
             M, N = x.shape
-            indices = x.indices
-            indptr = x.indptr
+            indices = x.indices.view(np.uint32)
+            indptr = x.indptr.view(np.uint32)
             z_data = z.data
-            if format == "csc":
+            if out_format == "csc":
                 for j in range(0, N):
                     for i_idx in range(indptr[j], indptr[j + 1]):
                         z_data[i_idx] *= y[j]
@@ -85,7 +93,7 @@ def numba_funcify_SparseDenseMultiply(op, node, **kwargs):
 
             return z
 
-        return sparse_dense_multiply
+        return sparse_dense_multiply, cache_version
 
     else:  # y.ndim == 2
 
@@ -98,10 +106,10 @@ def numba_funcify_SparseDenseMultiply(op, node, **kwargs):
                 z = x.astype(out_dtype)
 
             M, N = x.shape
-            indices = x.indices
-            indptr = x.indptr
+            indices = x.indices.view(np.uint32)
+            indptr = x.indptr.view(np.uint32)
             z_data = z.data
-            if format == "csc":
+            if out_format == "csc":
                 for j in range(0, N):
                     for i_idx in range(indptr[j], indptr[j + 1]):
                         i = indices[i_idx]
@@ -116,7 +124,7 @@ def numba_funcify_SparseDenseMultiply(op, node, **kwargs):
 
             return z
 
-        return sparse_dense_multiply
+        return sparse_dense_multiply, cache_version
 
 
 @register_funcify_and_cache_key(Dot)
@@ -138,7 +146,7 @@ def numba_funcify_SparseDot(op, node, **kwargs):
 
     out_type = np.dtype(out_dtype).type
 
-    cache_version = 3
+    cache_version = 5
     cache_key = sha256(
         str(
             (
@@ -153,6 +161,47 @@ def numba_funcify_SparseDot(op, node, **kwargs):
         ).encode()
     ).hexdigest()
 
+    if x_is_sparse and y_is_sparse and not z_is_sparse:
+
+        @numba_basic.numba_njit
+        def spmspm_dense(x, y):
+            # It accumulates directly into the dense output matrix, which is more efficient than
+            # constructing the corresponding sparse matrix and then converting it to dense.
+            assert x.shape[1] == y.shape[0]
+            n_row = np.uint32(x.shape[0])
+            n_col = np.uint32(y.shape[1])
+            if x_format != y_format:
+                if x_format == "csr":
+                    y = y.tocsr()
+                else:
+                    y = y.tocsc()
+
+            out = np.zeros((n_row, n_col), dtype=out_dtype)
+            x_ind = x.indices.view(np.uint32)
+            x_ptr = x.indptr.view(np.uint32)
+            y_ind = y.indices.view(np.uint32)
+            y_ptr = y.indptr.view(np.uint32)
+            x_data = x.data
+            y_data = y.data
+
+            if x_format == "csr":
+                for row in range(n_row):
+                    for x_pos in range(x_ptr[row], x_ptr[row + 1]):
+                        inner = x_ind[x_pos]
+                        value = out_type(x_data[x_pos])
+                        for y_pos in range(y_ptr[inner], y_ptr[inner + 1]):
+                            out[row, y_ind[y_pos]] += value * out_type(y_data[y_pos])
+            else:
+                for col in range(n_col):
+                    for y_pos in range(y_ptr[col], y_ptr[col + 1]):
+                        inner = y_ind[y_pos]
+                        value = out_type(y_data[y_pos])
+                        for x_pos in range(x_ptr[inner], x_ptr[inner + 1]):
+                            out[x_ind[x_pos], col] += out_type(x_data[x_pos]) * value
+            return out
+
+        return spmspm_dense, cache_key
+
     if x_is_sparse and y_is_sparse:
         # General spmspm algorithm in CSR format
         @numba_basic.numba_njit
@@ -165,17 +214,24 @@ def numba_funcify_SparseDot(op, node, **kwargs):
             x_data = x.data
             y_data = y.data
 
-            output_nnz = 0
-            mask = np.full(n_col, -1, dtype=np.int32)
+            # Sparse indices are int32, so the top two uint32 values are free sentinels.
+            not_visited = np.uint32(2**32 - 1)
+            end_of_list = np.uint32(2**32 - 2)
+
+            # Unsigned increments prevent signed promotion in index arithmetic.
+            output_nnz = np.uint64(0)
+
+            # Reuse the next-index buffer as row markers during the counting pass.
+            next_index = np.full(n_col, not_visited, dtype=np.uint32)
             for i in range(n_row):
-                row_nnz = 0
+                row_nnz = np.uint64(0)
                 for jj in range(x_ptr[i], x_ptr[i + 1]):
                     j = x_ind[jj]
                     for kk in range(y_ptr[j], y_ptr[j + 1]):
                         k = y_ind[kk]
-                        if mask[k] != i:
-                            mask[k] = i
-                            row_nnz += 1
+                        if next_index[k] != i:
+                            next_index[k] = i
+                            row_nnz += np.uint64(1)
                 output_nnz += row_nnz
 
             # Pass 2
@@ -183,40 +239,39 @@ def numba_funcify_SparseDot(op, node, **kwargs):
             z_ind = np.empty(output_nnz, dtype=np.uint32)
             z_data = np.empty(output_nnz, dtype=out_dtype)
 
-            # Refill original mask for reuse
-            mask.fill(-1)
+            next_index.fill(not_visited)
             sums = np.zeros(n_col, dtype=out_dtype)
 
-            nnz = 0
+            nnz = np.uint64(0)
             z_ptr[0] = 0
 
             for i in range(n_row):
-                head = -2
-                length = 0
+                head = end_of_list
+                length = np.uint64(0)
 
                 for jj in range(x_ptr[i], x_ptr[i + 1]):
                     j = x_ind[jj]
-                    v = x_data[jj]
+                    v = out_type(x_data[jj])
 
                     for kk in range(y_ptr[j], y_ptr[j + 1]):
                         k = y_ind[kk]
-                        sums[k] += v * y_data[kk]
+                        sums[k] += v * out_type(y_data[kk])
 
-                        if mask[k] == -1:
-                            mask[k] = head
+                        if next_index[k] == not_visited:
+                            next_index[k] = head
                             head = k
-                            length += 1
+                            length += np.uint64(1)
 
                 for _ in range(length):
                     if sums[head] != 0:
                         z_ind[nnz] = head
                         z_data[nnz] = sums[head]
-                        nnz += 1
+                        nnz += np.uint64(1)
 
-                    temp = head
-                    head = mask[head]
-                    mask[temp] = -1
-                    sums[temp] = 0
+                    next_head = next_index[head]
+                    next_index[head] = not_visited
+                    sums[head] = 0
+                    head = next_head
 
                 z_ptr[i + 1] = nnz
 
@@ -224,15 +279,13 @@ def numba_funcify_SparseDot(op, node, **kwargs):
 
         formats = (x_format, y_format)
         if formats == ("csc", "csc"):
-            # In all cases, the output is dense when the op is Dot.
+
             @numba_basic.numba_njit
             def spmspm_csc_csc(x, y):
                 # Swap inputs
                 n_row, n_col = x.shape[0], y.shape[1]
                 z_ptr, z_ind, z_data = _spmspm_csr(x=y, y=x, n_row=n_col, n_col=n_row)
                 output = sp.csc_matrix((z_data, z_ind, z_ptr), shape=(n_row, n_col))
-                if not z_is_sparse:
-                    return output.toarray()
                 return output
 
             return spmspm_csc_csc, cache_key
@@ -246,8 +299,6 @@ def numba_funcify_SparseDot(op, node, **kwargs):
                     x=y.tocsc(), y=x, n_row=n_col, n_col=n_row
                 )
                 output = sp.csc_matrix((z_data, z_ind, z_ptr), shape=(n_row, n_col))
-                if not z_is_sparse:
-                    return output.toarray()
                 return output
 
             return spmspm_csc_csr, cache_key
@@ -261,8 +312,6 @@ def numba_funcify_SparseDot(op, node, **kwargs):
                     x=x, y=y.tocsr(), n_row=n_row, n_col=n_col
                 )
                 output = sp.csr_matrix((z_data, z_ind, z_ptr), shape=(n_row, n_col))
-                if not z_is_sparse:
-                    return output.toarray()
                 return output
 
             return spmspm_csr_csc, cache_key
@@ -274,8 +323,6 @@ def numba_funcify_SparseDot(op, node, **kwargs):
                 n_row, n_col = x.shape[0], y.shape[1]
                 z_ptr, z_ind, z_data = _spmspm_csr(x=x, y=y, n_row=n_row, n_col=n_col)
                 output = sp.csr_matrix((z_data, z_ind, z_ptr), shape=(n_row, n_col))
-                if not z_is_sparse:
-                    return output.toarray()
                 return output
 
             return spmspm_csr_csr, cache_key
@@ -293,12 +340,12 @@ def numba_funcify_SparseDot(op, node, **kwargs):
             n_row = x_shape[0]
             x_ptr = x_ptr.view(np.uint32)
             x_ind = x_ind.view(np.uint32)
-            output = np.zeros(n_row, dtype=out_dtype)
+            output = np.empty(n_row, dtype=out_dtype)
 
             for row_idx in range(n_row):
-                acc = 0.0
+                acc = out_type(0)
                 for k in range(x_ptr[row_idx], x_ptr[row_idx + 1]):
-                    acc += x_data[k] * y[x_ind[k]]
+                    acc += out_type(x_data[k]) * out_type(y[x_ind[k]])
                 output[row_idx] = acc
 
             return output
@@ -311,9 +358,9 @@ def numba_funcify_SparseDot(op, node, **kwargs):
             output = np.zeros(n_row, dtype=out_dtype)
 
             for col_idx in range(n_col):
-                yj = y[col_idx]
+                yj = out_type(y[col_idx])
                 for k in range(x_ptr[col_idx], x_ptr[col_idx + 1]):
-                    output[x_ind[k]] += x_data[k] * yj
+                    output[x_ind[k]] += out_type(x_data[k]) * yj
 
             return output
 
@@ -342,6 +389,7 @@ def numba_funcify_SparseDot(op, node, **kwargs):
             return spmdv, cache_key
         else:  # y_is_sparse
             # Rely on: z = dot(x, y) -> z^T = dot(x, y)^T -> z^T = dot(y^T, x^T)
+            # The transpose of Y is not materialized to avoid unnecessary copies..
             if y_format == "csr":
                 _spmdv = _spmdv_csc
             else:  # csc
@@ -352,71 +400,76 @@ def numba_funcify_SparseDot(op, node, **kwargs):
                 # SciPy treats (p, ) * (p, k) as (1, p) @ (p, k),
                 # but returns the result as of shape (k, ).
                 assert x.shape[0] == y.shape[0]
-                yT = y.T  # (k, p)
-                return _spmdv(yT.indptr, yT.indices, yT.data, yT.shape, x)
+                return _spmdv(y.indptr, y.indices, y.data, (y.shape[1], y.shape[0]), x)
 
             return spmdv, cache_key
 
     # Only one of 'x' or 'y' is sparse, and we can't use spmdv.
     # We know we have to rely on the general (sparse-matrix, dense-matrix) dot product (spmdm).
     @numba_basic.numba_njit
-    def spmdm_csr(x, y):
-        assert x.shape[1] == y.shape[0]
-        n = x.shape[0]
+    def _spmdm_csr(x_ptr, x_ind, x_data, x_shape, y):
+        n = x_shape[0]
         k = y.shape[1]
         z = np.zeros((n, k), dtype=out_dtype)
 
-        x_ind = x.indices.view(np.uint32)
-        x_ptr = x.indptr.view(np.uint32)
-        x_data = x.data
+        x_ind = x_ind.view(np.uint32)
+        x_ptr = x_ptr.view(np.uint32)
 
         for row_idx in range(n):
             for idx in range(x_ptr[row_idx], x_ptr[row_idx + 1]):
                 col_idx = x_ind[idx]
                 value = out_type(x_data[idx])
-                z[row_idx] += value * y[col_idx]
+                for j in range(k):
+                    z[row_idx, j] += value * y[col_idx, j]
         return z
 
     @numba_basic.numba_njit
-    def spmdm_csc(x, y):
-        assert x.shape[1] == y.shape[0]
+    def _spmdm_csc(x_ptr, x_ind, x_data, x_shape, y):
         k = y.shape[1]
-        n = x.shape[0]
-        p = x.shape[1]
+        n, p = x_shape
         z = np.zeros((n, k), dtype=out_dtype)
 
-        x_ind = x.indices.view(np.uint32)
-        x_ptr = x.indptr.view(np.uint32)
-        x_data = x.data
+        x_ind = x_ind.view(np.uint32)
+        x_ptr = x_ptr.view(np.uint32)
 
         for col_idx in range(p):
             for idx in range(x_ptr[col_idx], x_ptr[col_idx + 1]):
                 row_idx = x_ind[idx]
                 value = out_type(x_data[idx])
-                z[row_idx] += value * y[col_idx]
+                for j in range(k):
+                    z[row_idx, j] += value * y[col_idx, j]
         return z
 
     if x_is_sparse:
         if x_format == "csr":
-            return spmdm_csr, cache_key
+            _spmdm = _spmdm_csr
         else:
-            return spmdm_csc, cache_key
+            _spmdm = _spmdm_csc
+
+        @numba_basic.numba_njit
+        def spmdm(x, y):
+            assert x.shape[1] == y.shape[0]
+            return _spmdm(x.indptr, x.indices, x.data, x.shape, y)
+
+        return spmdm, cache_key
 
     if y_is_sparse:
         # We don't implement a dense-sparse dot product.
         # Instead, we use properties of transpose:
         #     z = dot(x, y) -> z^T = dot(x, y)^T -> z^T = dot(y^T, x^T)
         # which allows us to reuse sparse-dense dot.
+        # Note we don't need to actually transpose Y, which would create unnecessary copies.
         if y_format == "csr":
-            # y.T will be CSC
-            @numba_basic.numba_njit
-            def dmspm(x, y):
-                return spmdm_csc(y.T, x.T).T
+            # y.T will be CSC.
+            _spmdm = _spmdm_csc
         else:
             # y.T will be CSR
-            @numba_basic.numba_njit
-            def dmspm(x, y):
-                return spmdm_csr(y.T, x.T).T
+            _spmdm = _spmdm_csr
+
+        @numba_basic.numba_njit
+        def dmspm(x, y):
+            assert x.shape[1] == y.shape[0]
+            return _spmdm(y.indptr, y.indices, y.data, (y.shape[1], y.shape[0]), x.T).T
 
         return dmspm, cache_key
 
@@ -464,8 +517,10 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
     g_xy_format = g_xy.type.format if g_xy_is_sparse else None
 
     x_format = "csc" if isinstance(op, StructuredDotGradCSC) else "csr"
-    out_dtype = g_xy_dtype
+    out_dtype = node.outputs[0].type.dtype
+    out_type = np.result_type(y_dtype, g_xy_dtype).type
 
+    cache_version = 2
     cache_key = sha256(
         str(
             (
@@ -474,8 +529,10 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
                 y_format,
                 y_dtype,
                 g_xy_format,
+                g_xy_dtype,
                 out_dtype,
                 y.type.shape,
+                cache_version,
             )
         ).encode()
     ).hexdigest()
@@ -494,7 +551,9 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
                     x_ptr = x_ptr.view(np.uint32)
                     for row_idx in range(size):
                         for value_idx in range(x_ptr[row_idx], x_ptr[row_idx + 1]):
-                            output[value_idx] = g_xy[row_idx] * y[x_indices[value_idx]]
+                            output[value_idx] = out_type(g_xy[row_idx]) * out_type(
+                                y[x_indices[value_idx]]
+                            )
                     return output
 
                 @numba_basic.numba_njit
@@ -503,32 +562,32 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
 
                 return grad_spmdv_csr, cache_key
             else:
-                # Y is a matrix
-                if config.compiler_verbose and y_dtype != out_dtype:
+                if config.compiler_verbose and y_dtype != g_xy_dtype:
                     print(  # noqa: T201
-                        "Numba StructuredDotGrad requires a type casting of inputs: "
+                        "Numba StructuredDotGrad uses scalar input casts: "
                         f"{y_dtype=}, {g_xy_dtype=}."
                     )
 
                 @numba_basic.numba_njit
                 def grad_spmdm_csr(x_indices, x_ptr, y, g_xy):
+                    if y.shape[1] != g_xy.shape[1]:
+                        raise ValueError("shapes not aligned")
+
                     size = len(x_ptr) - 1
                     x_indices = x_indices.view(np.uint32)
                     x_ptr = x_ptr.view(np.uint32)
 
-                    if y_dtype != out_dtype:
-                        new_out_dtype = np.result_type(y, g_xy)
-                        output = np.zeros(len(x_indices), dtype=new_out_dtype)
-                        y = y.astype(out_dtype)
-                        g_xy = g_xy.astype(out_dtype)
-                    else:
-                        output = np.zeros(len(x_indices), dtype=out_dtype)
+                    output = np.empty(len(x_indices), dtype=out_dtype)
 
                     for row_idx in range(size):
                         for value_idx in range(x_ptr[row_idx], x_ptr[row_idx + 1]):
-                            output[value_idx] = np.dot(
-                                g_xy[row_idx], y[x_indices[value_idx]]
-                            )
+                            col_idx = x_indices[value_idx]
+                            acc = out_type(0)
+                            for j in range(y.shape[1]):
+                                acc += out_type(g_xy[row_idx, j]) * out_type(
+                                    y[col_idx, j]
+                                )
+                            output[value_idx] = acc
                     return output
 
                 return grad_spmdm_csr, cache_key
@@ -536,17 +595,21 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
             # X is CSC
             @numba_basic.numba_njit
             def grad_spmdm_csc(x_indices, x_ptr, y, g_xy):
+                if y.shape[1] != g_xy.shape[1]:
+                    raise ValueError("shapes not aligned")
                 # len(x_indices) gives the number of non-zero elements in X.
-                output = np.zeros(len(x_indices), dtype=out_dtype)
+                output = np.empty(len(x_indices), dtype=out_dtype)
                 size = len(x_ptr) - 1
                 x_indices = x_indices.view(np.uint32)
                 x_ptr = x_ptr.view(np.uint32)
 
                 for col_idx in range(size):
                     for value_idx in range(x_ptr[col_idx], x_ptr[col_idx + 1]):
-                        output[value_idx] = np.dot(
-                            g_xy[x_indices[value_idx]], y[col_idx]
-                        )
+                        row_idx = x_indices[value_idx]
+                        acc = out_type(0)
+                        for j in range(y.shape[1]):
+                            acc += out_type(g_xy[row_idx, j]) * out_type(y[col_idx, j])
+                        output[value_idx] = acc
                 return output
 
             return grad_spmdm_csc, cache_key
@@ -554,23 +617,25 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
     # Y is sparse. In either case we need 'dot_csr_rows'
     @numba_basic.numba_njit
     def dot_csr_rows(x_ptr, x_indices, x_data, x_row, y_ptr, y_indices, y_data, y_row):
-        x_p = x_ptr[x_row]
-        x_end = x_ptr[x_row + 1]
-        y_p = y_ptr[y_row]
-        y_end = y_ptr[y_row + 1]
+        x_row = np.uint64(x_row)
+        y_row = np.uint64(y_row)
+        x_p = np.uint64(x_ptr[x_row])
+        x_end = np.uint64(x_ptr[x_row + np.uint64(1)])
+        y_p = np.uint64(y_ptr[y_row])
+        y_end = np.uint64(y_ptr[y_row + np.uint64(1)])
 
-        acc = 0.0
+        acc = out_type(0)
         while x_p < x_end and y_p < y_end:
             x_col = x_indices[x_p]
             y_col = y_indices[y_p]
             if x_col == y_col:
-                acc += x_data[x_p] * y_data[y_p]
-                x_p += 1
-                y_p += 1
+                acc += out_type(x_data[x_p]) * out_type(y_data[y_p])
+                x_p += np.uint64(1)
+                y_p += np.uint64(1)
             elif x_col < y_col:
-                x_p += 1
+                x_p += np.uint64(1)
             else:
-                y_p += 1
+                y_p += np.uint64(1)
 
         return acc
 
@@ -580,6 +645,8 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
 
         @numba_basic.numba_njit
         def grad_spmspm_csr(x_indices, x_ptr, y, g_xy):
+            x_indices = x_indices.view(np.uint32)
+            x_ptr = x_ptr.view(np.uint32)
             if y_format == "csc":
                 y = y.tocsr()
 
@@ -592,7 +659,7 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
             y_ptr = y.indptr.view(np.uint32)
 
             n_row = len(x_ptr) - 1
-            output = np.zeros(len(x_indices), dtype=out_dtype)
+            output = np.empty(len(x_indices), dtype=out_dtype)
 
             for x_row in range(n_row):
                 for data_idx in range(x_ptr[x_row], x_ptr[x_row + 1]):
@@ -616,6 +683,8 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
 
         @numba_basic.numba_njit
         def grad_spmspm_csc(x_indices, x_ptr, y, g_xy):
+            x_indices = x_indices.view(np.uint32)
+            x_ptr = x_ptr.view(np.uint32)
             if y_format == "csc":
                 y = y.tocsr()
 
@@ -649,3 +718,650 @@ def numba_funcify_StructuredDotGrad(op, node, **kwargs):
             return output
 
         return grad_spmspm_csc, cache_key
+
+
+@register_funcify_and_cache_key(AddSparseSparse)
+def numba_funcify_AddSparseSparse(op, node, **kwargs):
+    # NOTE: There are promotions to uint64 in a few places.
+    # The reason is numba promotes uint32 + uint32 to uint64,
+    # while uint64 + uint64 is just as fast.
+    # The benefit comes from using np.uint64(1) instead of 1 in increments:
+    # uint32/uint64 + 1 becomes signed, adding negative-index handling to array access,
+    # while uint64 + uint64 remains unsigned.
+    # Also, there are scalar promotions to the output type. This is more efficient that
+    # promoting the whole array at once, which requires additional memory allocation.
+
+    x, y = node.inputs
+    [z] = node.outputs
+    out_dtype = z.type.dtype
+    out_type = np.dtype(out_dtype).type
+
+    x_format = x.type.format
+    y_format = y.type.format
+
+    # The output `z` has the same format as `x`.
+    if x_format == "csr":
+        constructor = sp.csr_matrix
+    else:
+        constructor = sp.csc_matrix
+
+    @numba_basic.numba_njit
+    def add_sparse_sparse_canonical(x, y):
+        x_data = x.data
+        y_data = y.data
+        x_indices = x.indices.view(np.uint32)
+        y_indices = y.indices.view(np.uint32)
+        x_indptr = x.indptr.view(np.uint32)
+        y_indptr = y.indptr.view(np.uint32)
+
+        n_major = len(x_indptr) - 1
+        capacity = len(x_data) + len(y_data)
+        z_indptr = np.empty(n_major + 1, dtype=np.uint32)
+        z_indices = np.empty(capacity, dtype=np.uint32)
+        z_data = np.empty(capacity, dtype=out_dtype)
+
+        nnz = np.uint64(0)
+        z_indptr[0] = 0
+        for major in range(n_major):
+            x_ptr = np.uint64(x_indptr[major])
+            x_end = np.uint64(x_indptr[major + 1])
+            y_ptr = np.uint64(y_indptr[major])
+            y_end = np.uint64(y_indptr[major + 1])
+
+            while x_ptr < x_end and y_ptr < y_end:
+                if x_indices[x_ptr] == y_indices[y_ptr]:
+                    index = x_indices[x_ptr]
+                    # Numba promotes narrow integer types.
+                    # The outer cast ensures the result remains in the desired output dtype.
+                    value = out_type(out_type(x_data[x_ptr]) + out_type(y_data[y_ptr]))
+                    x_ptr += np.uint64(1)
+                    y_ptr += np.uint64(1)
+                elif x_indices[x_ptr] < y_indices[y_ptr]:
+                    index = x_indices[x_ptr]
+                    value = out_type(x_data[x_ptr])
+                    x_ptr += np.uint64(1)
+                else:
+                    index = y_indices[y_ptr]
+                    value = out_type(y_data[y_ptr])
+                    y_ptr += np.uint64(1)
+                z_indices[nnz] = index
+                z_data[nnz] = value
+                nnz += np.uint64(value != 0)
+
+            while x_ptr < x_end:
+                value = out_type(x_data[x_ptr])
+                z_indices[nnz] = x_indices[x_ptr]
+                z_data[nnz] = value
+                nnz += np.uint64(value != 0)
+                x_ptr += np.uint64(1)
+
+            while y_ptr < y_end:
+                value = out_type(y_data[y_ptr])
+                z_indices[nnz] = y_indices[y_ptr]
+                z_data[nnz] = value
+                nnz += np.uint64(value != 0)
+                y_ptr += np.uint64(1)
+
+            z_indptr[major + 1] = nnz
+
+        components = (
+            z_data[:nnz],
+            z_indices[:nnz].view(np.int32),
+            z_indptr.view(np.int32),
+        )
+        return constructor(components, shape=x.shape)
+
+    # Sparse indices are int32, so the top two uint32 values are free sentinels.
+    # This approach allows us to have unsigned `next_index` and unsigned `head`
+    not_visited = np.uint32(2**32 - 1)
+    end_of_list = np.uint32(2**32 - 2)
+
+    @numba_basic.numba_njit
+    def add_sparse_sparse_general(x, y):
+        x_data = x.data
+        y_data = y.data
+        x_indices = x.indices.view(np.uint32)
+        y_indices = y.indices.view(np.uint32)
+        x_indptr = x.indptr.view(np.uint32)
+        y_indptr = y.indptr.view(np.uint32)
+        n_major = len(x_indptr) - 1
+
+        if x_format == "csr":
+            n_minor = x.shape[1]
+        else:
+            n_minor = x.shape[0]
+
+        next_index = np.full(n_minor, not_visited, dtype=np.uint32)
+        x_row = np.empty(n_minor, dtype=out_dtype)
+        y_row = np.empty(n_minor, dtype=out_dtype)
+        capacity = len(x_data) + len(y_data)
+        z_data = np.empty(capacity, dtype=out_dtype)
+        z_indices = np.empty(capacity, dtype=np.int32)
+        z_indptr = np.empty(n_major + 1, dtype=np.int32)
+        nnz = np.uint64(0)
+        z_indptr[0] = 0
+
+        for major in range(n_major):
+            head = end_of_list
+            length = np.uint64(0)
+
+            for ptr in range(x_indptr[major], x_indptr[major + 1]):
+                index = x_indices[ptr]
+                if next_index[index] == not_visited:
+                    # Initialize accumulators only for indices visited in this row.
+                    x_row[index] = out_type(x_data[ptr])
+                    y_row[index] = 0
+                    next_index[index] = head
+                    head = index
+                    length += np.uint64(1)
+                else:
+                    x_row[index] += out_type(x_data[ptr])
+
+            for ptr in range(y_indptr[major], y_indptr[major + 1]):
+                index = y_indices[ptr]
+                if next_index[index] == not_visited:
+                    x_row[index] = 0
+                    y_row[index] = out_type(y_data[ptr])
+                    next_index[index] = head
+                    head = index
+                    length += np.uint64(1)
+                else:
+                    y_row[index] += out_type(y_data[ptr])
+
+            for _ in range(length):
+                value = out_type(x_row[head] + y_row[head])
+                if value != 0:
+                    z_indices[nnz] = head
+                    z_data[nnz] = value
+                    nnz += np.uint64(1)
+                index = head
+                head = next_index[index]
+                next_index[index] = not_visited
+
+            z_indptr[major + 1] = nnz
+        return constructor((z_data[:nnz], z_indices[:nnz], z_indptr), shape=x.shape)
+
+    cache_version = 1
+    cache_key = sha256(
+        str((AddSparseSparse, x_format, y_format, out_dtype, cache_version)).encode()
+    ).hexdigest()
+
+    @numba_basic.numba_njit
+    def add_sparse_sparse(x, y):
+        assert x.shape == y.shape
+
+        if x_format != y_format:
+            # Addition is CSR-CSR or CSC-CSC
+            if x_format == "csr":
+                y = y.tocsr()
+            else:
+                y = y.tocsc()
+
+        if x.has_canonical_format and y.has_canonical_format:
+            return add_sparse_sparse_canonical(x, y)
+
+        return add_sparse_sparse_general(x, y)
+
+    return add_sparse_sparse, cache_key
+
+
+@register_funcify_and_cache_key(MultiplySparseSparse)
+def numba_funcify_MultiplySparseSparse(op, node, **kwargs):
+    # NOTE: There are promotions to uint64 in a few places.
+    # The reason is numba promotes uint32 + uint32 to uint64,
+    # while uint64 + uint64 is just as fast.
+    # The benefit comes from using np.uint64(1) instead of 1 in increments:
+    # uint32/uint64 + 1 becomes signed, adding negative-index handling to array access,
+    # while uint64 + uint64 remains unsigned.
+    # Also, there are scalar promotions to the output type. This is more efficient that
+    # promoting the whole array at once, which requires additional memory allocation.
+
+    x, y = node.inputs
+    [z] = node.outputs
+    out_dtype = z.type.dtype
+    out_type = np.dtype(out_dtype).type
+
+    x_format = x.type.format
+    y_format = y.type.format
+
+    # The output `z` has the same format as `x`.
+    if x_format == "csr":
+        constructor = sp.csr_matrix
+    else:
+        constructor = sp.csc_matrix
+
+    @numba_basic.numba_njit
+    def multiply_sparse_sparse_canonical(x, y):
+        x_data = x.data
+        y_data = y.data
+        x_indices = x.indices.view(np.uint32)
+        y_indices = y.indices.view(np.uint32)
+        x_indptr = x.indptr.view(np.uint32)
+        y_indptr = y.indptr.view(np.uint32)
+        n_major = len(x_indptr) - 1
+        capacity = len(x_data) + len(y_data)
+        z_indptr = np.empty(n_major + 1, dtype=np.uint32)
+        z_indices = np.empty(capacity, dtype=np.uint32)
+        z_data = np.empty(capacity, dtype=out_dtype)
+
+        nnz = np.uint64(0)
+        z_indptr[0] = 0
+        for major in range(n_major):
+            x_ptr = np.uint64(x_indptr[major])
+            x_end = np.uint64(x_indptr[major + 1])
+            y_ptr = np.uint64(y_indptr[major])
+            y_end = np.uint64(y_indptr[major + 1])
+
+            while x_ptr < x_end and y_ptr < y_end:
+                # Numba promotes narrow integer types.
+                # The outer casts ensure the result remains in the desired output dtype.
+                if x_indices[x_ptr] == y_indices[y_ptr]:
+                    index = x_indices[x_ptr]
+                    value = out_type(out_type(x_data[x_ptr]) * out_type(y_data[y_ptr]))
+                    x_ptr += np.uint64(1)
+                    y_ptr += np.uint64(1)
+                elif x_indices[x_ptr] < y_indices[y_ptr]:
+                    index = x_indices[x_ptr]
+                    value = out_type(out_type(x_data[x_ptr]) * out_type(0))
+                    x_ptr += np.uint64(1)
+                else:
+                    index = y_indices[y_ptr]
+                    value = out_type(out_type(0) * out_type(y_data[y_ptr]))
+                    y_ptr += np.uint64(1)
+
+                if value != 0:
+                    z_indices[nnz] = index
+                    z_data[nnz] = value
+                    nnz += np.uint64(1)
+
+            while x_ptr < x_end:
+                value = out_type(out_type(x_data[x_ptr]) * out_type(0))
+                if value != 0:
+                    z_indices[nnz] = x_indices[x_ptr]
+                    z_data[nnz] = value
+                    nnz += np.uint64(1)
+                x_ptr += np.uint64(1)
+
+            while y_ptr < y_end:
+                value = out_type(out_type(0) * out_type(y_data[y_ptr]))
+                if value != 0:
+                    z_indices[nnz] = y_indices[y_ptr]
+                    z_data[nnz] = value
+                    nnz += np.uint64(1)
+                y_ptr += np.uint64(1)
+
+            z_indptr[major + 1] = nnz
+
+        components = (
+            z_data[:nnz],
+            z_indices[:nnz].view(np.int32),
+            z_indptr.view(np.int32),
+        )
+
+        return constructor(components, shape=x.shape)
+
+    # Sparse indices are int32, so the top two uint32 values are free sentinels.
+    not_visited = np.uint32(2**32 - 1)
+    end_of_list = np.uint32(2**32 - 2)
+
+    @numba_basic.numba_njit
+    def multiply_sparse_sparse_general(x, y):
+        x_data = x.data
+        y_data = y.data
+        x_indices = x.indices.view(np.uint32)
+        y_indices = y.indices.view(np.uint32)
+        x_indptr = x.indptr.view(np.uint32)
+        y_indptr = y.indptr.view(np.uint32)
+        n_major = len(x_indptr) - 1
+
+        if x_format == "csr":
+            n_minor = x.shape[1]
+        else:
+            n_minor = x.shape[0]
+
+        next_index = np.full(n_minor, not_visited, dtype=np.uint32)
+        x_row = np.empty(n_minor, dtype=out_dtype)
+        y_row = np.empty(n_minor, dtype=out_dtype)
+        capacity = len(x_data) + len(y_data)
+        z_data = np.empty(capacity, dtype=out_dtype)
+        z_indices = np.empty(capacity, dtype=np.int32)
+        z_indptr = np.empty(n_major + 1, dtype=np.int32)
+
+        nnz = np.uint64(0)
+        z_indptr[0] = 0
+        for major in range(n_major):
+            head = end_of_list
+            length = np.uint64(0)
+
+            for ptr in range(x_indptr[major], x_indptr[major + 1]):
+                index = x_indices[ptr]
+                if next_index[index] == not_visited:
+                    # Initialize accumulators only for indices visited in this row.
+                    x_row[index] = out_type(x_data[ptr])
+                    y_row[index] = 0
+                    next_index[index] = head
+                    head = index
+                    length += np.uint64(1)
+                else:
+                    x_row[index] += out_type(x_data[ptr])
+
+            for ptr in range(y_indptr[major], y_indptr[major + 1]):
+                index = y_indices[ptr]
+                if next_index[index] == not_visited:
+                    x_row[index] = 0
+                    y_row[index] = out_type(y_data[ptr])
+                    next_index[index] = head
+                    head = index
+                    length += np.uint64(1)
+                else:
+                    y_row[index] += out_type(y_data[ptr])
+
+            for _ in range(length):
+                value = out_type(x_row[head] * y_row[head])
+                if value != 0:
+                    z_indices[nnz] = head
+                    z_data[nnz] = value
+                    nnz += np.uint64(1)
+                index = head
+                head = next_index[index]
+                next_index[index] = not_visited
+            z_indptr[major + 1] = nnz
+
+        return constructor((z_data[:nnz], z_indices[:nnz], z_indptr), shape=x.shape)
+
+    cache_version = 1
+    cache_key = sha256(
+        str(
+            (MultiplySparseSparse, x_format, y_format, out_dtype, cache_version)
+        ).encode()
+    ).hexdigest()
+
+    @numba_basic.numba_njit
+    def multiply_sparse_sparse(x, y):
+        assert x.shape == y.shape
+
+        if x_format != y_format:
+            # Multiplication is CSR-CSR or CSC-CSC
+            if x_format == "csr":
+                y = y.tocsr()
+            else:
+                y = y.tocsc()
+
+        if x.has_canonical_format and y.has_canonical_format:
+            return multiply_sparse_sparse_canonical(x, y)
+
+        return multiply_sparse_sparse_general(x, y)
+
+    return multiply_sparse_sparse, cache_key
+
+
+@register_funcify_default_op_cache_key(AddSparseDense)
+def numba_funcify_AddSparseDense(op, node, **kwargs):
+    x, y = node.inputs
+    [z] = node.outputs
+    out_dtype = z.type.dtype
+    x_format = x.type.format
+    same_dtype = y.type.dtype == out_dtype
+
+    @numba_basic.numba_njit
+    def add_sparse_dense(x, y):
+        assert x.shape == y.shape
+        if same_dtype:
+            z = y.copy()
+        else:
+            z = y.astype(out_dtype)  # Also generates a copy
+
+        M = x.shape[0]
+        N = x.shape[1]
+        data = x.data
+        indices = x.indices.view(np.uint32)
+        indptr = x.indptr.view(np.uint32)
+
+        # Since `z` already has the output type, and we use `+=`, we don't need to cast `data`.
+        # Numba emits LLVM that automatically handles the cast.
+        if x_format == "csc":
+            for j in range(N):
+                for i_idx in range(indptr[j], indptr[j + 1]):
+                    i = indices[i_idx]
+                    z[i, j] += data[i_idx]
+        else:
+            for i in range(M):
+                for j_idx in range(indptr[i], indptr[i + 1]):
+                    j = indices[j_idx]
+                    z[i, j] += data[j_idx]
+
+        return z
+
+    return add_sparse_dense
+
+
+@register_funcify_default_op_cache_key(AddSparseSparseData)
+def numba_funcify_AddSparseSparseData(op, node, **kwargs):
+    if node.outputs[0].type.format == "csr":
+        constructor = sp.csr_matrix
+    else:
+        constructor = sp.csc_matrix
+
+    @numba_basic.numba_njit
+    def add_sparse_sparse_data(x, y):
+        assert x.shape == y.shape
+        assert x.data.shape == y.data.shape
+
+        # The Op forces x.data and y.data to be of the same type, no need to cast.
+        data = np.empty_like(x.data)
+        for ptr in range(len(data)):
+            data[ptr] = x.data[ptr] + y.data[ptr]
+
+        return constructor((data, x.indices.copy(), x.indptr.copy()), shape=x.shape)
+
+    return add_sparse_sparse_data
+
+
+@register_funcify_and_cache_key(StructuredAddSparseDenseVector)
+def numba_funcify_StructuredAddSparseDenseVector(op, node, **kwargs):
+    # NOTE: There are promotions to uint64 in a few places.
+    # The reason is numba promotes uint32 + uint32 to uint64,
+    # while uint64 + uint64 is just as fast.
+    # The benefit comes from using np.uint64(1) instead of 1 in increments:
+    # uint32/uint64 + 1 becomes signed, adding negative-index handling to array access,
+    # while uint64 + uint64 remains unsigned.
+
+    [z] = node.outputs
+    out_dtype = z.type.dtype
+    out_type = np.dtype(out_dtype).type
+    complex_dtype = np.issubdtype(np.dtype(out_dtype), np.complexfloating)
+    out_format = z.type.format
+
+    cache_version = 1
+    cache_key = sha256(
+        str((type(op), out_format, out_dtype, cache_version)).encode()
+    ).hexdigest()
+
+    if out_format == "csr":
+        constructor = sp.csr_matrix
+    else:
+        constructor = sp.csc_matrix
+
+    sum_duplicates = make_sum_duplicates(out_format)
+
+    @numba_basic.numba_njit(fastmath=False)
+    def add_nonfinite(value, other):
+        # Preserve NaN propagation from 0 * NaN and 0 * inf.
+        return out_type(value + (value != 0) * other)
+
+    @numba_basic.numba_njit
+    def finite_kernel(x, y):
+        assert x.shape[1] == y.shape[0]
+
+        # Can't reasign like in `x = sum_duplicates(x)` because Numba cannot infer a common
+        # type when the original indices are readonly.
+        if x.has_canonical_format:
+            x_data = x.data
+            x_indices = x.indices.view(np.uint32)
+            x_indptr = x.indptr.view(np.uint32)
+        else:
+            canonical_x = sum_duplicates(x)
+            x_data = canonical_x.data
+            x_indices = canonical_x.indices.view(np.uint32)
+            x_indptr = canonical_x.indptr.view(np.uint32)
+
+        n_major = len(x_indptr) - 1
+        capacity = len(x_data)
+        z_indptr = np.empty(n_major + 1, dtype=np.uint32)
+        z_indices = np.empty(capacity, dtype=np.uint32)
+        z_data = np.empty(capacity, dtype=out_dtype)
+
+        nnz = np.uint64(0)
+        z_indptr[0] = 0
+
+        for major in range(n_major):
+            start = x_indptr[major]
+            end = x_indptr[major + 1]
+            for ptr in range(start, end):
+                index = x_indices[ptr]
+                if out_format == "csr":
+                    column = index
+                else:
+                    column = major
+
+                value = x_data[ptr]
+
+                # Avoid a complex multiply for the structured mask.
+                if complex_dtype:
+                    if value != 0:
+                        value = out_type(value + y[column])
+                        if value != 0:
+                            z_indices[nnz] = index
+                            z_data[nnz] = value
+                            nnz += np.uint64(1)
+                else:
+                    value = out_type(value + (value != 0) * y[column])
+                    if value != 0:
+                        z_indices[nnz] = index
+                        z_data[nnz] = value
+                        nnz += np.uint64(1)
+
+            z_indptr[major + 1] = nnz
+
+        components = (
+            z_data[:nnz],
+            z_indices[:nnz].view(np.int32),
+            z_indptr.view(np.int32),
+        )
+
+        return constructor(components, shape=x.shape)
+
+    @numba_basic.numba_njit
+    def nonfinite_kernel(x, y, nonfinite_columns):
+        assert x.shape[1] == y.shape[0]
+
+        # Can't reasign like in `x = sum_duplicates(x)` because Numba cannot infer a common
+        # type when the original indices are readonly.
+        if x.has_canonical_format:
+            x_data = x.data
+            x_indices = x.indices.view(np.uint32)
+            x_indptr = x.indptr.view(np.uint32)
+        else:
+            canonical_x = sum_duplicates(x)
+            x_data = canonical_x.data
+            x_indices = canonical_x.indices.view(np.uint32)
+            x_indptr = canonical_x.indptr.view(np.uint32)
+
+        n_major = len(x_indptr) - 1
+        if out_format == "csr":
+            n_minor = np.uint64(x.shape[1])
+        else:
+            n_minor = np.uint64(x.shape[0])
+
+        nonfinite_columns_n = len(nonfinite_columns)
+        capacity = len(x_data) + x.shape[0] * nonfinite_columns_n
+
+        z_indptr = np.empty(n_major + 1, dtype=np.uint32)
+        z_indices = np.empty(capacity, dtype=np.uint32)
+        z_data = np.empty(capacity, dtype=out_dtype)
+
+        nnz = np.uint64(0)
+        z_indptr[0] = 0
+        for major in range(n_major):
+            ptr = np.uint64(x_indptr[major])
+            end = np.uint64(x_indptr[major + 1])
+            extra_ptr = np.uint64(0)
+
+            if out_format == "csr":
+                extra_count = np.uint64(nonfinite_columns_n)
+            elif not np.isfinite(y[major]):
+                extra_count = n_minor
+            else:
+                extra_count = np.uint64(0)
+
+            # CSC columns with finite y need no implicit entries, even in this kernel.
+            if out_format == "csc" and extra_count == 0:
+                for data_ptr in range(ptr, end):
+                    value = x_data[data_ptr]
+                    value = out_type(value + (value != 0) * y[major])
+                    if value != 0:
+                        z_indices[nnz] = x_indices[data_ptr]
+                        z_data[nnz] = value
+                        nnz += np.uint64(1)
+                z_indptr[major + 1] = nnz
+                continue
+
+            while ptr < end or extra_ptr < extra_count:
+                if ptr < end:
+                    stored_index = x_indices[ptr]
+                else:
+                    stored_index = n_minor
+
+                extra_index = n_minor
+                if extra_ptr < extra_count:
+                    if out_format == "csr":
+                        extra_index = np.uint64(nonfinite_columns[extra_ptr])
+                    else:
+                        extra_index = extra_ptr
+
+                index = min(stored_index, extra_index)
+                value = out_type(0)
+
+                if stored_index == index:
+                    value = x_data[ptr]
+                    ptr += np.uint64(1)
+
+                if extra_index == index:
+                    extra_ptr += np.uint64(1)
+
+                if out_format == "csr":
+                    column = index
+                else:
+                    column = major
+
+                value = add_nonfinite(value, y[column])
+                if value != 0:
+                    z_indices[nnz] = index
+                    z_data[nnz] = value
+                    nnz += np.uint64(1)
+
+            z_indptr[major + 1] = nnz
+
+        components = (
+            z_data[:nnz],
+            z_indices[:nnz].view(np.int32),
+            z_indptr.view(np.int32),
+        )
+
+        return constructor(components, shape=x.shape)
+
+    @numba_basic.numba_njit
+    def structured_add_sparse_dense_vector(x, y):
+        all_finite = True
+
+        # This is faster in numba, it's SIMD-friendly.
+        for y_i in y:
+            all_finite &= np.isfinite(y_i)
+
+        if all_finite:
+            return finite_kernel(x, y)
+
+        nonfinite_columns = np.flatnonzero(~np.isfinite(y))
+        return nonfinite_kernel(x, y, nonfinite_columns)
+
+    return structured_add_sparse_dense_vector, cache_key

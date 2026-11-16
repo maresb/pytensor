@@ -1,3 +1,5 @@
+import warnings
+
 from pytensor.graph.basic import Apply
 from pytensor.graph.op import Op
 from pytensor.tensor import basic as ptb
@@ -82,7 +84,15 @@ expm = Blockwise(Expm())
 
 
 class KroneckerProduct(TensorSymbolicOp):
-    """Kronecker product Op."""
+    """Kronecker product Op.
+
+    This is not a `FusibleSymbolicOp`: its body has only one broadcasting `mul`,
+    so there are no elementwise operations to fuse internally. The output `reshape`
+    also blocks fusion with downstream operations.
+
+    Keeping this op opaque also preserves native `kron` dispatch in JAX, PyTorch
+    and MLX.
+    """
 
     def build_inner_graph(self, a, b):
         if a.ndim + b.ndim <= 2:
@@ -129,7 +139,16 @@ def matrix_dot(*args):
     generate the matrix product between all in the given order, namely
     :math:`A_0 \cdot A_1 \cdot A_2 \cdot .. \cdot A_N`.
 
+    .. deprecated::
+        Use the ``@`` operator or ``pt.matmul`` instead.
+
     """
+    warnings.warn(
+        "matrix_dot is deprecated. Use the @ operator or pt.matmul instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+
     rval = args[0]
     for a in args[1:]:
         rval = ptm.dot(rval, a)

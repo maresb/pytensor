@@ -19,33 +19,35 @@ import pytensor
 import pytensor.compile.compiledir
 from pytensor import config
 from pytensor.link.c.basic import get_module_cache
+from pytensor.link.utils import clear_generated_src
 
 
 _logger = logging.getLogger("pytensor.bin.pytensor-cache")
 
 
+def remove_extra_caches(base_compiledir: Path) -> None:
+    """Remove the Numba cache and the generated source files."""
+    shutil.rmtree(base_compiledir / "numba", ignore_errors=True)
+    clear_generated_src()
+
+
 def print_help(exit_status):
+    stream = sys.stderr if exit_status else sys.stdout
     if exit_status:
-        print(f'command "{" ".join(sys.argv)}" not recognized')
-    print('Type "pytensor-cache" to print the cache location')
-    print('Type "pytensor-cache help" to print this help')
-    print('Type "pytensor-cache clear" to erase the cache')
-    print('Type "pytensor-cache list" to print the cache content')
-    print('Type "pytensor-cache unlock" to unlock the cache directory')
-    print('Type "pytensor-cache cleanup" to delete keys in the old format/code version')
-    print('Type "pytensor-cache purge" to force deletion of the cache directory')
+        print(f'command "{" ".join(sys.argv)}" not recognized', file=stream)
     print(
-        'Type "pytensor-cache basecompiledir" '
-        "to print the parent of the cache directory"
-    )
-    print(
-        'Type "pytensor-cache basecompiledir list" '
-        "to print the content of the base compile dir"
-    )
-    print(
-        'Type "pytensor-cache basecompiledir purge" '
-        "to remove everything in the base compile dir, "
-        "that is, erase ALL cache directories"
+        'Type "pytensor-cache" to print the cache location\n'
+        'Type "pytensor-cache help" to print this help\n'
+        'Type "pytensor-cache clear" to erase the cache\n'
+        'Type "pytensor-cache list" to print the cache content\n'
+        'Type "pytensor-cache unlock" to unlock the cache directory\n'
+        'Type "pytensor-cache cleanup" to delete keys in the old format/code version\n'
+        'Type "pytensor-cache purge" to force deletion of the cache directory\n'
+        'Type "pytensor-cache basecompiledir" to print the parent of the cache directory\n'
+        'Type "pytensor-cache basecompiledir list" to print the content of the base compile dir\n'
+        'Type "pytensor-cache basecompiledir purge" to remove everything in the base compile dir, '
+        "that is, erase ALL cache directories",
+        file=stream,
     )
     sys.exit(exit_status)
 
@@ -76,8 +78,7 @@ def main():
                     "remove everything from that directory."
                 )
                 _logger.debug(f"Remaining elements ({len(items)}): {items}")
-            numba_cache_dir: Path = config.base_compiledir / "numba"
-            shutil.rmtree(numba_cache_dir, ignore_errors=True)
+            remove_extra_caches(config.base_compiledir)
 
         elif sys.argv[1] == "list":
             pytensor.compile.compiledir.print_compiledir_content()
@@ -90,8 +91,7 @@ def main():
             print("Lock successfully removed!")
         elif sys.argv[1] == "purge":
             pytensor.compile.compiledir.compiledir_purge()
-            numba_cache_dir: Path = config.base_compiledir / "numba"
-            shutil.rmtree(numba_cache_dir, ignore_errors=True)
+            remove_extra_caches(config.base_compiledir)
         elif sys.argv[1] == "basecompiledir":
             # Simply print the base_compiledir
             print(pytensor.config.base_compiledir)
